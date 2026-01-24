@@ -1,0 +1,22 @@
+{
+  "name": "azworld",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "azcli": "bin/azcli",
+    "azchat": "bin/azchat"
+  },
+  "scripts": {
+    "azcli": "bun run src/cli/azcli.ts",
+    "azchat": "bun run src/chat/azchat.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "bun-types": "^1.1.0"
+  }
+}

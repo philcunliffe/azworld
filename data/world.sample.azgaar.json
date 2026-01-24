@@ -1,0 +1,134 @@
+{
+  "pack": {
+    "states": [
+      {
+        "name": "Neutral",
+        "removed": false
+      },
+      {
+        "name": "Eldoria",
+        "formName": "Kingdom",
+        "capital": 1,
+        "culture": 1,
+        "area": 1000,
+        "pops": 900000,
+        "neighbors": [
+          2
+        ],
+        "diplomacy": {
+          "2": "Neutral"
+        }
+      },
+      {
+        "name": "Marrowfen",
+        "formName": "Duchy",
+        "capital": 2,
+        "culture": 2,
+        "area": 800,
+        "pops": 450000,
+        "neighbors": [
+          1
+        ],
+        "diplomacy": {
+          "1": "Neutral"
+        }
+      }
+    ],
+    "cultures": [
+      {
+        "name": "Neutral"
+      },
+      {
+        "name": "Eldorian"
+      },
+      {
+        "name": "Fenfolk"
+      }
+    ],
+    "religions": [
+      {
+        "name": "None"
+      },
+      {
+        "name": "Lantern Faith"
+      }
+    ],
+    "rivers": [
+      {
+        "name": "None"
+      },
+      {
+        "name": "Vell"
+      }
+    ],
+    "burgs": [
+      {
+        "name": "Wilds"
+      },
+      {
+        "name": "Port Trill",
+        "state": 1,
+        "culture": 1,
+        "population": 24500,
+        "x": 0.51,
+        "y": 0.33,
+        "capital": true,
+        "port": true,
+        "type": "City"
+      },
+      {
+        "name": "Fenbridge",
+        "state": 2,
+        "culture": 2,
+        "population": 8300,
+        "x": 0.22,
+        "y": 0.77,
+        "capital": true,
+        "port": false,
+        "type": "Town"
+      }
+    ],
+    "cells": {
+      "h": [
+        10,
+        20,
+        30
+      ],
+      "biome": [
+        5,
+        5,
+        3
+      ],
+      "state": [
+        1,
+        1,
+        2
+      ],
+      "culture": [
+        1,
+        1,
+        2
+      ],
+      "religion": [
+        1,
+        1,
+        1
+      ],
+      "r": [
+        0,
+        1,
+        0
+      ],
+      "pop": [
+        100,
+        300,
+        200
+      ],
+      "area": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    }
+  }
+}
