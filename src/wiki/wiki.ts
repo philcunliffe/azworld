@@ -1,11 +1,15 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { AzgaarWorld } from "../world/azgaar";
-import { CanonStore } from "../canon/canon";
+import { CanonStore, CanonEntity } from "../canon/canon";
 import { nowIso } from "../util/time";
 import { slugify } from "../util/slug";
+import { stableFilename, getTemplate, frontmatter, TemplateContext } from "./templates";
 
-function frontmatter(d: Record<string, any>): string {
+/**
+ * Legacy frontmatter function for city pages
+ */
+function legacyFrontmatter(d: Record<string, any>): string {
   const lines = ["---"];
   for (const [k, v] of Object.entries(d)) {
     lines.push(`${k}: ${JSON.stringify(v)}`);
@@ -19,6 +23,12 @@ export async function exportWiki(outDir: string, world: AzgaarWorld, canon: Cano
 
   const ents = canon.listEntities({ limit: 100000 });
   const rels = canon.listRelations({ limit: 200000 });
+
+  // Build entity index for lookups
+  const entityById = new Map<string, CanonEntity>();
+  for (const e of ents) {
+    entityById.set(e.id, e);
+  }
 
   const byFrom: Record<string, any[]> = {};
   const byTo: Record<string, any[]> = {};
@@ -35,51 +45,33 @@ export async function exportWiki(outDir: string, world: AzgaarWorld, canon: Cano
   let written = 0;
   const entityPaths: Record<string, string> = {};
 
-  const writeEntity = async (e: any) => {
+  // Helper to get filename for an entity
+  const filenameForEntity = (e: CanonEntity) => stableFilename(e);
+
+  const writeEntity = async (e: CanonEntity) => {
     const tdir = join(outDir, `${e.type}s`);
     await mkdir(tdir, { recursive: true });
-    const fname = `${slugify(e.name)}_${e.id}.md`;
+    const fname = stableFilename(e);
     const path = join(tdir, fname);
     entityPaths[e.id] = join(`${e.type}s`, fname);
 
-    const lines: string[] = [];
-    lines.push(
-      frontmatter({
-        id: e.id,
-        type: e.type,
-        name: e.name,
-        tags: e.tags ?? [],
-        anchors: e.anchors ?? {},
-        updated_at: e.updated_at,
-      })
-    );
-    lines.push("", `# ${e.name}`, "");
+    // Build template context
+    const ctx: TemplateContext = {
+      entity: e,
+      relations: {
+        outgoing: byFrom[e.id] ?? [],
+        incoming: byTo[e.id] ?? [],
+      },
+      world,
+      getEntityById: (id: string) => entityById.get(id),
+      filenameForEntity,
+    };
 
-    if (e.summary) lines.push(String(e.summary), "");
-    if (e.details_md) lines.push(String(e.details_md), "");
+    // Get and apply template
+    const template = getTemplate(e.type);
+    const content = template(ctx);
 
-    const payload = e.payload ?? {};
-    if (payload && Object.keys(payload).length) {
-      lines.push("## Details", "", "```json", JSON.stringify(payload, null, 2), "```", "");
-    }
-
-    const outgoing = byFrom[e.id] ?? [];
-    const incoming = byTo[e.id] ?? [];
-    if (outgoing.length || incoming.length) {
-      lines.push("## Links", "");
-      if (outgoing.length) {
-        lines.push("### Outgoing", "");
-        for (const r of outgoing) lines.push(`- **${r.rel_type}** → \`${r.to_id}\``);
-        lines.push("");
-      }
-      if (incoming.length) {
-        lines.push("### Incoming", "");
-        for (const r of incoming) lines.push(`- \`${r.from_id}\` → **${r.rel_type}**`);
-        lines.push("");
-      }
-    }
-
-    await writeFile(path, lines.join("\n"), "utf8");
+    await writeFile(path, content, "utf8");
     written++;
   };
 
@@ -102,7 +94,8 @@ export async function exportWiki(outDir: string, world: AzgaarWorld, canon: Cano
   for (const bid of [...burgIds].sort((a, b) => a - b)) {
     const burg = world.getBurg(bid);
     if (!burg) continue;
-    const fname = `${slugify(burg.name ?? `burg-${bid}`)}_${bid}.md`;
+    // Stable filename for cities
+    const fname = `city-${slugify(burg.name ?? `burg-${bid}`)}-${bid}.md`;
     const path = join(citiesDir, fname);
 
     const localEnts = ents.filter((e) => e.anchors?.burgId === bid);
@@ -117,20 +110,37 @@ export async function exportWiki(outDir: string, world: AzgaarWorld, canon: Cano
       port: burg.port,
     };
 
-    const lines: string[] = [];
-    lines.push(frontmatter({ type: "city", burgId: bid, name: burg.name, exported_at: nowIso() }));
-    lines.push("", `# ${burg.name} (Burg ${bid})`, "");
-    lines.push("```json", JSON.stringify(basic, null, 2), "```", "");
+    const state = typeof burg.state === "number" ? world.getState(burg.state) : undefined;
 
+    const lines: string[] = [];
+    lines.push(legacyFrontmatter({ type: "city", burgId: bid, name: burg.name, exported_at: nowIso() }));
+    lines.push("", `# ${burg.name}`, "");
+    if (state) lines.push(`*${state.name}*`, "");
+    lines.push("");
+
+    // Summary stats
+    lines.push("## Overview", "");
+    lines.push(`- **Population:** ${basic.population || "unknown"}`);
+    if (basic.capital) lines.push("- **Capital city**");
+    if (basic.port) lines.push("- **Port city**");
+    lines.push("");
+
+    // Canon entities by type
     if (localEnts.length) {
-      lines.push("## Canon entities here", "");
-      const sorted = localEnts.slice().sort((a, b) => (a.type + a.name).localeCompare(b.type + b.name));
-      for (const e of sorted) {
-        const rel = entityPaths[e.id];
-        if (rel) lines.push(`- [${e.name}](${rel}) (${e.type})`);
-        else lines.push(`- ${e.name} (${e.type})`);
+      lines.push("## Canon Entities", "");
+      const byEntityType: Record<string, CanonEntity[]> = {};
+      for (const e of localEnts) {
+        (byEntityType[e.type] ??= []).push(e);
       }
-      lines.push("");
+      for (const type of Object.keys(byEntityType).sort()) {
+        lines.push(`### ${type.charAt(0).toUpperCase() + type.slice(1)}s`, "");
+        for (const e of byEntityType[type]!.sort((a, b) => a.name.localeCompare(b.name))) {
+          const rel = entityPaths[e.id];
+          const link = rel ? `[[../${rel.replace(/\.md$/, "")}|${e.name}]]` : e.name;
+          lines.push(`- ${link}`);
+        }
+        lines.push("");
+      }
     }
 
     await writeFile(path, lines.join("\n"), "utf8");
@@ -139,16 +149,47 @@ export async function exportWiki(outDir: string, world: AzgaarWorld, canon: Cano
 
   // Index page
   const indexLines: string[] = [];
-  indexLines.push(frontmatter({ generated_at: nowIso(), entities: ents.length }));
-  indexLines.push("", "# World Wiki", "", "## Sections", "");
-  if (cityWritten) indexLines.push("- [Cities](cities/)");
-  for (const t of Object.keys(byType).sort()) indexLines.push(`- [${t[0]!.toUpperCase() + t.slice(1)}s](${t}s/)`);
-  indexLines.push("", "## Recent canon entities", "");
-  const recent = ents.slice().sort((a, b) => (b.updated_at ?? "").localeCompare(a.updated_at ?? "")).slice(0, 50);
+  indexLines.push(legacyFrontmatter({ generated_at: nowIso(), entities: ents.length }));
+  indexLines.push("", "# World Wiki", "");
+  indexLines.push(`*Generated: ${nowIso()}*`, "");
+  indexLines.push(`*Entities: ${ents.length} | Cities: ${cityWritten}*`, "");
+  indexLines.push("");
+
+  // Sections
+  indexLines.push("## Sections", "");
+  if (cityWritten) indexLines.push("- [[cities/|Cities]]");
+  for (const t of Object.keys(byType).sort()) {
+    const count = byType[t]!.length;
+    indexLines.push(`- [[${t}s/|${t.charAt(0).toUpperCase() + t.slice(1)}s]] (${count})`);
+  }
+  indexLines.push("");
+
+  // Recent entities
+  indexLines.push("## Recent Updates", "");
+  const recent = ents.slice().sort((a, b) => (b.updated_at ?? "").localeCompare(a.updated_at ?? "")).slice(0, 30);
   for (const e of recent) {
     const rel = entityPaths[e.id];
-    if (rel) indexLines.push(`- [${e.name}](${rel}) (${e.type})`);
-    else indexLines.push(`- ${e.name} (${e.type})`);
+    const link = rel ? `[[${rel.replace(/\.md$/, "")}|${e.name}]]` : e.name;
+    indexLines.push(`- ${link} *(${e.type})*`);
+  }
+  indexLines.push("");
+
+  // Events summary if any
+  const events = byType["event"] || [];
+  if (events.length) {
+    indexLines.push("## Active Events", "");
+    const activeEvents = events
+      .filter((e) => e.payload?.ongoing || (e.payload?.daysAgo ?? 999) < 30)
+      .sort((a, b) => (a.payload?.daysAgo ?? 0) - (b.payload?.daysAgo ?? 0))
+      .slice(0, 10);
+    for (const e of activeEvents) {
+      const rel = entityPaths[e.id];
+      const link = rel ? `[[${rel.replace(/\.md$/, "")}|${e.name}]]` : e.name;
+      const daysAgo = e.payload?.daysAgo ?? 0;
+      const when = daysAgo === 0 ? "now" : `${daysAgo}d ago`;
+      indexLines.push(`- ${link} *(${e.payload?.scope || "?"}, ${when})*`);
+    }
+    indexLines.push("");
   }
 
   await writeFile(join(outDir, "index.md"), indexLines.join("\n"), "utf8");

@@ -236,6 +236,36 @@ export class AzgaarWorld {
     return out;
   }
 
+  /**
+   * Get the anchor hierarchy for a burg (burgId -> stateId).
+   * Useful for scope-aware event queries.
+   */
+  getAnchorHierarchy(burgId: number): { burgId: number; stateId?: number } {
+    this.buildIndexes();
+    const burg = this.burgsById.get(burgId);
+    if (!burg) return { burgId };
+    return {
+      burgId,
+      stateId: typeof burg.state === "number" ? burg.state : undefined,
+    };
+  }
+
+  /**
+   * Get burgs within a state
+   */
+  getBurgsByState(stateId: number): any[] {
+    this.buildIndexes();
+    const out: any[] = [];
+    for (const [id, b] of this.burgsById.entries()) {
+      if (id === 0) continue;
+      if (!b || b.removed) continue;
+      if (b.state === stateId) {
+        out.push({ id, ...b });
+      }
+    }
+    return out;
+  }
+
   search(term: string, kinds?: string[] | null, limit = 20): any[] {
     this.buildIndexes();
     const q = (term || "").trim().toLowerCase();

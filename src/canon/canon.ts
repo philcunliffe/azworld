@@ -29,6 +29,18 @@ export type CanonRelation = {
   created_at: string;
 };
 
+export type AwarenessLevel = "unknown" | "rumor" | "confirmed" | "intimate";
+export type ActorType = "burg" | "state" | "faction" | "npc";
+
+export type AwarenessRecord = {
+  id: string;
+  actorType: ActorType;
+  actorId: string;
+  eventId: string;
+  level: AwarenessLevel;
+  updatedAt: string;
+};
+
 const DDL = `
 PRAGMA foreign_keys=ON;
 
@@ -63,6 +75,19 @@ CREATE TABLE IF NOT EXISTS relations (
 CREATE INDEX IF NOT EXISTS idx_rel_from ON relations(from_id);
 CREATE INDEX IF NOT EXISTS idx_rel_to ON relations(to_id);
 CREATE INDEX IF NOT EXISTS idx_rel_type ON relations(rel_type);
+
+CREATE TABLE IF NOT EXISTS event_awareness (
+  id TEXT PRIMARY KEY,
+  actor_type TEXT NOT NULL CHECK(actor_type IN ('burg', 'state', 'faction', 'npc')),
+  actor_id TEXT NOT NULL,
+  event_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+  level TEXT NOT NULL CHECK(level IN ('unknown', 'rumor', 'confirmed', 'intimate')),
+  updated_at TEXT NOT NULL,
+  UNIQUE(actor_type, actor_id, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_awareness_actor ON event_awareness(actor_type, actor_id);
+CREATE INDEX IF NOT EXISTS idx_awareness_event ON event_awareness(event_id);
 `;
 
 function jdumps(v: any): string {
@@ -282,6 +307,209 @@ export class CanonStore {
 
     const rows = this.db.prepare(sql).all(...params) as any[];
     return rows.map((r) => this.rowToRelation(r));
+  }
+
+  /**
+   * Get active events affecting a location, querying upward through scopes.
+   * Events are filtered by recency and scope matching.
+   */
+  getActiveEvents(opts: {
+    burgId?: number;
+    stateId?: number;
+    neighborhoodId?: string;
+    includeParentScopes?: boolean;
+    recencyDays?: number;
+  }): CanonEntity[] {
+    const { burgId, stateId, neighborhoodId, recencyDays = 90 } = opts;
+    const includeParentScopes = opts.includeParentScopes !== false;
+
+    // Get all events
+    const allEvents = this.listEntities({ type: "event", limit: 500 });
+
+    const matchingEvents: CanonEntity[] = [];
+
+    for (const event of allEvents) {
+      const payload = event.payload || {};
+      const scope = (payload.scope as string) || "burg";
+      const daysAgo = typeof payload.daysAgo === "number" ? payload.daysAgo : 0;
+
+      // Filter by recency
+      if (daysAgo > recencyDays) continue;
+
+      // Check scope matching
+      let matches = false;
+
+      if (scope === "world") {
+        // World events always match
+        matches = true;
+      } else if (scope === "region" && includeParentScopes) {
+        // Region events match if parent scopes included
+        matches = true;
+      } else if (scope === "state") {
+        const eventStateId = event.anchors?.stateId;
+        if (eventStateId !== undefined && eventStateId === stateId) {
+          matches = true;
+        } else if (eventStateId === undefined && includeParentScopes) {
+          // State-scope event without specific anchor matches broadly
+          matches = true;
+        }
+      } else if (scope === "burg") {
+        const eventBurgId = event.anchors?.burgId;
+        if (eventBurgId !== undefined && eventBurgId === burgId) {
+          matches = true;
+        }
+      } else if (scope === "neighborhood") {
+        const eventNeighborhoodId = event.anchors?.neighborhoodId;
+        if (eventNeighborhoodId && eventNeighborhoodId === neighborhoodId) {
+          matches = true;
+        }
+      }
+
+      if (matches) {
+        matchingEvents.push(event);
+      }
+    }
+
+    // Sort by daysAgo ascending (most recent first)
+    matchingEvents.sort((a, b) => {
+      const aDays = (a.payload?.daysAgo as number) ?? 0;
+      const bDays = (b.payload?.daysAgo as number) ?? 0;
+      return aDays - bDays;
+    });
+
+    return matchingEvents;
+  }
+
+  /**
+   * Delete an entity and its relations
+   */
+  deleteEntity(entityId: string): boolean {
+    const entity = this.getEntity(entityId);
+    if (!entity) return false;
+
+    // Relations will be cascade-deleted due to FK
+    this.db.prepare("DELETE FROM entities WHERE id = ?").run(entityId);
+    return true;
+  }
+
+  /**
+   * Delete a relation by ID
+   */
+  deleteRelation(relationId: string): boolean {
+    const result = this.db.prepare("DELETE FROM relations WHERE id = ?").run(relationId);
+    return result.changes > 0;
+  }
+
+  /**
+   * Set or update awareness level for an actor about an event
+   */
+  setAwareness(opts: {
+    actorType: ActorType;
+    actorId: string;
+    eventId: string;
+    level: AwarenessLevel;
+  }): AwarenessRecord {
+    const id = makeId("aware");
+    const ts = nowIso();
+
+    this.db.prepare(`
+      INSERT INTO event_awareness (id, actor_type, actor_id, event_id, level, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(actor_type, actor_id, event_id) DO UPDATE SET
+        level = excluded.level,
+        updated_at = excluded.updated_at
+    `).run(id, opts.actorType, opts.actorId, opts.eventId, opts.level, ts);
+
+    // Return the record
+    const row = this.db.prepare(
+      "SELECT * FROM event_awareness WHERE actor_type = ? AND actor_id = ? AND event_id = ?"
+    ).get(opts.actorType, opts.actorId, opts.eventId) as any;
+
+    return this.rowToAwareness(row);
+  }
+
+  /**
+   * Get awareness records with optional filters
+   */
+  getAwareness(opts: {
+    actorType?: ActorType;
+    actorId?: string;
+    eventId?: string;
+    minLevel?: AwarenessLevel;
+  } = {}): AwarenessRecord[] {
+    const where: string[] = [];
+    const params: any[] = [];
+
+    if (opts.actorType) {
+      where.push("actor_type = ?");
+      params.push(opts.actorType);
+    }
+    if (opts.actorId) {
+      where.push("actor_id = ?");
+      params.push(opts.actorId);
+    }
+    if (opts.eventId) {
+      where.push("event_id = ?");
+      params.push(opts.eventId);
+    }
+    if (opts.minLevel) {
+      const levelOrder = ["unknown", "rumor", "confirmed", "intimate"];
+      const minIdx = levelOrder.indexOf(opts.minLevel);
+      const validLevels = levelOrder.slice(minIdx);
+      where.push(`level IN (${validLevels.map(() => "?").join(",")})`);
+      params.push(...validLevels);
+    }
+
+    let sql = "SELECT * FROM event_awareness";
+    if (where.length) sql += " WHERE " + where.join(" AND ");
+    sql += " ORDER BY updated_at DESC";
+
+    const rows = this.db.prepare(sql).all(...params) as any[];
+    return rows.map((r) => this.rowToAwareness(r));
+  }
+
+  /**
+   * Get all events an actor knows about with their awareness levels
+   */
+  getActorKnowledge(actorType: ActorType, actorId: string): Array<{ event: CanonEntity; level: AwarenessLevel }> {
+    const awareness = this.getAwareness({ actorType, actorId });
+    const results: Array<{ event: CanonEntity; level: AwarenessLevel }> = [];
+
+    for (const a of awareness) {
+      if (a.level === "unknown") continue;
+      const event = this.getEntity(a.eventId);
+      if (event && event.type === "event") {
+        results.push({ event, level: a.level });
+      }
+    }
+
+    return results;
+  }
+
+  private rowToAwareness(row: any): AwarenessRecord {
+    return {
+      id: String(row.id),
+      actorType: row.actor_type as ActorType,
+      actorId: String(row.actor_id),
+      eventId: String(row.event_id),
+      level: row.level as AwarenessLevel,
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  /**
+   * Get all neighborhoods (locations with kind: "neighborhood") in a burg
+   */
+  getNeighborhoods(burgId: number): CanonEntity[] {
+    const locations = this.listEntities({ type: "location", anchors: { burgId }, limit: 500 });
+    return locations.filter((l) => l.payload?.kind === "neighborhood");
+  }
+
+  /**
+   * Get all locations within a specific neighborhood
+   */
+  getLocationsInNeighborhood(neighborhoodId: string): CanonEntity[] {
+    return this.listEntities({ type: "location", anchors: { neighborhoodId }, limit: 200 });
   }
 
   exportSnapshot(): { entities: CanonEntity[]; relations: CanonRelation[] } {

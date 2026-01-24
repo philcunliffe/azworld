@@ -2,71 +2,56 @@ import { z } from "zod";
 
 export const EntityTypeEnum = z.enum(["npc", "faction", "location", "event", "rumor", "hook", "meta"]);
 
-export const SceneEntitySchema = z.object({
-  key: z.string().min(1),
-  type: EntityTypeEnum,
-  name: z.string().min(1),
-  summary: z.string().optional(),
-  details_md: z.string().optional(),
-  tags: z.array(z.string()).optional(),
-  payload: z.record(z.any()).optional(),
+// Event scope and severity enums
+export const EventScopeEnum = z.enum(["neighborhood", "burg", "state", "region", "world"]);
+export const EventSeverityEnum = z.enum(["minor", "moderate", "major", "catastrophic"]);
+
+// Event consequence schema
+export const EventConsequenceSchema = z.object({
+  type: z.string(),
+  target: z.string().optional(),
+  severity: z.string().optional(),
+  effect: z.string().optional(),
 });
 
-export const SceneRelationSchema = z.object({
-  from: z.string().min(1),
-  to: z.string().min(1),
-  rel_type: z.string().min(1),
-  strength: z.number().optional(),
-  notes: z.string().optional(),
+// Event payload schema (stored in entity.payload for event entities)
+export const EventPayloadSchema = z.object({
+  kind: z.string(),
+  scope: EventScopeEnum,
+  severity: EventSeverityEnum,
+  ongoing: z.boolean(),
+  daysAgo: z.number(),
+  consequences: z.array(EventConsequenceSchema).optional(),
 });
 
-export const SceneGenResultSchema = z.object({
-  entities: z.array(SceneEntitySchema),
-  relations: z.array(SceneRelationSchema),
-  narration: z.string().min(1),
+export type EventPayload = z.infer<typeof EventPayloadSchema>;
+export type EventConsequence = z.infer<typeof EventConsequenceSchema>;
+
+// Reaction schemas for LLM-assisted reactions
+export const ReactionCategoryEnum = z.enum(["political", "economic", "social", "factional"]);
+export const ReactionIntensityEnum = z.enum(["subtle", "moderate", "dramatic"]);
+
+export const ReactionOutcomeSchema = z.object({
+  type: z.enum(["relation", "rumor", "event"]),
+  description: z.string(),
+  targetType: z.string().optional(),
+  targetId: z.string().optional(),
+  relationType: z.string().optional(),
 });
 
-export type SceneGenResult = z.infer<typeof SceneGenResultSchema>;
+export const ReactionCandidateSchema = z.object({
+  description: z.string(),
+  category: ReactionCategoryEnum,
+  intensity: ReactionIntensityEnum,
+  publiclyVisible: z.boolean(),
+  creates: z.array(ReactionOutcomeSchema).optional(),
+});
 
-// A conservative JSON Schema object that both OpenAI Structured Outputs and Ollama's `format` schema tend to accept.
-// We avoid advanced constructs (`oneOf`, patternProperties, etc.) for better compatibility.
-export const SCENE_JSON_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    entities: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          key: { type: "string" },
-          type: { type: "string" },
-          name: { type: "string" },
-          summary: { type: "string" },
-          details_md: { type: "string" },
-          tags: { type: "array", items: { type: "string" } },
-          payload: { type: "object" },
-        },
-        required: ["key", "type", "name"],
-      },
-    },
-    relations: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          from: { type: "string" },
-          to: { type: "string" },
-          rel_type: { type: "string" },
-          strength: { type: "number" },
-          notes: { type: "string" },
-        },
-        required: ["from", "to", "rel_type"],
-      },
-    },
-    narration: { type: "string" },
-  },
-  required: ["entities", "relations", "narration"],
-};
+export const ReactionGenerationResultSchema = z.object({
+  actorName: z.string(),
+  eventName: z.string(),
+  candidates: z.array(ReactionCandidateSchema),
+});
+
+export type ReactionCandidate = z.infer<typeof ReactionCandidateSchema>;
+export type ReactionOutcome = z.infer<typeof ReactionOutcomeSchema>;
