@@ -168,6 +168,8 @@ export function registerGenerateTools(registry: ToolRegistry): void {
           hints: { type: "string", description: "Additional creative hints (e.g., 'criminal ties', 'upscale', 'miners guild')" },
           activeEvents: { type: "string", description: "JSON array of active events to incorporate" },
           existingEntities: { type: "string", description: "JSON array of existing entity names to avoid duplicating" },
+          reason: { type: "string", description: "Reason/prompt for why this entity is being generated (for provenance)" },
+          source: { type: "string", description: "Source application generating this entity (e.g., 'azbrowse', 'azchat')" },
         },
         required: ["kind", "burgId"],
       },
@@ -273,7 +275,13 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Constraints:
           tags: data.location.tags || [kind],
           anchors: { burgId },
           payload: data.location.payload || { kind },
-          provenance: { generated_by: "generate_location", provider: genLlm.provider, model: genLlm.model },
+          provenance: {
+            generated_by: args.source || "generate_location",
+            provider: genLlm.provider,
+            model: genLlm.model,
+            reason: args.reason || null,
+            approved_at: args.reason ? new Date().toISOString() : undefined,
+          },
         });
 
         // Persist NPCs and create relations
@@ -289,7 +297,13 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Constraints:
             tags: npc.tags || [],
             anchors: { burgId },
             payload: npc.payload || {},
-            provenance: { generated_by: "generate_location", provider: genLlm.provider, model: genLlm.model },
+            provenance: {
+              generated_by: args.source || "generate_location",
+              provider: genLlm.provider,
+              model: genLlm.model,
+              reason: args.reason ? `NPC generated as part of ${data.location.name}` : null,
+              approved_at: args.reason ? new Date().toISOString() : undefined,
+            },
           });
           keyToId[npc.key] = npcEntity.id;
           npcSummaries.push({ id: npcEntity.id, name: npc.name, summary: npc.summary || "" });
@@ -312,7 +326,13 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Constraints:
             tags: faction.tags || [],
             anchors: { burgId },
             payload: faction.payload || {},
-            provenance: { generated_by: "generate_location", provider: genLlm.provider, model: genLlm.model },
+            provenance: {
+              generated_by: args.source || "generate_location",
+              provider: genLlm.provider,
+              model: genLlm.model,
+              reason: args.reason ? `Faction generated as part of ${data.location.name}` : null,
+              approved_at: args.reason ? new Date().toISOString() : undefined,
+            },
           });
           keyToId[faction.key] = factionEntity.id;
         }
@@ -370,6 +390,8 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Constraints:
           roles: { type: "string", description: "Suggested roles (e.g., 'barkeep, guard, merchant')" },
           factionIds: { type: "string", description: "JSON array of faction IDs to potentially link NPCs to" },
           activeEvents: { type: "string", description: "JSON array of active events to incorporate" },
+          reason: { type: "string", description: "Reason/prompt for why these NPCs are being generated (for provenance)" },
+          source: { type: "string", description: "Source application generating these NPCs (e.g., 'azbrowse', 'azchat')" },
         },
         required: ["burgId"],
       },
@@ -494,7 +516,13 @@ If linking to factions, use "factionId" in payload and add a "factionRole" (memb
           tags: npc.tags || [],
           anchors: { burgId },
           payload: npc.payload || {},
-          provenance: { generated_by: "generate_npcs", provider: genLlm.provider, model: genLlm.model },
+          provenance: {
+            generated_by: args.source || "generate_npcs",
+            provider: genLlm.provider,
+            model: genLlm.model,
+            reason: args.reason || null,
+            approved_at: args.reason ? new Date().toISOString() : undefined,
+          },
         });
 
         const npcFactions: string[] = [];
@@ -562,6 +590,8 @@ If linking to factions, use "factionId" in payload and add a "factionRole" (memb
           burgId: { type: "number", description: "Burg where faction is based" },
           hints: { type: "string", description: "Additional hints about the faction" },
           activeEvents: { type: "string", description: "JSON array of active events to incorporate" },
+          reason: { type: "string", description: "Reason/prompt for why this faction is being generated (for provenance)" },
+          source: { type: "string", description: "Source application generating this faction (e.g., 'azbrowse', 'azchat')" },
         },
         required: ["kind", "burgId"],
       },
@@ -623,7 +653,13 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY vali
         tags: faction.tags || [kind],
         anchors: { burgId },
         payload: faction.payload || { kind },
-        provenance: { generated_by: "generate_faction", provider: genLlm.provider, model: genLlm.model },
+        provenance: {
+          generated_by: args.source || "generate_faction",
+          provider: genLlm.provider,
+          model: genLlm.model,
+          reason: args.reason || null,
+          approved_at: args.reason ? new Date().toISOString() : undefined,
+        },
       });
 
       return {
@@ -662,6 +698,8 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY vali
           stateId: { type: "number", description: "State where event is centered (if applicable)" },
           daysAgo: { type: "number", description: "How many days ago the event occurred (0 for ongoing)" },
           hints: { type: "string", description: "Additional creative hints" },
+          reason: { type: "string", description: "Reason/prompt for why this event is being generated (for provenance)" },
+          source: { type: "string", description: "Source application generating this event (e.g., 'azbrowse', 'azchat')" },
         },
         required: ["kind", "scope", "severity"],
       },
@@ -727,7 +765,13 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY vali
           ongoing: daysAgo === 0,
           consequences: parsed.data.consequences || [],
         },
-        provenance: { generated_by: "generate_event", provider: genLlm.provider, model: genLlm.model },
+        provenance: {
+          generated_by: args.source || "generate_event",
+          provider: genLlm.provider,
+          model: genLlm.model,
+          reason: args.reason || null,
+          approved_at: args.reason ? new Date().toISOString() : undefined,
+        },
       });
 
       return {
@@ -757,6 +801,8 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY vali
             description: "Aspect: history, customs, holidays, legends, religion, etc.",
           },
           context: { type: "string", description: "Context (burg name, state, culture)" },
+          reason: { type: "string", description: "Reason/prompt for why this lore is being generated (for provenance)" },
+          source: { type: "string", description: "Source application generating this lore (e.g., 'azbrowse', 'azchat')" },
         },
         required: ["subject", "aspect"],
       },
@@ -797,7 +843,13 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output JSON with
         tags: ["lore", aspect],
         anchors: {},
         payload: { subject, aspect, relatedTopics: parsed.data.relatedTopics },
-        provenance: { generated_by: "generate_lore", provider: genLlm.provider, model: genLlm.model },
+        provenance: {
+          generated_by: args.source || "generate_lore",
+          provider: genLlm.provider,
+          model: genLlm.model,
+          reason: args.reason || null,
+          approved_at: args.reason ? new Date().toISOString() : undefined,
+        },
       });
 
       return {

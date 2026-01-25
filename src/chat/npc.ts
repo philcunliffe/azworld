@@ -164,6 +164,7 @@ export async function npcTurn(opts: {
   scene?: SceneContext;
   userText: string;
   campaignSettings?: CampaignSettings;
+  onTokens?: (usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number }) => void;
 }): Promise<string> {
   const npcId = opts.state.currentNpcId;
   if (!npcId) return "(No NPC selected. Use /talk <name>.)";
@@ -187,6 +188,11 @@ export async function npcTurn(opts: {
     maxTokens: 700,
     temperature: 0.8,
   });
+
+  // Report token usage
+  if (res.usage && opts.onTokens) {
+    opts.onTokens(res.usage);
+  }
 
   const text = (res.text || "").trim() || "(The NPC stares silently.)";
   history.push({ role: "assistant", content: text });

@@ -1,7 +1,7 @@
 import { ToolRegistry, ToolContext } from "./index";
 import { EntityType, CanonEntity } from "../../canon/canon";
 
-const VALID_ENTITY_TYPES = ["npc", "faction", "location", "event", "rumor", "hook", "meta"] as const;
+const VALID_ENTITY_TYPES = ["npc", "faction", "location", "event", "rumor", "hook", "meta", "culture"] as const;
 
 export function registerCanonTools(registry: ToolRegistry): void {
   // canon_query - Search entities by type, tags, anchor, kind

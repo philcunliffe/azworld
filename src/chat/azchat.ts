@@ -162,7 +162,8 @@ async function main() {
   if (!campaignSettings) {
     const doSetup = (await ask("No campaign settings found. Configure now? [y/N]: ")).trim().toLowerCase();
     if (doSetup === "y" || doSetup === "yes") {
-      campaignSettings = await runOnboarding(rl, canon);
+      const onboardingResult = await runOnboarding(rl, canon);
+      campaignSettings = onboardingResult.settings;
     } else {
       console.log("(Skipped setup. Use /setup anytime to configure.)\n");
     }
@@ -195,9 +196,9 @@ async function main() {
         continue;
       }
       if (cmd === "setup") {
-        const newSettings = await runOnboarding(rl, canon);
-        if (newSettings) {
-          campaignSettings = newSettings;
+        const onboardingResult = await runOnboarding(rl, canon);
+        if (onboardingResult.settings) {
+          campaignSettings = onboardingResult.settings;
         }
         continue;
       }

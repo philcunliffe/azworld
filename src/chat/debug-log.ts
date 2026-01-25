@@ -8,7 +8,7 @@ let debugEnabled = false;
  * Initialize debug logging for this session.
  * Creates a timestamped log file in the logs directory.
  */
-export function initDebugLog(enabled: boolean, logsDir = "./logs"): string | undefined {
+export function initDebugLog(enabled: boolean, logsDir = "./logs", appName = "azchat"): string | undefined {
   debugEnabled = enabled;
   if (!enabled) {
     logFile = undefined;
@@ -24,10 +24,10 @@ export function initDebugLog(enabled: boolean, logsDir = "./logs"): string | und
 
   // Generate timestamped filename
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  logFile = join(logsDir, `session-${ts}.log`);
+  logFile = join(logsDir, `${appName}-${ts}.log`);
 
   // Write header
-  const header = `=== azchat debug session started ${new Date().toISOString()} ===\n\n`;
+  const header = `=== ${appName} debug session started ${new Date().toISOString()} ===\n\n`;
   appendFileSync(logFile, header);
 
   return logFile;

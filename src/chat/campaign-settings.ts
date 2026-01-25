@@ -2,6 +2,17 @@ import readline from "node:readline";
 import { CanonStore } from "../canon/canon";
 import { CampaignSettings, CampaignSettingsSchema } from "./schema";
 
+export type GenerationFlags = {
+  states?: boolean;
+  religions?: boolean;
+  cultures?: boolean;
+};
+
+export type OnboardingResult = {
+  settings: CampaignSettings | undefined;
+  generate?: GenerationFlags;
+};
+
 const CAMPAIGN_SETTINGS_NAME = "campaign-settings";
 
 /**
@@ -47,7 +58,7 @@ export function saveCampaignSettings(canon: CanonStore, settings: CampaignSettin
 export async function runOnboarding(
   rl: readline.Interface,
   canon: CanonStore
-): Promise<CampaignSettings | undefined> {
+): Promise<OnboardingResult> {
   const ask = (q: string) => new Promise<string>((resolve) => rl.question(q, resolve));
 
   console.log("\n=== Campaign Settings ===");
@@ -56,15 +67,13 @@ export async function runOnboarding(
 
   // World Vibe
   console.log("1. WORLD VIBE");
-  console.log('   The overall feel of your world (e.g., "Dark medieval with lingering magic",');
-  console.log('   "High fantasy with ancient ruins", "Grimdark survival horror")');
-  const worldVibe = (await ask("   World vibe: ")).trim() || undefined;
+  console.log("   The overall feel of your world.");
+  const worldVibe = (await ask('   World vibe (e.g., "Dark medieval with lingering magic", "High fantasy with ancient ruins"): ')).trim() || undefined;
 
   // Cultural Touchpoints
   console.log("\n2. CULTURAL TOUCHPOINTS");
-  console.log('   Inspirations for tone and style (e.g., "Game of Thrones politics, Discworld humor",');
-  console.log('   "Tolkien grandeur, Dark Souls bleakness", "Conan pulp adventure")');
-  const culturalTouchpoints = (await ask("   Inspirations: ")).trim() || undefined;
+  console.log("   Inspirations for tone and style.");
+  const culturalTouchpoints = (await ask('   Inspirations (e.g., "Game of Thrones politics", "Tolkien grandeur", "Dark Souls bleakness"): ')).trim() || undefined;
 
   // Campaign Arc
   console.log("\n3. CAMPAIGN ARC");
@@ -114,14 +123,54 @@ export async function runOnboarding(
   const hasContent = Object.values(settings).some((v) => v !== undefined);
   if (!hasContent) {
     console.log("\n(No settings provided. Using defaults.)");
-    return undefined;
+  } else {
+    // Save settings
+    saveCampaignSettings(canon, settings);
+    console.log("\n(Campaign settings saved!)");
   }
 
-  // Save settings
-  saveCampaignSettings(canon, settings);
-  console.log("\n(Campaign settings saved!)");
+  // World generation questions
+  console.log("\n=== World Generation ===");
+  console.log("Generate initial world content from Azgaar map data.");
+  console.log("This creates factions, NPCs, and lore based on your map.\n");
 
-  return settings;
+  const parseYesNo = (input: string): boolean => {
+    const v = input.trim().toLowerCase();
+    return v === "y" || v === "yes";
+  };
+
+  // 7. Generate State/Government content
+  console.log("7. GENERATE GOVERNMENTS & RULERS");
+  console.log("   Creates a faction for each state's government and a ruler NPC.");
+  console.log("   Determines industries based on geography, ports, military.");
+  const genStatesInput = (await ask("   Generate governments? [y/N]: ")).trim();
+  const genStates = parseYesNo(genStatesInput);
+
+  // 8. Generate Religion content
+  console.log("\n8. GENERATE RELIGIONS");
+  console.log("   Creates a faction for each religion with high priests/prophets.");
+  console.log("   Adds details about practices, holy sites, and beliefs.");
+  const genReligionsInput = (await ask("   Generate religions? [y/N]: ")).trim();
+  const genReligions = parseYesNo(genReligionsInput);
+
+  // 9. Generate Culture content
+  console.log("\n9. GENERATE CULTURES");
+  console.log("   Creates culture entities describing each culture's customs.");
+  console.log("   Considers climate, biomes, geography, and nearby religions.");
+  const genCulturesInput = (await ask("   Generate cultures? [y/N]: ")).trim();
+  const genCultures = parseYesNo(genCulturesInput);
+
+  const generate: GenerationFlags = {};
+  if (genStates) generate.states = true;
+  if (genReligions) generate.religions = true;
+  if (genCultures) generate.cultures = true;
+
+  const hasGeneration = Object.keys(generate).length > 0;
+
+  return {
+    settings: hasContent ? settings : undefined,
+    generate: hasGeneration ? generate : undefined,
+  };
 }
 
 /**

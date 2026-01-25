@@ -15,15 +15,15 @@ export type ModelConfig = {
 
 // Known model configurations - exact matches take priority
 const MODEL_CONFIGS: Record<string, ModelConfig> = {
-  // OpenAI GPT-5 series (2025+) - many have fixed temperature
-  "gpt-5": { fixedTemperature: 1 },
-  "gpt-5-mini": { fixedTemperature: 1 },
-  "gpt-5-turbo": { fixedTemperature: 1 },
-  "gpt-5.1": { fixedTemperature: 1 },
-  "gpt-5.1-mini": { fixedTemperature: 1 },
-  "gpt-5.2": { fixedTemperature: 1 },
-  "gpt-5.2-mini": { fixedTemperature: 1 },
-  "gpt-5.2-chat-latest": { fixedTemperature: 1 },
+  // OpenAI GPT-5 series (2025+) - reasoning models with fixed temperature
+  "gpt-5": { fixedTemperature: 1, reasoningModel: true },
+  "gpt-5-mini": { fixedTemperature: 1, reasoningModel: true },
+  "gpt-5-turbo": { fixedTemperature: 1, reasoningModel: true },
+  "gpt-5.1": { fixedTemperature: 1, reasoningModel: true },
+  "gpt-5.1-mini": { fixedTemperature: 1, reasoningModel: true },
+  "gpt-5.2": { fixedTemperature: 1, reasoningModel: true },
+  "gpt-5.2-mini": { fixedTemperature: 1, reasoningModel: true },
+  "gpt-5.2-chat-latest": { fixedTemperature: 1, reasoningModel: true },
 
   // OpenAI o-series reasoning models - no temperature control
   "o1": { fixedTemperature: 1, reasoningModel: true },
@@ -56,8 +56,8 @@ const MODEL_CONFIGS: Record<string, ModelConfig> = {
 // Pattern-based model matching for model families
 // Returns config if pattern matches, undefined otherwise
 const MODEL_PATTERNS: Array<{ pattern: RegExp; config: ModelConfig }> = [
-  // Any gpt-5.x model defaults to fixed temperature
-  { pattern: /^gpt-5(\.\d+)?(-|$)/i, config: { fixedTemperature: 1 } },
+  // Any gpt-5.x model - reasoning models with fixed temperature
+  { pattern: /^gpt-5(\.\d+)?(-|$)/i, config: { fixedTemperature: 1, reasoningModel: true } },
 
   // Any o1/o3/o4 reasoning model
   { pattern: /^o[134](-|$)/i, config: { fixedTemperature: 1, reasoningModel: true } },
@@ -105,6 +105,36 @@ function getEffectiveTemperature(model: string, requested?: number): number | un
   }
 
   return requested;
+}
+
+// Reasoning models use tokens for internal thinking AND output, so they need more headroom.
+// This multiplier ensures enough tokens for both reasoning and actual response.
+const REASONING_TOKEN_MULTIPLIER = 4;
+const REASONING_MIN_TOKENS = 8000;
+
+// Get effective maxTokens for a model, accounting for reasoning model needs
+function getEffectiveMaxTokens(model: string, requested?: number): number | undefined {
+  const config = getModelConfig(model);
+
+  if (config.reasoningModel && requested !== undefined) {
+    // Reasoning models need significantly more tokens since they use them for thinking
+    return Math.max(requested * REASONING_TOKEN_MULTIPLIER, REASONING_MIN_TOKENS);
+  }
+
+  return requested;
+}
+
+// Check if an API response indicates token exhaustion on a reasoning model
+function isReasoningTokenExhaustion(raw: any): boolean {
+  const choice = raw?.choices?.[0];
+  if (!choice) return false;
+
+  // Check for empty content with length finish reason and reasoning tokens used
+  const content = choice.message?.content ?? "";
+  const finishReason = choice.finish_reason;
+  const reasoningTokens = raw?.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+
+  return content === "" && finishReason === "length" && reasoningTokens > 0;
 }
 
 // Tool-use types
@@ -811,17 +841,34 @@ export async function listModels(provider: LLMProviderName): Promise<ModelInfo[]
 }
 
 export async function completeJson<T = any>(client: LLMClient, opts: Omit<CompleteOpts, "jsonMode"> & { jsonSchema?: any }): Promise<T> {
+  // Adjust maxTokens for reasoning models
+  const effectiveMaxTokens = getEffectiveMaxTokens(client.model, opts.maxTokens);
+
   if (isDebugEnabled()) {
     debugLLMCall("completeJson System prompt", opts.system);
     debugLLMCall("completeJson User message", opts.messages?.[0]?.content);
-    debugLLMCall("completeJson Options", { maxTokens: opts.maxTokens, temp: opts.temperature, hasSchema: !!opts.jsonSchema });
+    debugLLMCall("completeJson Options", {
+      maxTokens: opts.maxTokens,
+      effectiveMaxTokens,
+      temp: opts.temperature,
+      hasSchema: !!opts.jsonSchema,
+    });
   }
 
-  const res = await client.complete({ ...opts, jsonMode: true });
+  const res = await client.complete({ ...opts, maxTokens: effectiveMaxTokens, jsonMode: true });
 
   if (isDebugEnabled()) {
     debugLLMCall("completeJson Raw response", res.text);
     debugLLMCall("completeJson Raw API response", res.raw);
+  }
+
+  // Check for reasoning model token exhaustion (empty response, all tokens used on thinking)
+  if (isReasoningTokenExhaustion(res.raw)) {
+    const used = res.raw?.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+    throw new Error(
+      `Reasoning model exhausted tokens on thinking (${used} reasoning tokens used, no output). ` +
+      `Try increasing maxTokens or using a non-reasoning model for this task.`
+    );
   }
 
   try {
@@ -829,6 +876,58 @@ export async function completeJson<T = any>(client: LLMClient, opts: Omit<Comple
     return parsed as T;
   } catch (e: any) {
     debugLLMCall("completeJson Parse error - full response", res.text);
-    throw e;
+    // Include preview of the response in error for easier debugging
+    const preview = res.text.length > 200 ? res.text.slice(0, 200) + "..." : res.text;
+    throw new Error(`Failed to parse JSON from LLM response: ${preview}`);
+  }
+}
+
+export type CompleteJsonResult<T> = {
+  data: T;
+  usage?: TokenUsage;
+};
+
+export async function completeJsonWithUsage<T = any>(
+  client: LLMClient,
+  opts: Omit<CompleteOpts, "jsonMode"> & { jsonSchema?: any }
+): Promise<CompleteJsonResult<T>> {
+  // Adjust maxTokens for reasoning models
+  const effectiveMaxTokens = getEffectiveMaxTokens(client.model, opts.maxTokens);
+
+  if (isDebugEnabled()) {
+    debugLLMCall("completeJson System prompt", opts.system);
+    debugLLMCall("completeJson User message", opts.messages?.[0]?.content);
+    debugLLMCall("completeJson Options", {
+      maxTokens: opts.maxTokens,
+      effectiveMaxTokens,
+      temp: opts.temperature,
+      hasSchema: !!opts.jsonSchema,
+    });
+  }
+
+  const res = await client.complete({ ...opts, maxTokens: effectiveMaxTokens, jsonMode: true });
+
+  if (isDebugEnabled()) {
+    debugLLMCall("completeJson Raw response", res.text);
+    debugLLMCall("completeJson Raw API response", res.raw);
+  }
+
+  // Check for reasoning model token exhaustion (empty response, all tokens used on thinking)
+  if (isReasoningTokenExhaustion(res.raw)) {
+    const used = res.raw?.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+    throw new Error(
+      `Reasoning model exhausted tokens on thinking (${used} reasoning tokens used, no output). ` +
+      `Try increasing maxTokens or using a non-reasoning model for this task.`
+    );
+  }
+
+  try {
+    const parsed = parseJsonLoose(res.text);
+    return { data: parsed as T, usage: res.usage };
+  } catch (e: any) {
+    debugLLMCall("completeJson Parse error - full response", res.text);
+    // Include preview of the response in error for easier debugging
+    const preview = res.text.length > 200 ? res.text.slice(0, 200) + "..." : res.text;
+    throw new Error(`Failed to parse JSON from LLM response: ${preview}`);
   }
 }

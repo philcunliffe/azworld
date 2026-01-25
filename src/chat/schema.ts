@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const EntityTypeEnum = z.enum(["npc", "faction", "location", "event", "rumor", "hook", "meta"]);
+export const EntityTypeEnum = z.enum(["npc", "faction", "location", "event", "rumor", "hook", "meta", "culture"]);
 
 // Event scope and severity enums
 export const EventScopeEnum = z.enum(["neighborhood", "burg", "state", "region", "world"]);

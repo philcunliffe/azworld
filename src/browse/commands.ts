@@ -4,7 +4,20 @@
 
 import { AzgaarWorld } from "../world/azgaar";
 import { CanonStore, CanonEntity, EntityType } from "../canon/canon";
-import { LLMClient, completeJson } from "../llm/providers";
+import {
+  LLMClient,
+  completeJson,
+  listModels,
+  createLLMClient,
+  type LLMProviderName,
+} from "../llm/providers";
+import {
+  type LLMConfig,
+  saveConfig,
+  getEffectiveModel,
+  getEffectiveGenerationModel,
+  validateProviderSwitch,
+} from "../llm/config";
 import { directScene, SceneContext } from "../chat/director";
 import { npcTurn, resolveNpcByName } from "../chat/npc";
 import { CampaignSettings } from "../chat/schema";
@@ -33,6 +46,14 @@ import {
   listContextual,
   formatListResult,
 } from "./listing";
+import {
+  planGeneration,
+  executeGeneration,
+  formatPlanForApproval,
+  syncNavigationFromChatState,
+  GenContext,
+} from "./gen-agent";
+import { selectPrompt } from "./select-prompt";
 
 // Color codes
 const RESET = "\x1b[0m";
@@ -53,6 +74,17 @@ export type CommandContext = {
   useColors?: boolean;
   onToolCall?: (name: string, args: any) => void;
   onToolResult?: (name: string, result: any, elapsedMs: number) => void;
+  onTokens?: (usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number }) => void;
+  getTokens?: () => { promptTokens: number; completionTokens: number; totalTokens: number };
+  // Entity generation progress callbacks
+  onEntityStart?: (name: string, index: number, total: number) => void;
+  onEntityComplete?: (name: string, index: number, total: number, tokens: number, elapsedMs: number) => void;
+  // Model switching support
+  config?: LLMConfig;
+  onConfigChange?: (config: LLMConfig) => void;
+  onLlmChange?: (llm: LLMClient) => void;
+  onGenerationLlmChange?: (llm: LLMClient | undefined) => void;
+  setStatusBarProvider?: (provider: string, model: string) => void;
 };
 
 export type CommandResult = {
@@ -288,8 +320,22 @@ export async function executeCommand(
     return { error: `Relation not found: ${argStr}` };
   }
 
-  // Generation: gen location <kind> [hints]
+  // Smart Generation with planning and permission: gen location <kind> [hints]
   if (cmd === "gen") {
+    const [subCmd, ...subArgs] = args;
+
+    if (subCmd === "location" || subCmd === "npc" || subCmd === "faction") {
+      const kind = subCmd === "npc" ? undefined : (subArgs[0] || (subCmd === "location" ? "tavern" : "guild"));
+      const hints = subCmd === "npc" ? subArgs.join(" ") : subArgs.slice(1).join(" ");
+      const fullPrompt = hints ? `${kind ? kind + " " : ""}${hints}`.trim() : (kind || subCmd);
+
+      return runSmartGeneration(subCmd as "location" | "npc" | "faction", kind, fullPrompt, ctx);
+    }
+    return { error: "Usage: gen location|npc|faction <kind> [hints]" };
+  }
+
+  // Simple Generation (old behavior, no planning): simplegen location <kind> [hints]
+  if (cmd === "simplegen") {
     const [subCmd, ...subArgs] = args;
     const hints = subArgs.slice(1).join(" ");
 
@@ -304,7 +350,7 @@ export async function executeCommand(
       const kind = subArgs[0] || "guild";
       return generateFaction(kind, hints, ctx);
     }
-    return { error: "Usage: gen location|npc|faction <kind> [hints]" };
+    return { error: "Usage: simplegen location|npc|faction <kind> [hints]" };
   }
 
   // Modification: mod [id] <hints>
@@ -345,6 +391,28 @@ export async function executeCommand(
   // Campaign settings: /init
   if (cmd === "/init" || cmd === "/setup") {
     return { runOnboarding: true };
+  }
+
+  // Token usage: /tokens
+  if (cmd === "/tokens") {
+    if (!ctx.getTokens) {
+      return { output: "(Token tracking not available)" };
+    }
+    const tokens = ctx.getTokens();
+    const formatNum = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+    return {
+      output: `Session tokens: ${formatNum(tokens.totalTokens)} total (${formatNum(tokens.promptTokens)} prompt, ${formatNum(tokens.completionTokens)} completion)`,
+    };
+  }
+
+  // Model switching: /model
+  if (cmd === "/model") {
+    return handleModelCommand(argStr, ctx);
+  }
+
+  // Generation model switching: /genmodel
+  if (cmd === "/genmodel") {
+    return handleGenModelCommand(argStr, ctx);
   }
 
   // Unknown command
@@ -530,7 +598,70 @@ function deleteEntity(idOrEmpty: string, ctx: CommandContext): CommandResult {
   return { error: `Failed to delete: ${entityId}` };
 }
 
-// Generation commands
+// Smart generation with planning and permission prompt
+async function runSmartGeneration(
+  genType: "location" | "npc" | "faction",
+  kindHint: string | undefined,
+  prompt: string,
+  ctx: CommandContext
+): Promise<CommandResult> {
+  const genCtx: GenContext = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
+    onEntityStart: ctx.onEntityStart,
+    onEntityComplete: ctx.onEntityComplete,
+  };
+
+  try {
+    // Phase 1: Planning
+    const plan = await planGeneration(prompt, genType, kindHint, genCtx);
+
+    // Phase 2: Show permission prompt
+    const approval = formatPlanForApproval(plan, ctx.useColors);
+    console.log(approval);
+
+    // Ask for user approval with arrow-key selection
+    const answer = await selectPrompt({
+      message: "What would you like to do?",
+      options: [
+        { label: "Create", value: "create", hint: "Generate the planned entities" },
+        { label: "Cancel", value: "cancel", hint: "Abort without creating anything" },
+        { label: "Edit", value: "edit", hint: "Modify hints and try again" },
+      ],
+      useColors: ctx.useColors,
+      defaultIndex: 0,
+    });
+
+    if (answer === null || answer === "cancel") {
+      return { output: "(Cancelled)" };
+    }
+
+    if (answer === "edit") {
+      return { output: "(Edit mode not yet implemented. Run the command again with modified hints.)" };
+    }
+
+    // Phase 3: Execute generation
+    const result = await executeGeneration(plan, genCtx);
+
+    // Phase 4: Sync navigation to new location
+    syncNavigationFromChatState(genCtx);
+
+    const green = ctx.useColors ? GREEN : "";
+    const reset = ctx.useColors ? RESET : "";
+    return { output: `${green}${result.summary}${reset}` };
+  } catch (e: any) {
+    return { error: `Generation failed: ${e?.message || String(e)}` };
+  }
+}
+
+// Simple generation commands (legacy single-shot behavior)
 async function generateLocation(kind: string, hints: string, ctx: CommandContext): Promise<CommandResult> {
   const burgId = currentBurgId(ctx.state);
   if (burgId === undefined) {
@@ -982,6 +1113,179 @@ function formatEntityInfo(entity: CanonEntity, useColors?: boolean): string {
   ].filter(Boolean).join("\n");
 }
 
+// Model command handler
+async function handleModelCommand(argStr: string, ctx: CommandContext): Promise<CommandResult> {
+  // No args: show current
+  if (!argStr) {
+    const lines = [`Chat:       ${ctx.llm.provider}/${ctx.llm.model}`];
+    if (ctx.generationLlm) {
+      lines.push(`Generation: ${ctx.generationLlm.provider}/${ctx.generationLlm.model}`);
+    } else {
+      lines.push(`Generation: (using chat model)`);
+    }
+    return { output: lines.join("\n") };
+  }
+
+  // List available
+  if (argStr === "list") {
+    const lines: string[] = ["Fetching available models...\n"];
+
+    // Ollama
+    lines.push("ollama:");
+    const ollamaModels = await listModels("ollama");
+    if (ollamaModels.length === 0) {
+      lines.push("  (none found - is Ollama running?)");
+    } else {
+      for (const m of ollamaModels) {
+        const sizeStr = m.size ? ` (${m.size})` : "";
+        lines.push(`  ${m.id}${sizeStr}`);
+      }
+    }
+
+    // OpenAI
+    lines.push("\nopenai:");
+    const openaiModels = await listModels("openai");
+    if (openaiModels.length === 0) {
+      lines.push("  (no API key or failed to fetch)");
+    } else {
+      for (const m of openaiModels.slice(0, 15)) {
+        lines.push(`  ${m.id}`);
+      }
+      if (openaiModels.length > 15) {
+        lines.push(`  ... and ${openaiModels.length - 15} more`);
+      }
+    }
+
+    // Anthropic
+    lines.push("\nanthropic:");
+    const anthropicModels = await listModels("anthropic");
+    for (const m of anthropicModels) {
+      lines.push(`  ${m.id}`);
+    }
+
+    return { output: lines.join("\n") };
+  }
+
+  // Parse provider/model
+  const parts = argStr.split("/", 2);
+  const newProvider = parts[0] as LLMProviderName;
+  const newModel = parts[1]; // may be undefined
+
+  if (!["ollama", "openai", "anthropic"].includes(newProvider)) {
+    return { error: `Unknown provider: ${newProvider}. Use: ollama, openai, anthropic` };
+  }
+
+  // Validate API key requirements
+  const validationError = validateProviderSwitch(newProvider);
+  if (validationError) {
+    return { error: `Cannot switch: ${validationError}` };
+  }
+
+  if (!ctx.config || !ctx.onConfigChange || !ctx.onLlmChange) {
+    return { error: "Model switching not available (no config context)" };
+  }
+
+  try {
+    // Determine effective model
+    const effectiveModel = newModel || getEffectiveModel(ctx.config, newProvider);
+
+    // Create new client
+    const newLlm = createLLMClient({ provider: newProvider, model: effectiveModel });
+
+    // Update and save config
+    const newConfig: LLMConfig = {
+      ...ctx.config,
+      provider: newProvider,
+      models: {
+        ...ctx.config.models,
+        [newProvider]: effectiveModel,
+      },
+    };
+    await saveConfig(newConfig);
+
+    // Hot-swap via callbacks
+    ctx.onConfigChange(newConfig);
+    ctx.onLlmChange(newLlm);
+    if (ctx.setStatusBarProvider) {
+      ctx.setStatusBarProvider(newLlm.provider, newLlm.model);
+    }
+
+    return { output: `Chat model: ${newLlm.provider}/${newLlm.model}` };
+  } catch (e: any) {
+    return { error: `Failed to switch: ${e?.message ?? String(e)}` };
+  }
+}
+
+// Generation model command handler
+async function handleGenModelCommand(argStr: string, ctx: CommandContext): Promise<CommandResult> {
+  // Disable separate generation model
+  if (argStr === "off" || argStr === "none" || argStr === "disable") {
+    if (!ctx.config || !ctx.onConfigChange || !ctx.onGenerationLlmChange) {
+      return { error: "Model switching not available (no config context)" };
+    }
+
+    const newConfig: LLMConfig = {
+      ...ctx.config,
+      generationProvider: undefined,
+      generationModels: undefined,
+    };
+    await saveConfig(newConfig);
+    ctx.onConfigChange(newConfig);
+    ctx.onGenerationLlmChange(undefined);
+    return { output: "Generation model disabled (using chat model)" };
+  }
+
+  // No args: show current
+  if (!argStr) {
+    if (ctx.generationLlm) {
+      return { output: `Generation: ${ctx.generationLlm.provider}/${ctx.generationLlm.model}` };
+    } else {
+      return { output: `Generation: (using chat model: ${ctx.llm.provider}/${ctx.llm.model})` };
+    }
+  }
+
+  // Parse provider/model
+  const parts = argStr.split("/", 2);
+  const newProvider = parts[0] as LLMProviderName;
+  const newModel = parts[1];
+
+  if (!["ollama", "openai", "anthropic"].includes(newProvider)) {
+    return { error: `Unknown provider: ${newProvider}. Use: ollama, openai, anthropic` };
+  }
+
+  const validationError = validateProviderSwitch(newProvider);
+  if (validationError) {
+    return { error: `Cannot switch: ${validationError}` };
+  }
+
+  if (!ctx.config || !ctx.onConfigChange || !ctx.onGenerationLlmChange) {
+    return { error: "Model switching not available (no config context)" };
+  }
+
+  try {
+    const effectiveModel = newModel || getEffectiveGenerationModel(ctx.config, newProvider);
+    const newGenLlm = createLLMClient({ provider: newProvider, model: effectiveModel });
+
+    // Update and save config
+    const newConfig: LLMConfig = {
+      ...ctx.config,
+      generationProvider: newProvider,
+      generationModels: {
+        ...ctx.config.generationModels,
+        [newProvider]: effectiveModel,
+      },
+    };
+    await saveConfig(newConfig);
+
+    ctx.onConfigChange(newConfig);
+    ctx.onGenerationLlmChange(newGenLlm);
+
+    return { output: `Generation model: ${newGenLlm.provider}/${newGenLlm.model}` };
+  } catch (e: any) {
+    return { error: `Failed to switch: ${e?.message ?? String(e)}` };
+  }
+}
+
 // Help text
 function helpText(useColors?: boolean): string {
   const bold = useColors ? BOLD : "";
@@ -1014,9 +1318,12 @@ ${cyan}Information${reset}
   search <term>      Fuzzy search across world and canon
 
 ${cyan}Generation (LLM)${reset}
-  gen location <kind> [hints]   Generate location at current burg
-  gen npc [hints]               Generate NPCs at current location
-  gen faction <kind> [hints]    Generate faction
+  gen location <kind> [hints]   Smart generation with planning & approval
+  gen npc [hints]               Smart NPC generation with connections
+  gen faction <kind> [hints]    Smart faction generation with context
+  simplegen location <kind>     Quick generation (no planning step)
+  simplegen npc [hints]         Quick NPC generation
+  simplegen faction <kind>      Quick faction generation
 
 ${cyan}Modification${reset}
   mod <hints>        Modify current entity with natural language
@@ -1035,6 +1342,12 @@ ${cyan}LLM/Chat${reset}
 
 ${cyan}Settings${reset}
   /init              Configure campaign settings (vibe, quest, tone, rating)
+  /tokens            Show session token usage
+  /model             Show current LLM provider/model (chat + generation)
+  /model list        List available providers and models
+  /model <p>/<m>     Switch chat model (e.g., /model openai/gpt-4o)
+  /genmodel <p>/<m>  Switch generation model (e.g., /genmodel anthropic/claude-sonnet-4-5-20250929)
+  /genmodel off      Use chat model for generation (disable separate model)
 
 ${cyan}Other${reset}
   help               Show this help
