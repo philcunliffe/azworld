@@ -10,6 +10,7 @@
   "scripts": {
     "azcli": "bun run src/cli/azcli.ts",
     "azchat": "bun run src/chat/azchat.ts",
+    "azbrowse": "bun run src/browse/azbrowse.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

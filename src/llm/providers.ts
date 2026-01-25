@@ -1,6 +1,111 @@
 import { parseJsonLoose } from "../util/json";
+import { debugLLMCall, isDebugEnabled } from "../chat/debug-log";
 
 export type LLMProviderName = "ollama" | "openai" | "anthropic";
+
+// Per-model configuration for handling model-specific quirks
+export type ModelConfig = {
+  fixedTemperature?: number;              // If set, temperature is locked to this value
+  temperatureRange?: { min: number; max: number };  // Clamp temperature to this range
+  supportsTools?: boolean;                // Whether model supports tool calling (default: true)
+  supportsJsonMode?: boolean;             // Whether model supports JSON mode (default: true)
+  maxOutputTokens?: number;               // Model's max output token limit
+  reasoningModel?: boolean;               // Whether this is a reasoning/thinking model
+};
+
+// Known model configurations - exact matches take priority
+const MODEL_CONFIGS: Record<string, ModelConfig> = {
+  // OpenAI GPT-5 series (2025+) - many have fixed temperature
+  "gpt-5": { fixedTemperature: 1 },
+  "gpt-5-mini": { fixedTemperature: 1 },
+  "gpt-5-turbo": { fixedTemperature: 1 },
+  "gpt-5.1": { fixedTemperature: 1 },
+  "gpt-5.1-mini": { fixedTemperature: 1 },
+  "gpt-5.2": { fixedTemperature: 1 },
+  "gpt-5.2-mini": { fixedTemperature: 1 },
+  "gpt-5.2-chat-latest": { fixedTemperature: 1 },
+
+  // OpenAI o-series reasoning models - no temperature control
+  "o1": { fixedTemperature: 1, reasoningModel: true },
+  "o1-mini": { fixedTemperature: 1, reasoningModel: true },
+  "o1-preview": { fixedTemperature: 1, reasoningModel: true },
+  "o3": { fixedTemperature: 1, reasoningModel: true },
+  "o3-mini": { fixedTemperature: 1, reasoningModel: true },
+  "o3-mini-high": { fixedTemperature: 1, reasoningModel: true },
+  "o4-mini": { fixedTemperature: 1, reasoningModel: true },
+
+  // GPT-4o series - standard temperature support
+  "gpt-4o": { temperatureRange: { min: 0, max: 2 }, maxOutputTokens: 16384 },
+  "gpt-4o-mini": { temperatureRange: { min: 0, max: 2 }, maxOutputTokens: 16384 },
+  "gpt-4o-2024-08-06": { temperatureRange: { min: 0, max: 2 }, maxOutputTokens: 16384 },
+  "gpt-4o-2024-11-20": { temperatureRange: { min: 0, max: 2 }, maxOutputTokens: 16384 },
+
+  // GPT-4 Turbo
+  "gpt-4-turbo": { temperatureRange: { min: 0, max: 2 }, maxOutputTokens: 4096 },
+  "gpt-4-turbo-preview": { temperatureRange: { min: 0, max: 2 }, maxOutputTokens: 4096 },
+
+  // Legacy GPT-4
+  "gpt-4": { temperatureRange: { min: 0, max: 2 }, maxOutputTokens: 8192 },
+  "gpt-4-32k": { temperatureRange: { min: 0, max: 2 }, maxOutputTokens: 8192 },
+
+  // GPT-3.5 Turbo
+  "gpt-3.5-turbo": { temperatureRange: { min: 0, max: 2 }, maxOutputTokens: 4096 },
+  "gpt-3.5-turbo-16k": { temperatureRange: { min: 0, max: 2 }, maxOutputTokens: 4096 },
+};
+
+// Pattern-based model matching for model families
+// Returns config if pattern matches, undefined otherwise
+const MODEL_PATTERNS: Array<{ pattern: RegExp; config: ModelConfig }> = [
+  // Any gpt-5.x model defaults to fixed temperature
+  { pattern: /^gpt-5(\.\d+)?(-|$)/i, config: { fixedTemperature: 1 } },
+
+  // Any o1/o3/o4 reasoning model
+  { pattern: /^o[134](-|$)/i, config: { fixedTemperature: 1, reasoningModel: true } },
+
+  // Any gpt-4o variant
+  { pattern: /^gpt-4o(-|$)/i, config: { temperatureRange: { min: 0, max: 2 }, maxOutputTokens: 16384 } },
+
+  // Any gpt-4-turbo variant
+  { pattern: /^gpt-4-turbo/i, config: { temperatureRange: { min: 0, max: 2 }, maxOutputTokens: 4096 } },
+
+  // Any gpt-4 variant (non-turbo, non-o)
+  { pattern: /^gpt-4(-\d|$)/i, config: { temperatureRange: { min: 0, max: 2 }, maxOutputTokens: 8192 } },
+
+  // Any gpt-3.5 variant
+  { pattern: /^gpt-3\.5/i, config: { temperatureRange: { min: 0, max: 2 }, maxOutputTokens: 4096 } },
+];
+
+// Get model config, checking exact match first, then patterns
+export function getModelConfig(model: string): ModelConfig {
+  // Exact match first
+  if (MODEL_CONFIGS[model]) {
+    return MODEL_CONFIGS[model];
+  }
+
+  // Try pattern matching
+  for (const { pattern, config } of MODEL_PATTERNS) {
+    if (pattern.test(model)) {
+      return config;
+    }
+  }
+
+  return {};
+}
+
+// Get effective temperature for a model, applying any constraints
+function getEffectiveTemperature(model: string, requested?: number): number | undefined {
+  const config = getModelConfig(model);
+
+  if (config.fixedTemperature !== undefined) {
+    return config.fixedTemperature;
+  }
+
+  if (requested !== undefined && config.temperatureRange) {
+    return Math.max(config.temperatureRange.min, Math.min(config.temperatureRange.max, requested));
+  }
+
+  return requested;
+}
 
 // Tool-use types
 export type ToolDefinition = {
@@ -39,11 +144,18 @@ export type CompleteOpts = {
   toolChoice?: "auto" | "required" | "none";
 };
 
+export type TokenUsage = {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+};
+
 export type CompleteResult = {
   text: string;
   raw?: any;
   toolCalls?: ToolCall[];
   stopReason?: "end_turn" | "tool_use" | "max_tokens";
+  usage?: TokenUsage;
 };
 
 // Streaming types
@@ -74,6 +186,37 @@ function addJsonDiscipline(system: string | undefined): string {
     "If the user requests structured output, respond with ONLY valid JSON. No markdown, no backticks, no commentary." +
     " If you must refuse or report an error, still output JSON with an 'error' field."
   );
+}
+
+function extractUsage(resp: any): TokenUsage | undefined {
+  // OpenAI format
+  if (resp?.usage) {
+    return {
+      promptTokens: resp.usage.prompt_tokens ?? resp.usage.input_tokens ?? 0,
+      completionTokens: resp.usage.completion_tokens ?? resp.usage.output_tokens ?? 0,
+      totalTokens: resp.usage.total_tokens ??
+        ((resp.usage.prompt_tokens ?? 0) + (resp.usage.completion_tokens ?? 0)),
+    };
+  }
+  // Anthropic format
+  if (resp?.usage?.input_tokens !== undefined) {
+    return {
+      promptTokens: resp.usage.input_tokens ?? 0,
+      completionTokens: resp.usage.output_tokens ?? 0,
+      totalTokens: (resp.usage.input_tokens ?? 0) + (resp.usage.output_tokens ?? 0),
+    };
+  }
+  // Ollama format
+  if (resp?.prompt_eval_count !== undefined || resp?.eval_count !== undefined) {
+    const prompt = resp.prompt_eval_count ?? 0;
+    const completion = resp.eval_count ?? 0;
+    return {
+      promptTokens: prompt,
+      completionTokens: completion,
+      totalTokens: prompt + completion,
+    };
+  }
+  return undefined;
 }
 
 function extractOpenAIOutputText(resp: any): string {
@@ -118,7 +261,8 @@ export class OpenAIResponsesClient implements LLMClient {
       instructions,
       store: false,
     };
-    if (typeof opts.temperature === "number") body.temperature = opts.temperature;
+    const effectiveTempResp = getEffectiveTemperature(this.model, opts.temperature);
+    if (typeof effectiveTempResp === "number") body.temperature = effectiveTempResp;
     if (typeof opts.maxTokens === "number") body.max_output_tokens = opts.maxTokens;
 
     if (opts.jsonMode) {
@@ -145,7 +289,8 @@ export class OpenAIResponsesClient implements LLMClient {
 
     const json = await res.json();
     const text = extractOpenAIOutputText(json);
-    return { text, raw: json };
+    const usage = extractUsage(json);
+    return { text, raw: json, usage };
   }
 }
 
@@ -196,7 +341,8 @@ export class OpenAIChatClient implements LLMClient {
       messages,
     };
 
-    if (typeof opts.temperature === "number") body.temperature = opts.temperature;
+    const effectiveTemp = getEffectiveTemperature(this.model, opts.temperature);
+    if (typeof effectiveTemp === "number") body.temperature = effectiveTemp;
     if (typeof opts.maxTokens === "number") body.max_completion_tokens = opts.maxTokens;
 
     if (opts.tools?.length) {
@@ -214,7 +360,19 @@ export class OpenAIChatClient implements LLMClient {
     }
 
     if (opts.jsonMode && !opts.tools?.length) {
-      body.response_format = { type: "json_object" };
+      if (opts.jsonSchema) {
+        // Use structured outputs - strict mode disabled to allow flexible payload objects
+        body.response_format = {
+          type: "json_schema",
+          json_schema: {
+            name: "response",
+            strict: false,
+            schema: opts.jsonSchema,
+          },
+        };
+      } else {
+        body.response_format = { type: "json_object" };
+      }
     }
 
     const res = await fetch(url, {
@@ -262,7 +420,8 @@ export class OpenAIChatClient implements LLMClient {
       stopReason = "max_tokens";
     }
 
-    return { text, raw: json, toolCalls: toolCalls.length ? toolCalls : undefined, stopReason };
+    const usage = extractUsage(json);
+    return { text, raw: json, toolCalls: toolCalls.length ? toolCalls : undefined, stopReason, usage };
   }
 
   async *completeStream(opts: CompleteOpts): AsyncIterable<StreamChunk> {
@@ -296,7 +455,8 @@ export class OpenAIChatClient implements LLMClient {
       stream: true,
     };
 
-    if (typeof opts.temperature === "number") body.temperature = opts.temperature;
+    const effectiveTempStream = getEffectiveTemperature(this.model, opts.temperature);
+    if (typeof effectiveTempStream === "number") body.temperature = effectiveTempStream;
     if (typeof opts.maxTokens === "number") body.max_completion_tokens = opts.maxTokens;
 
     if (opts.tools?.length) {
@@ -492,11 +652,13 @@ export class AnthropicMessagesClient implements LLMClient {
       stopReason = "max_tokens";
     }
 
+    const usage = extractUsage(json);
     return {
       text: text || (toolCalls.length ? "" : JSON.stringify(json)),
       raw: json,
       toolCalls: toolCalls.length ? toolCalls : undefined,
       stopReason,
+      usage,
     };
   }
 }
@@ -508,7 +670,7 @@ export class OllamaChatClient implements LLMClient {
 
   constructor(overrideModel?: string) {
     this.baseUrl = process.env.OLLAMA_HOST || "http://localhost:11434";
-    this.model = overrideModel || process.env.OLLAMA_MODEL || "llama3";
+    this.model = overrideModel || process.env.OLLAMA_MODEL || "llama3.2";
   }
 
   async complete(opts: CompleteOpts): Promise<CompleteResult> {
@@ -544,7 +706,8 @@ export class OllamaChatClient implements LLMClient {
 
     const json = await res.json();
     const text = json?.message?.content;
-    return { text: typeof text === "string" ? text : JSON.stringify(json), raw: json };
+    const usage = extractUsage(json);
+    return { text: typeof text === "string" ? text : JSON.stringify(json), raw: json, usage };
   }
 }
 
@@ -568,8 +731,104 @@ export function createLLMClient(opts?: CreateLLMClientOpts): LLMClient {
   return new OllamaChatClient(model);
 }
 
+// Known Anthropic models (no public list API)
+// Keep this list updated as new models are released
+const ANTHROPIC_MODELS = [
+  // Claude 4.5 series (latest)
+  "claude-sonnet-4-5-20250929",
+  "claude-opus-4-5-20251101",
+  // Claude 4 series
+  "claude-opus-4-20250514",
+  "claude-sonnet-4-20250514",
+  // Claude 3.5 series
+  "claude-3-5-sonnet-20241022",
+  "claude-3-5-haiku-20241022",
+  // Claude 3 series
+  "claude-3-opus-20240229",
+  "claude-3-sonnet-20240229",
+  "claude-3-haiku-20240307",
+];
+
+export type ModelInfo = {
+  id: string;
+  name?: string;
+  size?: string;
+};
+
+/**
+ * List available models for a provider.
+ */
+export async function listModels(provider: LLMProviderName): Promise<ModelInfo[]> {
+  if (provider === "ollama") {
+    const baseUrl = process.env.OLLAMA_HOST || "http://localhost:11434";
+    try {
+      const res = await fetch(`${baseUrl}/api/tags`);
+      if (!res.ok) return [];
+      const json = await res.json();
+      return (json.models || []).map((m: any) => ({
+        id: m.name,
+        name: m.name,
+        size: m.size ? `${(m.size / 1e9).toFixed(1)}GB` : undefined,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  if (provider === "openai") {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return [];
+    const baseUrl = process.env.OPENAI_BASE_URL || "https://api.openai.com";
+    try {
+      const res = await fetch(`${baseUrl}/v1/models`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+      });
+      if (!res.ok) return [];
+      const json = await res.json();
+      // Filter to chat/reasoning models, sort by id
+      // Include: gpt-*, o1*, o3*, o4* (reasoning models)
+      return (json.data || [])
+        .filter((m: any) => {
+          const id = m.id.toLowerCase();
+          return id.includes("gpt") ||
+                 id.startsWith("o1") ||
+                 id.startsWith("o3") ||
+                 id.startsWith("o4");
+        })
+        .map((m: any) => ({ id: m.id, name: m.id }))
+        .sort((a: ModelInfo, b: ModelInfo) => a.id.localeCompare(b.id));
+    } catch {
+      return [];
+    }
+  }
+
+  if (provider === "anthropic") {
+    // No public API, return known models
+    return ANTHROPIC_MODELS.map((id) => ({ id, name: id }));
+  }
+
+  return [];
+}
+
 export async function completeJson<T = any>(client: LLMClient, opts: Omit<CompleteOpts, "jsonMode"> & { jsonSchema?: any }): Promise<T> {
+  if (isDebugEnabled()) {
+    debugLLMCall("completeJson System prompt", opts.system);
+    debugLLMCall("completeJson User message", opts.messages?.[0]?.content);
+    debugLLMCall("completeJson Options", { maxTokens: opts.maxTokens, temp: opts.temperature, hasSchema: !!opts.jsonSchema });
+  }
+
   const res = await client.complete({ ...opts, jsonMode: true });
-  const parsed = parseJsonLoose(res.text);
-  return parsed as T;
+
+  if (isDebugEnabled()) {
+    debugLLMCall("completeJson Raw response", res.text);
+    debugLLMCall("completeJson Raw API response", res.raw);
+  }
+
+  try {
+    const parsed = parseJsonLoose(res.text);
+    return parsed as T;
+  } catch (e: any) {
+    debugLLMCall("completeJson Parse error - full response", res.text);
+    throw e;
+  }
 }

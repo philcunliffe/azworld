@@ -2,6 +2,7 @@ import { ToolRegistry, ToolContext } from "./index";
 import { completeJson } from "../../llm/providers";
 import { z } from "zod";
 import { ReactionGenerationResultSchema, ReactionCandidateSchema } from "../schema";
+import { formatSettingsForGeneration } from "../campaign-settings";
 
 // Schemas for generated content
 const GeneratedEntitySchema = z.object({
@@ -67,7 +68,7 @@ const LOCATION_JSON_SCHEMA = {
       additionalProperties: false,
       properties: {
         key: { type: "string" },
-        type: { type: "string" },
+        type: { type: "string", enum: ["location"], description: "Must be 'location'" },
         name: { type: "string" },
         summary: { type: "string" },
         details_md: { type: "string" },
@@ -83,7 +84,7 @@ const LOCATION_JSON_SCHEMA = {
         additionalProperties: false,
         properties: {
           key: { type: "string" },
-          type: { type: "string" },
+          type: { type: "string", enum: ["npc"], description: "Must be 'npc'" },
           name: { type: "string" },
           summary: { type: "string" },
           details_md: { type: "string" },
@@ -100,7 +101,7 @@ const LOCATION_JSON_SCHEMA = {
         additionalProperties: false,
         properties: {
           key: { type: "string" },
-          type: { type: "string" },
+          type: { type: "string", enum: ["faction"], description: "Must be 'faction'" },
           name: { type: "string" },
           summary: { type: "string" },
           details_md: { type: "string" },
@@ -143,14 +144,19 @@ function formatEventContext(events: any[]): string {
   return lines.join("\n");
 }
 
+// Helper to get the LLM client for generation (prefers generationLlm if available)
+function getGenLlm(ctx: ToolContext) {
+  return ctx.generationLlm ?? ctx.llm;
+}
+
 export function registerGenerateTools(registry: ToolRegistry): void {
-  // generate_location - Generate a place with NPCs
+  // generate_location - Generate a place with NPCs and persist to canon
   registry.register(
     "generate_location",
     {
       name: "generate_location",
       description:
-        "Generate a location (tavern, guild hall, temple, shop, etc.) with NPCs present. Returns generated content that must be persisted with canon.upsert.",
+        "Generate a location (tavern, guild hall, temple, shop, etc.) with NPCs present. Automatically persists all entities to canon and returns a compact summary.",
       parameters: {
         type: "object",
         properties: {
@@ -167,8 +173,10 @@ export function registerGenerateTools(registry: ToolRegistry): void {
       },
     },
     async (args: Record<string, any>, ctx: ToolContext) => {
+      console.log("[generate_location] Starting...");
       const kind = String(args.kind || "tavern");
       const burgId = Number(args.burgId);
+      console.log(`[generate_location] kind=${kind}, burgId=${burgId}`);
 
       if (!Number.isFinite(burgId)) {
         return { error: "burgId must be a number" };
@@ -178,6 +186,7 @@ export function registerGenerateTools(registry: ToolRegistry): void {
       if (!burg) {
         return { error: `Burg ${burgId} not found` };
       }
+      console.log(`[generate_location] Found burg: ${burg.name}`);
 
       const state = typeof burg.state === "number" ? ctx.world.getState(burg.state) : undefined;
 
@@ -202,10 +211,11 @@ export function registerGenerateTools(registry: ToolRegistry): void {
       }
 
       const eventContext = formatEventContext(activeEvents);
+      const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
 
       const systemPrompt = `You are a tabletop GM assistant. Generate a ${kind} location for a fantasy city.
 Output ONLY valid JSON matching the schema.
-Constraints:
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Constraints:
 - Keep names distinct; avoid these existing names: ${existingNames.slice(0, 50).join(", ") || "(none)"}
 - Use vivid but concise details
 - Generate 3-6 NPCs present at the location
@@ -229,33 +239,128 @@ Constraints:
           "Narration should be a short GM-facing opening description.",
       };
 
-      const result = await completeJson(ctx.llm, {
-        system: systemPrompt,
-        messages: [{ role: "user", content: JSON.stringify(userPrompt) }],
-        jsonSchema: LOCATION_JSON_SCHEMA,
-        maxTokens: 1500,
-        temperature: 0.7,
-      });
+      const genLlm = getGenLlm(ctx);
+      console.log(`[generate_location] Calling LLM (provider=${genLlm.provider}, model=${genLlm.model})...`);
+      const startTime = Date.now();
 
-      const parsed = LocationGenResultSchema.safeParse(result);
-      if (!parsed.success) {
-        return { error: "Failed to parse generation result", raw: result };
+      try {
+        const result = await completeJson(genLlm, {
+          system: systemPrompt,
+          messages: [{ role: "user", content: JSON.stringify(userPrompt) }],
+          jsonSchema: LOCATION_JSON_SCHEMA,
+          maxTokens: 4000,
+          temperature: 0.7,
+        });
+
+        const elapsed = Date.now() - startTime;
+        console.log(`[generate_location] LLM returned after ${elapsed}ms`);
+
+        const parsed = LocationGenResultSchema.safeParse(result);
+        if (!parsed.success) {
+          console.log(`[generate_location] Parse failed: ${parsed.error.message}`);
+          return { error: "Failed to parse generation result" };
+        }
+
+        const data = parsed.data;
+        console.log(`[generate_location] Persisting to canon: ${data.location?.name}`);
+
+        // Persist location to canon
+        const locationEntity = ctx.canon.addEntity({
+          type: "location",
+          name: data.location.name,
+          summary: data.location.summary || null,
+          details_md: data.location.details_md || null,
+          tags: data.location.tags || [kind],
+          anchors: { burgId },
+          payload: data.location.payload || { kind },
+          provenance: { generated_by: "generate_location", provider: genLlm.provider, model: genLlm.model },
+        });
+
+        // Persist NPCs and create relations
+        const npcSummaries: Array<{ id: string; name: string; summary: string }> = [];
+        const keyToId: Record<string, string> = { [data.location.key]: locationEntity.id };
+
+        for (const npc of data.npcs || []) {
+          const npcEntity = ctx.canon.addEntity({
+            type: "npc",
+            name: npc.name,
+            summary: npc.summary || null,
+            details_md: npc.details_md || null,
+            tags: npc.tags || [],
+            anchors: { burgId },
+            payload: npc.payload || {},
+            provenance: { generated_by: "generate_location", provider: genLlm.provider, model: genLlm.model },
+          });
+          keyToId[npc.key] = npcEntity.id;
+          npcSummaries.push({ id: npcEntity.id, name: npc.name, summary: npc.summary || "" });
+
+          // Create located_at relation
+          ctx.canon.addRelation({
+            from_id: npcEntity.id,
+            to_id: locationEntity.id,
+            rel_type: "located_at",
+          });
+        }
+
+        // Persist factions
+        for (const faction of data.factions || []) {
+          const factionEntity = ctx.canon.addEntity({
+            type: "faction",
+            name: faction.name,
+            summary: faction.summary || null,
+            details_md: faction.details_md || null,
+            tags: faction.tags || [],
+            anchors: { burgId },
+            payload: faction.payload || {},
+            provenance: { generated_by: "generate_location", provider: genLlm.provider, model: genLlm.model },
+          });
+          keyToId[faction.key] = factionEntity.id;
+        }
+
+        // Create additional relations
+        for (const rel of data.relations || []) {
+          const fromId = keyToId[rel.from];
+          const toId = keyToId[rel.to];
+          if (fromId && toId && rel.rel_type !== "located_at") {
+            ctx.canon.addRelation({
+              from_id: fromId,
+              to_id: toId,
+              rel_type: rel.rel_type,
+              strength: rel.strength,
+              notes: rel.notes,
+            });
+          }
+        }
+
+        // Update session state
+        ctx.state.currentLocationId = locationEntity.id;
+        ctx.state.currentBurgId = burgId;
+
+        console.log(`[generate_location] Persisted: 1 location, ${npcSummaries.length} NPCs`);
+
+        // Return compact summary (not full entities)
+        return {
+          success: true,
+          locationId: locationEntity.id,
+          locationName: locationEntity.name,
+          locationSummary: locationEntity.summary,
+          npcs: npcSummaries,
+          narration: data.narration,
+        };
+      } catch (err: any) {
+        const elapsed = Date.now() - startTime;
+        console.log(`[generate_location] ERROR after ${elapsed}ms: ${err?.message || String(err)}`);
+        throw err;
       }
-
-      return {
-        generated: true,
-        ...parsed.data,
-        anchors: { burgId },
-      };
     }
   );
 
-  // generate_npcs - Generate characters
+  // generate_npcs - Generate characters and persist to canon
   registry.register(
     "generate_npcs",
     {
       name: "generate_npcs",
-      description: "Generate one or more NPCs for a location or burg.",
+      description: "Generate one or more NPCs for a location or burg. Automatically persists to canon with rich character details.",
       parameters: {
         type: "object",
         properties: {
@@ -263,6 +368,7 @@ Constraints:
           burgId: { type: "number", description: "Burg where NPCs are based" },
           locationId: { type: "string", description: "Location entity ID where NPCs will be" },
           roles: { type: "string", description: "Suggested roles (e.g., 'barkeep, guard, merchant')" },
+          factionIds: { type: "string", description: "JSON array of faction IDs to potentially link NPCs to" },
           activeEvents: { type: "string", description: "JSON array of active events to incorporate" },
         },
         required: ["burgId"],
@@ -271,6 +377,7 @@ Constraints:
     async (args: Record<string, any>, ctx: ToolContext) => {
       const count = Number(args.count) || 3;
       const burgId = Number(args.burgId);
+      const locationId = args.locationId ? String(args.locationId) : undefined;
 
       if (!Number.isFinite(burgId)) {
         return { error: "burgId must be a number" };
@@ -290,45 +397,161 @@ Constraints:
         }
       }
 
-      const eventContext = formatEventContext(activeEvents);
+      // Parse faction IDs if provided
+      let availableFactions: Array<{ id: string; name: string; kind: string }> = [];
+      if (args.factionIds) {
+        try {
+          const ids = JSON.parse(String(args.factionIds));
+          for (const id of ids) {
+            const faction = ctx.canon.getEntity(id);
+            if (faction && faction.type === "faction") {
+              availableFactions.push({
+                id: faction.id,
+                name: faction.name,
+                kind: faction.payload?.kind || "organization",
+              });
+            }
+          }
+        } catch {
+          // Ignore parse errors
+        }
+      }
 
-      const systemPrompt = `You are a tabletop GM assistant. Generate ${count} NPCs for a fantasy city.
-Output ONLY valid JSON with an "npcs" array.`;
+      // Also get existing factions in the burg if none specified
+      if (availableFactions.length === 0) {
+        const burgFactions = ctx.canon.listEntities({ type: "faction", anchors: { burgId }, limit: 10 });
+        availableFactions = burgFactions.map(f => ({
+          id: f.id,
+          name: f.name,
+          kind: f.payload?.kind || "organization",
+        }));
+      }
+
+      const eventContext = formatEventContext(activeEvents);
+      const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+      const genLlm = getGenLlm(ctx);
+
+      const systemPrompt = `You are a tabletop GM assistant. Generate ${count} detailed NPCs for a fantasy city.
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
+Each NPC should have rich character details. Output ONLY valid JSON:
+{
+  "npcs": [{
+    "key": "unique_key",
+    "type": "npc",
+    "name": "Full Name",
+    "summary": "One-line public description",
+    "details_md": "Longer background (optional)",
+    "tags": ["role", "trait"],
+    "payload": {
+      "role": "their job/role",
+      "personality": "key personality traits",
+      "appearance": "physical description",
+      "background": "brief history",
+      "knows": {
+        "public": ["commonly known facts they share freely"],
+        "secret": ["things they know but hide"],
+        "intimate": ["deep secrets only shared with trusted friends"]
+      },
+      "secrets": ["personal secrets about themselves"],
+      "motivations": ["what drives them"],
+      "factionId": "optional faction ID if member"
+    }
+  }]
+}
+
+If linking to factions, use "factionId" in payload and add a "factionRole" (member/senior/leader) and "factionSecret" (true/false).`;
 
       const userPrompt = {
         count,
         burg: { id: burg.id, name: burg.name },
         roles: args.roles || null,
-        locationId: args.locationId || null,
+        locationId: locationId || null,
+        availableFactions: availableFactions.length > 0 ? availableFactions : null,
         eventContext,
+        instructions: "Create interesting NPCs with secrets and motivations. Some may be faction members.",
       };
 
-      const result = await completeJson(ctx.llm, {
+      const result = await completeJson(genLlm, {
         system: systemPrompt,
         messages: [{ role: "user", content: JSON.stringify(userPrompt) }],
-        maxTokens: 1000,
+        maxTokens: 4000,
         temperature: 0.7,
       });
 
       const parsed = NpcsGenResultSchema.safeParse(result);
       if (!parsed.success) {
-        return { error: "Failed to parse generation result", raw: result };
+        return { error: "Failed to parse generation result" };
+      }
+
+      // Persist NPCs to canon
+      const npcSummaries: Array<{ id: string; name: string; summary: string; factions?: string[] }> = [];
+      for (const npc of parsed.data.npcs) {
+        const npcEntity = ctx.canon.addEntity({
+          type: "npc",
+          name: npc.name,
+          summary: npc.summary || null,
+          details_md: npc.details_md || null,
+          tags: npc.tags || [],
+          anchors: { burgId },
+          payload: npc.payload || {},
+          provenance: { generated_by: "generate_npcs", provider: genLlm.provider, model: genLlm.model },
+        });
+
+        const npcFactions: string[] = [];
+
+        // Link to location if provided
+        if (locationId) {
+          ctx.canon.addRelation({
+            from_id: npcEntity.id,
+            to_id: locationId,
+            rel_type: "located_at",
+          });
+        }
+
+        // Create faction membership relation if specified
+        const payload = npc.payload || {};
+        if (payload.factionId && typeof payload.factionId === "string") {
+          const faction = ctx.canon.getEntity(payload.factionId);
+          if (faction && faction.type === "faction") {
+            const role = payload.factionRole === "leader" ? "leads" :
+                        payload.factionRole === "senior" ? "member_of" : "member_of";
+            const strength = payload.factionRole === "leader" ? 1.0 :
+                            payload.factionRole === "senior" ? 0.8 : 0.5;
+            const notes = payload.factionSecret ? "secret" : undefined;
+
+            ctx.canon.addRelation({
+              from_id: npcEntity.id,
+              to_id: faction.id,
+              rel_type: role,
+              strength,
+              notes,
+            });
+            npcFactions.push(faction.name + (payload.factionSecret ? " (secret)" : ""));
+          }
+        }
+
+        npcSummaries.push({
+          id: npcEntity.id,
+          name: npc.name,
+          summary: npc.summary || "",
+          factions: npcFactions.length > 0 ? npcFactions : undefined,
+        });
       }
 
       return {
-        generated: true,
-        ...parsed.data,
-        anchors: { burgId },
+        success: true,
+        count: npcSummaries.length,
+        npcs: npcSummaries,
       };
     }
   );
 
-  // generate_faction - Generate an organization
+  // generate_faction - Generate an organization and persist to canon
   registry.register(
     "generate_faction",
     {
       name: "generate_faction",
-      description: "Generate a faction/organization (guild, criminal ring, religious order, etc.).",
+      description: "Generate a faction/organization (guild, criminal ring, religious order, etc.). Automatically persists to canon.",
       parameters: {
         type: "object",
         properties: {
@@ -366,9 +589,11 @@ Output ONLY valid JSON with an "npcs" array.`;
       }
 
       const eventContext = formatEventContext(activeEvents);
+      const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+      const genLlm = getGenLlm(ctx);
 
       const systemPrompt = `You are a tabletop GM assistant. Generate a ${kind} faction.
-Output ONLY valid JSON with a "faction" object.`;
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY valid JSON with a "faction" object.`;
 
       const userPrompt = {
         kind,
@@ -377,32 +602,45 @@ Output ONLY valid JSON with a "faction" object.`;
         eventContext,
       };
 
-      const result = await completeJson(ctx.llm, {
+      const result = await completeJson(genLlm, {
         system: systemPrompt,
         messages: [{ role: "user", content: JSON.stringify(userPrompt) }],
-        maxTokens: 800,
+        maxTokens: 2000,
         temperature: 0.7,
       });
 
       const parsed = FactionGenResultSchema.safeParse(result);
       if (!parsed.success) {
-        return { error: "Failed to parse generation result", raw: result };
+        return { error: "Failed to parse generation result" };
       }
 
-      return {
-        generated: true,
-        ...parsed.data,
+      const faction = parsed.data.faction;
+      const factionEntity = ctx.canon.addEntity({
+        type: "faction",
+        name: faction.name,
+        summary: faction.summary || null,
+        details_md: faction.details_md || null,
+        tags: faction.tags || [kind],
         anchors: { burgId },
+        payload: faction.payload || { kind },
+        provenance: { generated_by: "generate_faction", provider: genLlm.provider, model: genLlm.model },
+      });
+
+      return {
+        success: true,
+        factionId: factionEntity.id,
+        factionName: factionEntity.name,
+        factionSummary: factionEntity.summary,
       };
     }
   );
 
-  // generate_event - Generate an event with consequences
+  // generate_event - Generate an event with consequences and persist to canon
   registry.register(
     "generate_event",
     {
       name: "generate_event",
-      description: "Generate a world event (disaster, political change, festival, etc.) with scope and consequences.",
+      description: "Generate a world event (disaster, political change, festival, etc.) with scope and consequences. Automatically persists to canon.",
       parameters: {
         type: "object",
         properties: {
@@ -433,19 +671,23 @@ Output ONLY valid JSON with a "faction" object.`;
       const scope = String(args.scope);
       const severity = String(args.severity);
       const daysAgo = typeof args.daysAgo === "number" ? args.daysAgo : 0;
+      const burgId = args.burgId ? Number(args.burgId) : undefined;
+      const stateId = args.stateId ? Number(args.stateId) : undefined;
 
       let context = "";
-      if (args.burgId) {
-        const burg = ctx.world.getBurg(Number(args.burgId));
+      if (burgId) {
+        const burg = ctx.world.getBurg(burgId);
         if (burg) context += `Centered on ${burg.name} (burg ${burg.id}). `;
       }
-      if (args.stateId) {
-        const state = ctx.world.getState(Number(args.stateId));
+      if (stateId) {
+        const state = ctx.world.getState(stateId);
         if (state) context += `In the state of ${state.name}. `;
       }
 
+      const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+      const genLlm = getGenLlm(ctx);
       const systemPrompt = `You are a tabletop GM assistant. Generate a ${kind} event.
-Output ONLY valid JSON with an "event" object and "consequences" array.`;
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY valid JSON with an "event" object and "consequences" array.`;
 
       const userPrompt = {
         kind,
@@ -456,48 +698,56 @@ Output ONLY valid JSON with an "event" object and "consequences" array.`;
         hints: args.hints || null,
       };
 
-      const result = await completeJson(ctx.llm, {
+      const result = await completeJson(genLlm, {
         system: systemPrompt,
         messages: [{ role: "user", content: JSON.stringify(userPrompt) }],
-        maxTokens: 600,
+        maxTokens: 2000,
         temperature: 0.7,
       });
 
       const parsed = EventGenResultSchema.safeParse(result);
       if (!parsed.success) {
-        return { error: "Failed to parse generation result", raw: result };
+        return { error: "Failed to parse generation result" };
       }
 
-      // Add event payload fields
       const event = parsed.data.event;
-      event.payload = {
-        ...event.payload,
-        kind,
+      const eventEntity = ctx.canon.addEntity({
+        type: "event",
+        name: event.name,
+        summary: event.summary || null,
+        details_md: event.details_md || null,
+        tags: event.tags || [kind, scope],
+        anchors: { burgId, stateId },
+        payload: {
+          ...event.payload,
+          kind,
+          scope,
+          severity,
+          daysAgo,
+          ongoing: daysAgo === 0,
+          consequences: parsed.data.consequences || [],
+        },
+        provenance: { generated_by: "generate_event", provider: genLlm.provider, model: genLlm.model },
+      });
+
+      return {
+        success: true,
+        eventId: eventEntity.id,
+        eventName: eventEntity.name,
+        eventSummary: eventEntity.summary,
         scope,
         severity,
         daysAgo,
-        ongoing: daysAgo === 0,
-        consequences: parsed.data.consequences || [],
-      };
-
-      return {
-        generated: true,
-        event,
-        consequences: parsed.data.consequences,
-        anchors: {
-          burgId: args.burgId ? Number(args.burgId) : undefined,
-          stateId: args.stateId ? Number(args.stateId) : undefined,
-        },
       };
     }
   );
 
-  // generate_lore - Generate world-building details
+  // generate_lore - Generate world-building details and persist to canon
   registry.register(
     "generate_lore",
     {
       name: "generate_lore",
-      description: "Generate world-building lore (holidays, customs, history, legends).",
+      description: "Generate world-building lore (holidays, customs, history, legends). Automatically persists to canon as a meta entity.",
       parameters: {
         type: "object",
         properties: {
@@ -515,8 +765,10 @@ Output ONLY valid JSON with an "event" object and "consequences" array.`;
       const subject = String(args.subject);
       const aspect = String(args.aspect);
 
+      const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+      const genLlm = getGenLlm(ctx);
       const systemPrompt = `You are a tabletop GM assistant. Generate ${aspect} lore about ${subject}.
-Output JSON with: subject, aspect, content (markdown), relatedTopics (array of strings).`;
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output JSON with: subject, aspect, content (markdown), relatedTopics (array of strings).`;
 
       const userPrompt = {
         subject,
@@ -524,19 +776,37 @@ Output JSON with: subject, aspect, content (markdown), relatedTopics (array of s
         context: args.context || null,
       };
 
-      const result = await completeJson(ctx.llm, {
+      const result = await completeJson(genLlm, {
         system: systemPrompt,
         messages: [{ role: "user", content: JSON.stringify(userPrompt) }],
-        maxTokens: 800,
+        maxTokens: 2000,
         temperature: 0.7,
       });
 
       const parsed = LoreGenResultSchema.safeParse(result);
       if (!parsed.success) {
-        return { error: "Failed to parse generation result", raw: result };
+        return { error: "Failed to parse generation result" };
       }
 
-      return { generated: true, ...parsed.data };
+      // Persist as meta entity
+      const loreEntity = ctx.canon.addEntity({
+        type: "meta",
+        name: `${subject} - ${aspect}`,
+        summary: parsed.data.content.slice(0, 200),
+        details_md: parsed.data.content,
+        tags: ["lore", aspect],
+        anchors: {},
+        payload: { subject, aspect, relatedTopics: parsed.data.relatedTopics },
+        provenance: { generated_by: "generate_lore", provider: genLlm.provider, model: genLlm.model },
+      });
+
+      return {
+        success: true,
+        loreId: loreEntity.id,
+        subject,
+        aspect,
+        contentPreview: parsed.data.content.slice(0, 150) + "...",
+      };
     }
   );
 
@@ -619,9 +889,10 @@ Severity: ${eventPayload.severity || "unknown"}
 Days ago: ${eventPayload.daysAgo ?? 0}
 Ongoing: ${eventPayload.ongoing ? "yes" : "no"}`;
 
+      const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
       const systemPrompt = `You are a tabletop GM assistant generating NPC/faction reactions to world events.
 Generate 3-5 diverse, plausible reactions the actor might have to the event.
-Output JSON with: actorName, eventName, candidates (array of reaction objects).
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output JSON with: actorName, eventName, candidates (array of reaction objects).
 
 Each candidate should have:
 - description: what the actor does
@@ -642,28 +913,29 @@ Each candidate should have:
           "Consider what the actor wants and how the event affects their interests.",
       };
 
-      const result = await completeJson(ctx.llm, {
+      const result = await completeJson(getGenLlm(ctx), {
         system: systemPrompt,
         messages: [{ role: "user", content: JSON.stringify(userPrompt) }],
-        maxTokens: 1000,
+        maxTokens: 2000,
         temperature: 0.8,
       });
 
       const parsed = ReactionGenerationResultSchema.safeParse(result);
       if (!parsed.success) {
-        // Return raw result if parsing fails
-        return {
-          generated: true,
-          actorName,
-          eventName: event.name,
-          candidates: result.candidates || [],
-          parseWarning: "Could not validate against schema",
-        };
+        return { error: "Failed to parse generation result" };
       }
 
+      // Return compact summary - just names/descriptions, not full creates arrays
       return {
-        generated: true,
-        ...parsed.data,
+        success: true,
+        actorName: parsed.data.actorName,
+        eventName: parsed.data.eventName,
+        candidates: parsed.data.candidates.map((c) => ({
+          description: c.description,
+          category: c.category,
+          intensity: c.intensity,
+          publiclyVisible: c.publiclyVisible,
+        })),
       };
     }
   );

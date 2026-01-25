@@ -2,12 +2,15 @@ import { AzgaarWorld } from "../../world/azgaar";
 import { CanonStore, CanonEntity } from "../../canon/canon";
 import { LLMClient, ToolDefinition } from "../../llm/providers";
 import { ChatState } from "../director";
+import { CampaignSettings } from "../schema";
 
 export type ToolContext = {
   world: AzgaarWorld;
   canon: CanonStore;
   llm: LLMClient;
+  generationLlm?: LLMClient;  // Separate LLM for content generation (uses llm if not set)
   state: ChatState;
+  campaignSettings?: CampaignSettings;
 };
 
 export type ToolHandler = (args: Record<string, any>, ctx: ToolContext) => Promise<any>;

@@ -55,3 +55,15 @@ export const ReactionGenerationResultSchema = z.object({
 
 export type ReactionCandidate = z.infer<typeof ReactionCandidateSchema>;
 export type ReactionOutcome = z.infer<typeof ReactionOutcomeSchema>;
+
+// Campaign settings schemas
+export const ContentRatingEnum = z.enum(["pg", "teen", "mature", "explicit"]);
+export const CampaignSettingsSchema = z.object({
+  worldVibe: z.string().optional(),
+  culturalTouchpoints: z.string().optional(),
+  campaignArc: z.string().optional(),
+  userNotes: z.string().optional(),
+  contentTone: z.number().min(1).max(5).optional(),
+  rating: ContentRatingEnum.optional(),
+});
+export type CampaignSettings = z.infer<typeof CampaignSettingsSchema>;

@@ -2,7 +2,8 @@ import { AzgaarWorld } from "../world/azgaar";
 import { CanonStore, CanonEntity } from "../canon/canon";
 import { LLMClient } from "../llm/providers";
 import { createDirectorRegistry, ToolContext } from "./tools";
-import { runToolLoop, DIRECTOR_SYSTEM_PROMPT } from "./tool-executor";
+import { runToolLoop, buildDirectorSystemPrompt } from "./tool-executor";
+import { CampaignSettings } from "./schema";
 
 export type SceneContext = {
   burgId: number;
@@ -30,12 +31,15 @@ export function newChatState(): ChatState {
  */
 export async function directScene(opts: {
   llm: LLMClient;
+  generationLlm?: LLMClient;  // Separate LLM for content generation
   world: AzgaarWorld;
   canon: CanonStore;
   state: ChatState;
   userText: string;
+  campaignSettings?: CampaignSettings;
   onToolCall?: (name: string, args: any) => void;
-  onToolResult?: (name: string, result: any) => void;
+  onToolResult?: (name: string, result: any, elapsedMs: number) => void;
+  onLLMComplete?: (usage: { promptTokens: number; completionTokens: number; totalTokens: number } | undefined) => void;
 }): Promise<{ reply: string; scene?: SceneContext; state: ChatState }> {
   // Ensure canon DB is initialized
   opts.canon.initDb();
@@ -46,7 +50,9 @@ export async function directScene(opts: {
     world: opts.world,
     canon: opts.canon,
     llm: opts.llm,
+    generationLlm: opts.generationLlm,
     state: opts.state,
+    campaignSettings: opts.campaignSettings,
   };
 
   // Add user message to history
@@ -57,11 +63,12 @@ export async function directScene(opts: {
     llm: opts.llm,
     registry,
     ctx,
-    systemPrompt: DIRECTOR_SYSTEM_PROMPT,
+    systemPrompt: buildDirectorSystemPrompt(opts.campaignSettings),
     userMessage: opts.userText,
     maxIterations: 15,
     onToolCall: opts.onToolCall,
     onToolResult: opts.onToolResult,
+    onLLMComplete: opts.onLLMComplete,
   });
 
   // Use narration from session.narrate if available, otherwise use final text

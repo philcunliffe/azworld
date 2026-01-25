@@ -43,7 +43,7 @@ export function registerCanonTools(registry: ToolRegistry): void {
       if (args.neighborhoodId) anchors.neighborhoodId = String(args.neighborhoodId);
       if (Object.keys(anchors).length) opts.anchors = anchors;
 
-      opts.limit = typeof args.limit === "number" ? args.limit : 20;
+      opts.limit = typeof args.limit === "number" ? Math.min(args.limit, 20) : 20;
 
       const results = ctx.canon.listEntities(opts);
       return {
@@ -52,10 +52,9 @@ export function registerCanonTools(registry: ToolRegistry): void {
           id: e.id,
           type: e.type,
           name: e.name,
-          summary: e.summary,
+          summary: e.summary ? e.summary.slice(0, 150) : null,
           tags: e.tags,
-          anchors: e.anchors,
-          payload: e.payload,
+          // Omit payload and anchors from list view - use canon_get for full details
         })),
       };
     }
@@ -79,7 +78,13 @@ export function registerCanonTools(registry: ToolRegistry): void {
       const entityId = String(args.entityId);
       const entity = ctx.canon.getEntity(entityId);
       if (!entity) return { error: `Entity ${entityId} not found` };
-      return entity;
+      // Return entity but truncate very long details_md
+      return {
+        ...entity,
+        details_md: entity.details_md && entity.details_md.length > 500
+          ? entity.details_md.slice(0, 500) + "... [truncated]"
+          : entity.details_md,
+      };
     }
   );
 
@@ -350,17 +355,21 @@ export function registerCanonTools(registry: ToolRegistry): void {
         return aDays - bDays;
       });
 
+      // Limit to 10 most relevant events to reduce token usage
+      const limitedEvents = matchingEvents.slice(0, 10);
+
       return {
         count: matchingEvents.length,
-        events: matchingEvents.map((e) => ({
+        showing: limitedEvents.length,
+        events: limitedEvents.map((e) => ({
           id: e.id,
           name: e.name,
-          summary: e.summary,
+          summary: e.summary ? e.summary.slice(0, 100) : null,  // Truncate summaries
           scope: e.payload?.scope,
           severity: e.payload?.severity,
           daysAgo: e.payload?.daysAgo,
           ongoing: e.payload?.ongoing,
-          consequences: e.payload?.consequences,
+          // Omit full consequences - use canon_get for details
         })),
       };
     }
