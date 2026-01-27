@@ -109,8 +109,10 @@ function getEffectiveTemperature(model: string, requested?: number): number | un
 
 // Reasoning models use tokens for internal thinking AND output, so they need more headroom.
 // This multiplier ensures enough tokens for both reasoning and actual response.
-const REASONING_TOKEN_MULTIPLIER = 4;
-const REASONING_MIN_TOKENS = 8000;
+// Note: gpt-5-mini can easily use 8000+ tokens on reasoning alone for complex JSON generation,
+// so we need generous minimums to ensure actual output is produced.
+const REASONING_TOKEN_MULTIPLIER = 8;
+const REASONING_MIN_TOKENS = 16000;
 
 // Get effective maxTokens for a model, accounting for reasoning model needs
 function getEffectiveMaxTokens(model: string, requested?: number): number | undefined {

@@ -52,6 +52,9 @@ import {
   formatPlanForApproval,
   syncNavigationFromChatState,
   GenContext,
+  planModification,
+  executeModification,
+  formatModPlanForApproval,
 } from "./gen-agent";
 import { selectPrompt } from "./select-prompt";
 
@@ -72,13 +75,14 @@ export type CommandContext = {
   generationLlm?: LLMClient;
   campaignSettings?: CampaignSettings;
   useColors?: boolean;
+  tuiMode?: boolean;  // When true, gen commands return plan for TUI approval instead of using console
   onToolCall?: (name: string, args: any) => void;
   onToolResult?: (name: string, result: any, elapsedMs: number) => void;
   onTokens?: (usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number }) => void;
   getTokens?: () => { promptTokens: number; completionTokens: number; totalTokens: number };
   // Entity generation progress callbacks
   onEntityStart?: (name: string, index: number, total: number) => void;
-  onEntityComplete?: (name: string, index: number, total: number, tokens: number, elapsedMs: number) => void;
+  onEntityComplete?: (entity: { id: string; name: string; type: string }, index: number, total: number, tokens: number, elapsedMs: number) => void;
   // Model switching support
   config?: LLMConfig;
   onConfigChange?: (config: LLMConfig) => void;
@@ -86,6 +90,9 @@ export type CommandContext = {
   onGenerationLlmChange?: (llm: LLMClient | undefined) => void;
   setStatusBarProvider?: (provider: string, model: string) => void;
 };
+
+// Import GenPlan and ModPlan types for pending operations
+import type { GenPlan, ModPlan } from "./gen-agent";
 
 export type CommandResult = {
   output?: string;           // Text to display
@@ -95,6 +102,19 @@ export type CommandResult = {
   quit?: boolean;            // Should exit program
   scene?: SceneContext;      // Updated scene context
   runOnboarding?: boolean;   // Should run campaign settings onboarding
+  // TUI-specific: pending generation needing approval
+  pendingGeneration?: {
+    plan: GenPlan;
+    formattedPlan: string;
+    genType: "location" | "npc" | "faction";
+    kindHint: string | undefined;
+    prompt: string;
+  };
+  // TUI-specific: pending modification needing approval
+  pendingModification?: {
+    plan: ModPlan;
+    formattedPlan: string;
+  };
 };
 
 // Parse command line into command and args
@@ -625,6 +645,21 @@ async function runSmartGeneration(
 
     // Phase 2: Show permission prompt
     const approval = formatPlanForApproval(plan, ctx.useColors);
+
+    // TUI Mode: Return plan for TUI approval instead of console output
+    if (ctx.tuiMode) {
+      return {
+        pendingGeneration: {
+          plan,
+          formattedPlan: approval,
+          genType,
+          kindHint,
+          prompt,
+        },
+      };
+    }
+
+    // Non-TUI: Use console and selectPrompt
     console.log(approval);
 
     // Ask for user approval with arrow-key selection
@@ -659,6 +694,72 @@ async function runSmartGeneration(
   } catch (e: any) {
     return { error: `Generation failed: ${e?.message || String(e)}` };
   }
+}
+
+/**
+ * Execute a pending generation after TUI approval
+ */
+export async function executePendingGeneration(
+  plan: GenPlan,
+  ctx: CommandContext
+): Promise<CommandResult> {
+  const genCtx: GenContext = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
+    onEntityStart: ctx.onEntityStart,
+    onEntityComplete: ctx.onEntityComplete,
+  };
+
+  try {
+    const result = await executeGeneration(plan, genCtx);
+    syncNavigationFromChatState(genCtx);
+
+    const green = ctx.useColors ? GREEN : "";
+    const reset = ctx.useColors ? RESET : "";
+    return { output: `${green}${result.summary}${reset}` };
+  } catch (e: any) {
+    return { error: `Generation failed: ${e?.message || String(e)}` };
+  }
+}
+
+/**
+ * Execute a pending modification after TUI approval
+ */
+export function executePendingModification(
+  plan: ModPlan,
+  ctx: CommandContext
+): CommandResult {
+  const genCtx: GenContext = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
+  };
+
+  const result = executeModification(plan, genCtx);
+
+  if (!result.success) {
+    return { error: result.error || "Modification failed" };
+  }
+
+  const green = ctx.useColors ? GREEN : "";
+  const reset = ctx.useColors ? RESET : "";
+  return {
+    output: `${green}${result.summary}${reset}\n` +
+      (result.appliedChanges.length > 0 ? result.appliedChanges.map(c => `  + ${c}`).join("\n") : "  (no changes)"),
+  };
 }
 
 // Simple generation commands (legacy single-shot behavior)
@@ -893,7 +994,7 @@ Output ONLY valid JSON: { "faction": { "name": string, "summary": string, "tags"
   }
 }
 
-// Modification command
+// Modification command with two-phase planning and approval
 async function modifyEntity(args: string[], ctx: CommandContext): Promise<CommandResult> {
   let entityId: string | undefined;
   let hints: string;
@@ -913,46 +1014,69 @@ async function modifyEntity(args: string[], ctx: CommandContext): Promise<Comman
   const entity = ctx.canon.getEntity(entityId);
   if (!entity) return { error: `Entity not found: ${entityId}` };
 
-  const genLlm = ctx.generationLlm || ctx.llm;
-  const systemPrompt = `You are a tabletop GM assistant modifying an existing entity.
-Given the current entity and modification hints, output ONLY valid JSON with the updated fields.
-Only include fields that should be changed. Preserve existing data not mentioned in hints.
-Output: { "name"?: string, "summary"?: string, "details_md"?: string, "tags"?: string[], "payload"?: object }`;
-
-  const userPrompt = {
-    currentEntity: {
-      name: entity.name,
-      summary: entity.summary,
-      details_md: entity.details_md,
-      tags: entity.tags,
-      payload: entity.payload,
-    },
-    hints,
+  const genCtx: GenContext = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
   };
 
   try {
-    const patch = await completeJson(genLlm, {
-      system: systemPrompt,
-      messages: [{ role: "user", content: JSON.stringify(userPrompt) }],
-      maxTokens: 1500,
-      temperature: 0.6,
-    }) as any;
+    // Phase 1: Planning
+    const plan = await planModification(entityId, hints, genCtx);
 
-    const updated = ctx.canon.patchEntity(entityId, patch);
-    if (!updated) return { error: "Failed to update entity" };
+    if (plan.changes.length === 0) {
+      return { output: "(No changes proposed)" };
+    }
 
-    const changes: string[] = [];
-    if (patch.name && patch.name !== entity.name) changes.push(`name: ${patch.name}`);
-    if (patch.summary) changes.push(`summary updated`);
-    if (patch.details_md) changes.push(`details_md updated`);
-    if (patch.tags) changes.push(`tags: ${patch.tags.join(", ")}`);
-    if (patch.payload) changes.push(`payload updated`);
+    // Phase 2: Show permission prompt
+    const approval = formatModPlanForApproval(plan, entity, ctx.useColors);
+
+    // TUI Mode: Return plan for TUI approval instead of console output
+    if (ctx.tuiMode) {
+      return {
+        pendingModification: {
+          plan,
+          formattedPlan: approval,
+        },
+      };
+    }
+
+    // Non-TUI: Use console and selectPrompt
+    console.log(approval);
+
+    // Ask for user approval with arrow-key selection
+    const answer = await selectPrompt({
+      message: "What would you like to do?",
+      options: [
+        { label: "Apply", value: "apply", hint: "Apply the modifications" },
+        { label: "Cancel", value: "cancel", hint: "Abort without changing anything" },
+      ],
+      useColors: ctx.useColors,
+      defaultIndex: 0,
+    });
+
+    if (answer === null || answer === "cancel") {
+      return { output: "(Cancelled)" };
+    }
+
+    // Phase 3: Execute modification
+    const result = executeModification(plan, genCtx);
+
+    if (!result.success) {
+      return { error: result.error || "Modification failed" };
+    }
 
     const green = ctx.useColors ? GREEN : "";
     const reset = ctx.useColors ? RESET : "";
     return {
-      output: `${green}Updated: ${updated.name}${reset}\n` +
-        (changes.length > 0 ? changes.map(c => `  + ${c}`).join("\n") : "  (no changes)"),
+      output: `${green}${result.summary}${reset}\n` +
+        (result.appliedChanges.length > 0 ? result.appliedChanges.map(c => `  + ${c}`).join("\n") : "  (no changes)"),
     };
   } catch (e: any) {
     return { error: `Modification failed: ${e?.message || String(e)}` };

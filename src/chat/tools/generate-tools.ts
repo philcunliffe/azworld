@@ -73,7 +73,10 @@ const LOCATION_JSON_SCHEMA = {
         summary: { type: "string" },
         details_md: { type: "string" },
         tags: { type: "array", items: { type: "string" } },
-        payload: { type: "object" },
+        payload: {
+          type: "object",
+          description: "Location-specific data including: kind (tavern, temple, etc.), briefDescription (3-5 sentences), physicalDescription (detailed sensory description), atmosphere, features",
+        },
       },
       required: ["key", "type", "name"],
     },
@@ -220,6 +223,7 @@ Output ONLY valid JSON matching the schema.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Constraints:
 - Keep names distinct; avoid these existing names: ${existingNames.slice(0, 50).join(", ") || "(none)"}
 - Use vivid but concise details
+- Include a brief description (3-5 sentences for quick reference) AND a detailed physical description (rich sensory details - sights, sounds, smells, layout, lighting, notable features)
 - Generate 3-6 NPCs present at the location
 - Entity keys should be stable identifiers like "location_main", "npc_barkeep"
 - NPCs should have varied roles appropriate to the location`;

@@ -2,6 +2,7 @@
  * azbrowse - File-system-like navigation through world and canon entities
  *
  * Entry point and REPL loop for the browsable world navigation CLI.
+ * Supports both readline REPL mode (default) and full-screen TUI mode (--tui).
  */
 
 import readline from "node:readline";
@@ -25,9 +26,10 @@ import { SceneContext } from "../chat/director";
 import { StatusBar } from "../chat/status-bar";
 import { initDebugLog, debugLog, debugToolCall, debugToolResult, debugTokens } from "../chat/debug-log";
 
-import { newBrowseState, BrowseState, stackToPath, isAtNpc, currentRef, currentBurgId, currentLocationId, currentStateId } from "./state";
+import { newBrowseState, BrowseState, stackToPath, isAtNpc, currentRef, currentBurgId, currentLocationId, currentStateId, navigateTo } from "./state";
 import { getPrompt, getPromptPlain } from "./prompt";
 import { executeCommand, CommandContext, CommandResult } from "./commands";
+import { TuiController, type TuiControllerOptions } from "./tui";
 
 // ANSI color codes
 const RESET = "\x1b[0m";
@@ -184,10 +186,18 @@ Usage:
 Options:
   --world <path>    World JSON path (default: ./data/world.json)
   --canon <path>    Canon SQLite DB path (default: ./data/canon.db)
+  --tui             Enable full-screen TUI mode with tree navigation
   --no-color        Disable colored output
   --debug           Enable debug logging to ./logs/session-<timestamp>.log
 
-Commands (type 'help' once running):
+TUI Mode Keys:
+  j/k or arrows     Navigate tree / scroll detail
+  Enter             Expand/collapse node or select
+  l/h or arrows     Move between panels
+  :                 Enter command mode
+  q                 Quit
+
+REPL Commands (type 'help' once running):
   loc <name>        Navigate to burg or location
   ls                List contents at current level
   gen location      Generate new location with NPCs
@@ -196,6 +206,7 @@ Commands (type 'help' once running):
 
 Example:
   bun run azbrowse -- --world data/world.json --canon data/canon.db
+  bun run azbrowse -- --tui    # Full-screen TUI mode
 `.trim();
 }
 
@@ -212,6 +223,7 @@ async function main() {
   const worldPath = globals.world || "./data/world.json";
   const canonPath = globals.canon || "./data/canon.db";
   const useColors = !rest.includes("--no-color") && process.stdout.isTTY;
+  const tuiMode = rest.includes("--tui");
   const debugMode = rest.includes("--debug");
 
   // Initialize debug logging
@@ -246,8 +258,8 @@ async function main() {
   // Initialize browse state
   const state = newBrowseState();
 
-  // Initialize status bar for token tracking
-  const statusBar = new StatusBar(llm.provider, llm.model, useColors);
+  // Initialize status bar for token tracking (disabled in TUI mode - TUI has its own footer)
+  const statusBar = new StatusBar(llm.provider, llm.model, useColors && !tuiMode);
 
   // Display startup info
   const counts = world.counts();
@@ -331,7 +343,7 @@ async function main() {
   }
 
   // Check for existing campaign settings; prompt for onboarding if missing
-  if (!campaignSettings) {
+  if (!campaignSettings && !tuiMode) {
     const doSetup = (await ask("No campaign settings found. Configure now? [y/N]: ")).trim().toLowerCase();
     if (doSetup === "y" || doSetup === "yes") {
       const onboardingResult = await runOnboarding(rl, canon);
@@ -342,15 +354,76 @@ async function main() {
     } else {
       console.log("(Skipped setup. Use /init anytime to configure.)\n");
     }
-  } else {
+  } else if (!tuiMode) {
     console.log("(Campaign settings loaded.)\n");
+  }
+
+  // TUI Mode - full-screen interface
+  if (tuiMode) {
+    rl.close(); // Close readline for TUI mode
+
+    // Build command context for TUI
+    const commandContext: CommandContext = {
+      state,
+      world,
+      canon,
+      llm,
+      generationLlm,
+      campaignSettings,
+      useColors,
+      onToolCall: (name, args) => {
+        debugToolCall(name, args);
+        statusBar.toolStart(name);
+      },
+      onToolResult: (name, result, elapsedMs) => {
+        debugToolResult(name, result, elapsedMs);
+        statusBar.toolEnd();
+      },
+      onTokens: (usage) => {
+        statusBar.addTokens(usage);
+        if (usage.totalTokens) {
+          debugTokens(usage as any);
+        }
+      },
+      getTokens: () => statusBar.getTokens(),
+      onEntityStart: (name, index, total) => {
+        // TUI will handle progress display via its own context override
+      },
+      onEntityComplete: (entity, index, total, tokens, elapsedMs) => {
+        // TUI will handle progress display via its own context override
+      },
+      config,
+      onConfigChange: (newConfig) => { config = newConfig; },
+      onLlmChange: (newLlm) => { llm = newLlm; },
+      onGenerationLlmChange: (newGenLlm) => { generationLlm = newGenLlm; },
+      setStatusBarProvider: (p, m) => statusBar.setProvider(p as any, m),
+    };
+
+    const tuiOptions: TuiControllerOptions = {
+      world,
+      canon,
+      browseState: state,
+      commandContext,
+      useColors,
+      onQuit: () => {
+        statusBar.clear();
+        canon.close();
+      },
+      onNavigate: (ref) => {
+        navigateTo(state, ref);
+      },
+    };
+
+    const tui = new TuiController(tuiOptions);
+    await tui.start();
+    return;
   }
 
   // Track modes
   let talkMode = false;
   let scene: SceneContext | undefined;
 
-  // Main REPL loop
+  // Main REPL loop (non-TUI mode)
   while (true) {
     try {
       // Get appropriate prompt
@@ -418,12 +491,12 @@ async function main() {
             console.log(`${DIM}[${index + 1}/${total}] Generating: ${name}...${RESET}`);
           }
         },
-        onEntityComplete: (name, index, total, tokens, elapsedMs) => {
+        onEntityComplete: (entity, index, total, tokens, elapsedMs) => {
           const secs = (elapsedMs / 1000).toFixed(1);
           if (useColors) {
-            console.log(`${GREEN}[${index + 1}/${total}] ✓ ${name}${RESET} ${DIM}(${tokens} tokens, ${secs}s)${RESET}`);
+            console.log(`${GREEN}[${index + 1}/${total}] ✓ ${entity.name}${RESET} ${DIM}(${tokens} tokens, ${secs}s)${RESET}`);
           } else {
-            console.log(`[${index + 1}/${total}] Created: ${name} (${tokens} tokens, ${secs}s)`);
+            console.log(`[${index + 1}/${total}] Created: ${entity.name} (${tokens} tokens, ${secs}s)`);
           }
         },
         // Model switching support

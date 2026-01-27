@@ -11,6 +11,7 @@
 import { AzgaarWorld } from "../world/azgaar";
 import { CanonStore, CanonEntity, EntityType } from "../canon/canon";
 import { LLMClient, completeJsonWithUsage, ToolDefinition, ToolCall, ChatMessage, TokenUsage } from "../llm/providers";
+import { debugLLMCall, debugLog, isDebugEnabled } from "../chat/debug-log";
 import { CampaignSettings } from "../chat/schema";
 import { formatSettingsForGeneration } from "../chat/campaign-settings";
 import {
@@ -52,6 +53,37 @@ export type GenPlan = {
 export type GenResult = {
   entityIds: string[];
   summary: string;
+  failures?: Array<{ name: string; type: string; error: string }>;
+};
+
+// Types for modification planning
+export type ModFieldChange = {
+  field: "name" | "summary" | "details_md" | "tags" | "payload";
+  oldValue: any;
+  newValue: any;
+  reason: string;
+};
+
+export type ModPlan = {
+  entityId: string;
+  entityName: string;
+  entityType: EntityType;
+  description: string;
+  userPrompt: string;
+  changes: ModFieldChange[];
+  context: {
+    burgId?: number;
+    burgName?: string;
+    relatedEntities: string[];
+  };
+};
+
+export type ModResult = {
+  success: boolean;
+  entityId: string;
+  summary: string;
+  appliedChanges: string[];
+  error?: string;
 };
 
 export type GenContext = {
@@ -65,7 +97,7 @@ export type GenContext = {
   onToolResult?: (name: string, result: any, elapsedMs: number) => void;
   onTokens?: (usage: Partial<TokenUsage>) => void;
   onEntityStart?: (name: string, index: number, total: number) => void;
-  onEntityComplete?: (name: string, index: number, total: number, tokens: number, elapsedMs: number) => void;
+  onEntityComplete?: (entity: { id: string; name: string; type: string }, index: number, total: number, tokens: number, elapsedMs: number) => void;
 };
 
 // Planning tools for the sub-agent
@@ -109,14 +141,14 @@ const PLANNING_TOOLS: ToolDefinition[] = [
   },
   {
     name: "submit_plan",
-    description: "Submit the generation plan. Call this when you have gathered enough context.",
+    description: "Submit the generation plan. Call this when you have gathered enough context. IMPORTANT: Entity names must NOT contain quotes or special characters that would break JSON parsing.",
     parameters: {
       type: "object",
       properties: {
         description: { type: "string", description: "Brief description of what will be generated" },
         entities: {
           type: "string",
-          description: "JSON array of entities to create, each with: type, name, kind (optional), reason, connectsTo (array of {name, rel, isNew?, isExisting?})",
+          description: "JSON array of entities to create. Each entity has: type (location/npc/faction/event), name (NO quotes in names!), kind (optional subtype), reason (why creating), connectsTo (array of {name, rel, isNew?, isExisting?}). Example: [{\"type\":\"location\",\"name\":\"The Red Dragon Inn\",\"kind\":\"tavern\",\"reason\":\"User requested tavern\",\"connectsTo\":[]}]",
         },
       },
       required: ["description", "entities"],
@@ -182,11 +214,62 @@ async function executePlanningTool(
     case "submit_plan": {
       // This is handled specially - return the plan data
       let entities: EntityPlan[] = [];
-      try {
-        entities = JSON.parse(args.entities || "[]");
-      } catch {
-        entities = [];
+
+      // Debug: log the raw input
+      const entitiesType = typeof args.entities;
+      const isArray = Array.isArray(args.entities);
+      // Check for String object (typeof returns "object" for new String())
+      const isStringObject = args.entities instanceof String;
+
+      debugLog(`[submit_plan] args.entities type: ${entitiesType}, isArray: ${isArray}, isStringObject: ${isStringObject}`);
+      debugLog(`[submit_plan] args.entities constructor: ${args.entities?.constructor?.name}`);
+
+      // Handle entities as array (new format) or string (legacy format)
+      if (isArray) {
+        entities = args.entities;
+        debugLog(`[submit_plan] Using array directly, length: ${entities.length}`);
+      } else if ((entitiesType === "string" || isStringObject) && args.entities) {
+        // Convert String object to primitive if needed
+        const entitiesStr = String(args.entities);
+        debugLog(`[submit_plan] Parsing string, length: ${entitiesStr.length}`);
+        debugLog(`[submit_plan] First 100 chars: ${entitiesStr.slice(0, 100)}`);
+        try {
+          const parsed = JSON.parse(entitiesStr);
+          if (Array.isArray(parsed)) {
+            entities = parsed;
+            debugLog(`[submit_plan] Parsed successfully, got ${entities.length} entities`);
+          } else {
+            debugLog(`[submit_plan] ERROR: Parsed entities is not an array: ${typeof parsed}`);
+          }
+        } catch (e: any) {
+          debugLog(`[submit_plan] ERROR: Failed to parse entities JSON: ${e?.message || e}`);
+          debugLog(`[submit_plan] First 20 char codes: ${[...entitiesStr.slice(0, 20)].map(c => c.charCodeAt(0)).join(',')}`);
+        }
+      } else if (args.entities && entitiesType === "object") {
+        // Sometimes the LLM sends it as an object that got parsed by the provider
+        // But NOT a String object (handled above), so this is a real object/array-like
+        debugLog(`[submit_plan] entities is object, checking if array-like`);
+        if (typeof args.entities.length === "number" && args.entities.length > 0) {
+          // Make sure we're not just getting string characters
+          const firstItem = args.entities[0];
+          if (typeof firstItem === "object" && firstItem !== null) {
+            entities = Array.from(args.entities);
+            debugLog(`[submit_plan] Converted array-like object, length: ${entities.length}`);
+          } else {
+            debugLog(`[submit_plan] ERROR: array-like but first item is not object: ${typeof firstItem}`);
+          }
+        } else {
+          debugLog(`[submit_plan] ERROR: entities is object but not valid array-like: ${JSON.stringify(args.entities).slice(0, 200)}`);
+        }
+      } else {
+        debugLog(`[submit_plan] WARNING: No entities provided or unhandled type`);
       }
+
+      if (entities.length === 0 && args.entities) {
+        debugLog(`[submit_plan] WARNING: No entities parsed but args.entities exists`);
+        debugLog(`[submit_plan] args.entities preview: ${String(args.entities).slice(0, 300)}`);
+      }
+
       return {
         _isPlan: true,
         description: args.description,
@@ -381,9 +464,10 @@ export async function executeGeneration(
   const createdIds: string[] = [];
   const keyToId: Record<string, string> = {};
   const summaries: string[] = [];
+  const failures: Array<{ name: string; type: string; error: string }> = [];
   const total = plan.entities.length;
 
-  // First pass: Generate all entities in parallel
+  // First pass: Generate all entities in parallel (LLM calls only)
   const generateEntity = async (entityPlan: EntityPlan, index: number) => {
     const startTime = Date.now();
     ctx.onEntityStart?.(entityPlan.name, index, total);
@@ -393,14 +477,25 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
 Output ONLY valid JSON with these fields:
 {
   "name": "${entityPlan.name}",
-  "summary": "One-line description",
-  "details_md": "Longer markdown description with background, personality, secrets etc",
+  "summary": "One-line description (brief tagline)",
+  "details_md": "Only for additional notes that don't fit structured fields - usually empty or minimal",
   "tags": ["tag1", "tag2"],
   "payload": { ... type-specific data ... }
 }
 
-For NPCs, payload should include: role, personality, appearance, knows (public/secret arrays), secrets, motivations
-For locations, payload should include: kind, atmosphere, features
+For NPCs, payload MUST include ALL of these structured fields:
+- role: string (job/position like "Tavernkeeper", "Guard Captain", "Merchant")
+- background: string (brief backstory, 2-3 sentences - origin, history, how they got here)
+- personality: string (key traits and mannerisms, 2-3 sentences)
+- appearance: string (physical description, 1-2 sentences)
+- hooks: string[] (2-4 GM-facing story hooks/adventure seeds involving this NPC)
+- knows: { public: string[], secret: string[] } (what this NPC knows - public facts anyone can learn, secret facts only revealed through roleplay)
+- secrets: string[] (personal secrets ABOUT this NPC - things they hide)
+- motivations: string[] (what drives them, their goals)
+
+IMPORTANT for NPCs: Put ALL descriptive content in the payload fields above. The "details_md" field should be empty or minimal - do NOT duplicate background/personality/appearance there.
+
+For locations, payload should include: kind, briefDescription (3-5 sentences for quick reference), physicalDescription (detailed sensory description - sights, sounds, smells, layout, lighting, notable features), atmosphere, features
 For factions, payload should include: kind, goals, methods, influence`;
 
     const userPrompt = JSON.stringify({
@@ -433,14 +528,15 @@ For factions, payload should include: kind, goals, methods, influence`;
         ctx.onTokens(usage);
       }
 
-      ctx.onEntityComplete?.(entityPlan.name, index, total, tokens, elapsedMs);
-
-      return { entityPlan, result, usage, success: true as const };
+      return { entityPlan, result, usage, elapsedMs, tokens, index, success: true as const };
     } catch (e: any) {
       const elapsedMs = Date.now() - startTime;
-      ctx.onEntityComplete?.(entityPlan.name, index, total, 0, elapsedMs);
-      console.error(`Failed to generate ${entityPlan.name}:`, e?.message || e);
-      return { entityPlan, error: e?.message || e, success: false as const };
+      const errorMsg = e?.message || String(e);
+      console.error(`Failed to generate ${entityPlan.name}:`, errorMsg);
+      if (isDebugEnabled()) {
+        debugLLMCall(`Generation FAILED: ${entityPlan.name}`, { type: entityPlan.type, error: errorMsg });
+      }
+      return { entityPlan, error: errorMsg, elapsedMs, tokens: 0, index, success: false as const };
     }
   };
 
@@ -449,10 +545,26 @@ For factions, payload should include: kind, goals, methods, influence`;
     plan.entities.map((entityPlan, index) => generateEntity(entityPlan, index))
   );
 
-  // Process successful results sequentially (DB writes)
+  // Process results sequentially (DB writes) and fire callbacks with entity IDs
   for (const res of results) {
-    if (!res.success) continue;
-    const { entityPlan, result } = res;
+    if (!res.success) {
+      // Record the failure
+      failures.push({
+        name: res.entityPlan.name,
+        type: res.entityPlan.type,
+        error: res.error || "Unknown error",
+      });
+      // Fire callback for failed entities (no ID)
+      ctx.onEntityComplete?.(
+        { id: "", name: res.entityPlan.name, type: res.entityPlan.type },
+        res.index,
+        total,
+        res.tokens,
+        res.elapsedMs
+      );
+      continue;
+    }
+    const { entityPlan, result, elapsedMs, tokens, index } = res;
 
     const entity = ctx.canon.addEntity({
       type: entityPlan.type,
@@ -475,6 +587,15 @@ For factions, payload should include: kind, goals, methods, influence`;
     createdIds.push(entity.id);
     keyToId[entityPlan.name] = entity.id;
     summaries.push(`${entity.name} (${entityPlan.type})`);
+
+    // Fire callback with actual entity info (including ID)
+    ctx.onEntityComplete?.(
+      { id: entity.id, name: entity.name, type: entity.type },
+      index,
+      total,
+      tokens,
+      elapsedMs
+    );
   }
 
   // Second pass: Create relations
@@ -515,11 +636,22 @@ For factions, payload should include: kind, goals, methods, influence`;
     }
   }
 
+  // Build summary including both successes and failures
+  const summaryParts: string[] = [];
+  if (summaries.length > 0) {
+    summaryParts.push(`Created: ${summaries.join(", ")}`);
+  }
+  if (failures.length > 0) {
+    const failedNames = failures.map(f => `${f.name} (${f.type})`).join(", ");
+    summaryParts.push(`Failed: ${failedNames}`);
+  }
+
   return {
     entityIds: createdIds,
-    summary: summaries.length > 0
-      ? `Created: ${summaries.join(", ")}`
+    summary: summaryParts.length > 0
+      ? summaryParts.join("\n")
       : "No entities created",
+    failures: failures.length > 0 ? failures : undefined,
   };
 }
 
@@ -571,6 +703,411 @@ export function formatPlanForApproval(plan: GenPlan, useColors?: boolean): strin
   lines.push("");
 
   return lines.join("\n");
+}
+
+// Modification planning tools for the sub-agent
+const MOD_PLANNING_TOOLS: ToolDefinition[] = [
+  {
+    name: "get_entity_full",
+    description: "Get complete entity details including all fields",
+    parameters: {
+      type: "object",
+      properties: {
+        entityId: { type: "string", description: "Entity ID to retrieve" },
+      },
+      required: ["entityId"],
+    },
+  },
+  {
+    name: "get_entity_relations",
+    description: "Get all relations involving this entity",
+    parameters: {
+      type: "object",
+      properties: {
+        entityId: { type: "string", description: "Entity ID to get relations for" },
+      },
+      required: ["entityId"],
+    },
+  },
+  {
+    name: "canon_query",
+    description: "Search canon entities by type and/or text. Returns IDs and names only.",
+    parameters: {
+      type: "object",
+      properties: {
+        type: { type: "string", description: "Entity type: npc, location, faction, event" },
+        text: { type: "string", description: "Text to search for in name/summary" },
+        burgId: { type: "string", description: "Filter by burg ID" },
+        limit: { type: "string", description: "Max results (default 10)" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "world_getBurgDetails",
+    description: "Get details about a burg (city/town)",
+    parameters: {
+      type: "object",
+      properties: {
+        burgId: { type: "string", description: "Burg ID" },
+      },
+      required: ["burgId"],
+    },
+  },
+  {
+    name: "submit_mod_plan",
+    description: "Submit the modification plan with specific changes. Call this when you have analyzed the entity and determined what changes to make.",
+    parameters: {
+      type: "object",
+      properties: {
+        description: { type: "string", description: "Brief description of the modification" },
+        changes: {
+          type: "string",
+          description: "JSON array of changes. Each change has: field (name/summary/details_md/tags/payload), oldValue, newValue, reason. Example: [{\"field\":\"summary\",\"oldValue\":\"A tired bartender\",\"newValue\":\"A tired bartender who secretly works for the crown\",\"reason\":\"Adding spy background per user request\"}]",
+        },
+      },
+      required: ["description", "changes"],
+    },
+  },
+];
+
+// Execute modification planning tools
+async function executeModPlanningTool(
+  name: string,
+  args: Record<string, any>,
+  ctx: GenContext,
+  targetEntity: CanonEntity
+): Promise<any> {
+  switch (name) {
+    case "get_entity_full": {
+      const id = args.entityId as string;
+      const entity = ctx.canon.getEntity(id);
+      if (!entity) return { error: `Entity ${id} not found` };
+      return {
+        id: entity.id,
+        type: entity.type,
+        name: entity.name,
+        summary: entity.summary,
+        details_md: entity.details_md,
+        tags: entity.tags,
+        payload: entity.payload,
+        anchors: entity.anchors,
+        _note: "Now analyze this entity and call submit_mod_plan with your proposed changes.",
+      };
+    }
+
+    case "get_entity_relations": {
+      const id = args.entityId as string;
+      const rels = ctx.canon.listRelations({ entity_id: id, limit: 50 });
+      return rels.map(r => {
+        const fromEntity = ctx.canon.getEntity(r.from_id);
+        const toEntity = ctx.canon.getEntity(r.to_id);
+        return {
+          id: r.id,
+          from: { id: r.from_id, name: fromEntity?.name, type: fromEntity?.type },
+          to: { id: r.to_id, name: toEntity?.name, type: toEntity?.type },
+          rel_type: r.rel_type,
+          notes: r.notes,
+        };
+      });
+    }
+
+    case "canon_query": {
+      const type = args.type as EntityType | undefined;
+      const text = args.text as string | undefined;
+      const burgId = args.burgId ? Number(args.burgId) : undefined;
+      const limit = args.limit ? Number(args.limit) : 10;
+
+      const entities = ctx.canon.listEntities({
+        type,
+        text,
+        anchors: burgId !== undefined ? { burgId } : undefined,
+        limit,
+      });
+
+      return entities.map(e => ({ id: e.id, name: e.name, type: e.type, kind: e.payload?.kind }));
+    }
+
+    case "world_getBurgDetails": {
+      const id = Number(args.burgId);
+      const burg = ctx.world.getBurg(id);
+      if (!burg) return { error: `Burg ${id} not found` };
+
+      const state = typeof burg.state === "number" ? ctx.world.getState(burg.state) : undefined;
+      return {
+        id: burg.id,
+        name: burg.name,
+        population: burg.population ?? burg.pop,
+        capital: burg.capital,
+        port: burg.port,
+        state: state ? { id: state.id, name: state.name, form: state.formName ?? state.form } : null,
+      };
+    }
+
+    case "submit_mod_plan": {
+      // Parse changes
+      let changes: ModFieldChange[] = [];
+      if (Array.isArray(args.changes)) {
+        changes = args.changes;
+      } else if (typeof args.changes === "string") {
+        try {
+          changes = JSON.parse(args.changes);
+        } catch (e) {
+          console.error("[submit_mod_plan] Failed to parse changes JSON:", e);
+          changes = [];
+        }
+      }
+
+      return {
+        _isModPlan: true,
+        description: args.description,
+        changes,
+      };
+    }
+
+    default:
+      return { error: `Unknown tool: ${name}` };
+  }
+}
+
+/**
+ * Plan modification using a sub-agent with tools
+ */
+export async function planModification(
+  entityId: string,
+  prompt: string,
+  ctx: GenContext
+): Promise<ModPlan> {
+  const entity = ctx.canon.getEntity(entityId);
+  if (!entity) {
+    throw new Error(`Entity not found: ${entityId}`);
+  }
+
+  const burgId = entity.anchors?.burgId as number | undefined;
+  const burg = burgId !== undefined ? ctx.world.getBurg(burgId) : undefined;
+  const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+
+  const systemPrompt = `You are a world-building modification assistant. Your job is to plan specific changes to an existing entity.
+
+Given an entity and modification request, you should:
+1. FIRST call get_entity_full to understand the current state
+2. Then call submit_mod_plan with your proposed changes
+
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
+IMPORTANT GUIDELINES:
+- Preserve existing content unless explicitly changing it
+- For each change, provide a clear reason
+- Be specific about what's being changed (old value vs new value)
+- For payload changes, you can modify specific payload fields
+
+CRITICAL: You MUST call submit_mod_plan to complete this task. Without calling submit_mod_plan, no changes will be made.`;
+
+  const userMessage = `Modify entity: ${entity.name} (${entity.type})
+Modification request: "${prompt}"
+
+Entity ID: ${entityId}
+
+Instructions:
+1. Call get_entity_full with entityId "${entityId}" to see current state
+2. Call submit_mod_plan with the specific field changes needed to implement the modification request
+
+You MUST call submit_mod_plan to complete this task.`;
+
+  const llm = ctx.llm;
+  const messages: ChatMessage[] = [{ role: "user", content: userMessage }];
+
+  // Run the planning agent loop
+  let plan: ModPlan | null = null;
+  let iterations = 0;
+  const maxIterations = 5;
+
+  while (!plan && iterations < maxIterations) {
+    iterations++;
+
+    const result = await llm.complete({
+      system: systemPrompt,
+      messages,
+      tools: MOD_PLANNING_TOOLS,
+      toolChoice: iterations === maxIterations ? "required" : "auto",
+      maxTokens: 2000,
+      temperature: 0.3,
+    });
+
+    // Report token usage
+    if (result.usage && ctx.onTokens) {
+      ctx.onTokens(result.usage);
+    }
+
+    // If no tool calls, the agent is done
+    if (!result.toolCalls?.length) {
+      if (result.text) {
+        messages.push({ role: "assistant", content: result.text });
+      }
+      break;
+    }
+
+    // Process tool calls
+    const assistantMessage: ChatMessage = {
+      role: "assistant",
+      content: result.text || "",
+      toolCalls: result.toolCalls,
+    };
+    messages.push(assistantMessage);
+
+    for (const tc of result.toolCalls) {
+      if (ctx.onToolCall) ctx.onToolCall(tc.name, tc.arguments);
+      const startTime = Date.now();
+
+      const toolResult = await executeModPlanningTool(tc.name, tc.arguments, ctx, entity);
+
+      if (ctx.onToolResult) {
+        ctx.onToolResult(tc.name, toolResult, Date.now() - startTime);
+      }
+
+      // Check if this is the plan submission
+      if (toolResult?._isModPlan) {
+        const rels = ctx.canon.listRelations({ entity_id: entityId, limit: 20 });
+        const relatedEntities = rels.map(r => {
+          const otherId = r.from_id === entityId ? r.to_id : r.from_id;
+          const other = ctx.canon.getEntity(otherId);
+          return other?.name || otherId;
+        });
+
+        plan = {
+          entityId,
+          entityName: entity.name,
+          entityType: entity.type,
+          description: toolResult.description,
+          userPrompt: prompt,
+          changes: toolResult.changes,
+          context: {
+            burgId,
+            burgName: burg?.name,
+            relatedEntities,
+          },
+        };
+        break;
+      }
+
+      // Add tool result to messages
+      messages.push({
+        role: "tool",
+        content: JSON.stringify(toolResult),
+        toolCallId: tc.id,
+      });
+    }
+  }
+
+  if (!plan) {
+    // Check if we have any text response from the LLM that might explain what happened
+    const lastAssistantMsg = messages.filter(m => m.role === "assistant").pop();
+    const assistantText = lastAssistantMsg?.content;
+    if (assistantText && typeof assistantText === "string" && assistantText.length > 0) {
+      throw new Error(`Modification planning failed. The assistant responded with text instead of calling submit_mod_plan: "${assistantText.slice(0, 200)}..."`);
+    }
+    throw new Error("Failed to create modification plan - agent did not call submit_mod_plan");
+  }
+
+  return plan;
+}
+
+/**
+ * Execute a modification plan, applying all changes
+ */
+export function executeModification(plan: ModPlan, ctx: GenContext): ModResult {
+  const entity = ctx.canon.getEntity(plan.entityId);
+  if (!entity) {
+    return {
+      success: false,
+      entityId: plan.entityId,
+      summary: `Entity not found: ${plan.entityId}`,
+      appliedChanges: [],
+      error: `Entity not found: ${plan.entityId}`,
+    };
+  }
+
+  const patch: Record<string, any> = {};
+  const appliedChanges: string[] = [];
+
+  for (const change of plan.changes) {
+    if (change.field === "payload") {
+      // Merge payload rather than replace
+      patch.payload = { ...entity.payload, ...change.newValue };
+    } else {
+      patch[change.field] = change.newValue;
+    }
+    appliedChanges.push(`${change.field}: ${change.reason}`);
+  }
+
+  const updated = ctx.canon.patchEntity(plan.entityId, patch);
+  if (!updated) {
+    return {
+      success: false,
+      entityId: plan.entityId,
+      summary: "Failed to update entity",
+      appliedChanges: [],
+      error: "Failed to update entity",
+    };
+  }
+
+  return {
+    success: true,
+    entityId: plan.entityId,
+    summary: `Updated: ${updated.name}`,
+    appliedChanges,
+  };
+}
+
+/**
+ * Format a modification plan for user approval display
+ */
+export function formatModPlanForApproval(plan: ModPlan, entity: CanonEntity, useColors?: boolean): string {
+  const BOLD = useColors ? "\x1b[1m" : "";
+  const DIM = useColors ? "\x1b[2m" : "";
+  const CYAN = useColors ? "\x1b[36m" : "";
+  const GREEN = useColors ? "\x1b[32m" : "";
+  const RED = useColors ? "\x1b[31m" : "";
+  const YELLOW = useColors ? "\x1b[33m" : "";
+  const RESET = useColors ? "\x1b[0m" : "";
+
+  const lines: string[] = [];
+
+  // Header
+  lines.push(`${BOLD}${CYAN}Modification Plan${RESET}`);
+  lines.push(`${DIM}${plan.userPrompt}${RESET}`);
+  lines.push("");
+
+  // Entity info
+  lines.push(`${BOLD}Entity:${RESET} ${entity.name} (${entity.type})`);
+  if (plan.context.burgName) {
+    lines.push(`${DIM}Location: ${plan.context.burgName}${RESET}`);
+  }
+  if (plan.context.relatedEntities.length > 0) {
+    lines.push(`${DIM}Related: ${plan.context.relatedEntities.slice(0, 5).join(", ")}${RESET}`);
+  }
+  lines.push("");
+
+  // Changes
+  lines.push(`${BOLD}Proposed Changes:${RESET}`);
+  for (const change of plan.changes) {
+    lines.push(`  ${YELLOW}${change.field}${RESET}`);
+    lines.push(`    ${RED}- ${truncateValue(change.oldValue, 60)}${RESET}`);
+    lines.push(`    ${GREEN}+ ${truncateValue(change.newValue, 60)}${RESET}`);
+    lines.push(`    ${DIM}"${change.reason}"${RESET}`);
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * Helper to truncate long values for display
+ */
+function truncateValue(value: any, maxLen: number): string {
+  if (value === null || value === undefined) return "(empty)";
+  const str = typeof value === "string" ? value : JSON.stringify(value);
+  if (str.length <= maxLen) return str;
+  return str.slice(0, maxLen - 3) + "...";
 }
 
 /**
