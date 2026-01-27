@@ -16,6 +16,8 @@ import { buildTree, getTreeChildren, nodeIdToRef, refToNodeId, expandPathToNode,
 import { renderTreePanelWithBorder } from "./panels/tree-panel";
 import { renderDetailPanelWithBorder, getCurrentSectionKey } from "./panels/detail-panel";
 import { overlayModal } from "./panels/modal";
+import { overlaySearchModal } from "./panels/search-modal";
+import { performSearch } from "./search";
 import { handleKeypress, parseKeyBuffer, getModeHelpText } from "./keybindings";
 import {
   CSI,
@@ -74,6 +76,7 @@ export class TuiController {
   private wasRawMode = false;
   private pendingPlan: GenPlan | null = null;  // Generation plan awaiting user approval
   private pendingModPlan: ModPlan | null = null;  // Modification plan awaiting user approval
+  private searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;  // Search debounce timer
 
   constructor(private options: TuiControllerOptions) {
     this.state = createInitialTuiState();
@@ -277,6 +280,18 @@ export class TuiController {
       if (sectionKey) {
         this.dispatch({ type: "TOGGLE_DETAIL_SECTION", sectionKey });
       }
+    }
+
+    if (result.callback === "navigate_to_search_result") {
+      this.navigateToSearchResult();
+    }
+
+    // Trigger search with debounce when query changes
+    if (result.actions.some(a =>
+      a.type === "INSERT_SEARCH_CHAR" ||
+      a.type === "BACKSPACE_SEARCH"
+    )) {
+      this.scheduleSearch();
     }
 
     // Rebuild tree if nodes were expanded/collapsed
@@ -493,6 +508,52 @@ export class TuiController {
   }
 
   /**
+   * Schedule a search with debouncing
+   */
+  private scheduleSearch(): void {
+    if (this.searchDebounceTimer) {
+      clearTimeout(this.searchDebounceTimer);
+    }
+
+    this.searchDebounceTimer = setTimeout(() => {
+      this.executeSearch();
+    }, 150); // 150ms debounce
+  }
+
+  /**
+   * Execute the search and update results
+   */
+  private executeSearch(): void {
+    const query = this.state.search?.query || "";
+    const results = performSearch(
+      query,
+      this.options.world,
+      this.options.canon,
+      20
+    );
+
+    this.dispatch({ type: "SET_SEARCH_RESULTS", results });
+    this.render();
+  }
+
+  /**
+   * Navigate to the selected search result
+   */
+  private navigateToSearchResult(): void {
+    if (!this.state.search?.results.length) return;
+
+    const result = this.state.search.results[this.state.search.selectedIndex];
+    if (!result) return;
+
+    // Close search modal
+    this.dispatch({ type: "CLOSE_SEARCH" });
+
+    // Parse result ID to EntityRef and navigate
+    const ref = nodeIdToRef(result.id);
+    this.navigateToEntity(ref);
+  }
+
+  /**
    * Navigate to an entity (used when pressing Enter on a node)
    */
   private navigateToEntity(ref: EntityRef): void {
@@ -635,8 +696,14 @@ export class TuiController {
 
     // Footer - status bar with model info and token counts
     const mode = this.state.mode;
-    const modeIndicator = mode === "command" ? `${FG_YELLOW}COMMAND${RESET}` : (mode === "modal" ? `${FG_GREEN}MODAL${RESET}` : `${FG_CYAN}NORMAL${RESET}`);
-    const modeText = mode === "command" ? "COMMAND" : (mode === "modal" ? "MODAL" : "NORMAL");
+    const modeIndicator = mode === "command" ? `${FG_YELLOW}COMMAND${RESET}` :
+                          mode === "modal" ? `${FG_GREEN}MODAL${RESET}` :
+                          mode === "search" ? `${FG_YELLOW}SEARCH${RESET}` :
+                          `${FG_CYAN}NORMAL${RESET}`;
+    const modeText = mode === "command" ? "COMMAND" :
+                     mode === "modal" ? "MODAL" :
+                     mode === "search" ? "SEARCH" :
+                     "NORMAL";
     const helpText = getModeHelpText(this.state.mode, this.state.focus);
 
     // Format model info with token counts
@@ -685,6 +752,11 @@ export class TuiController {
     let screenLines = lines;
     if (this.state.modal?.visible) {
       screenLines = overlayModal(lines, this.state.modal, this.layout);
+    }
+
+    // Apply search modal overlay if visible
+    if (this.state.search?.visible) {
+      screenLines = overlaySearchModal(screenLines, this.state.search, this.layout);
     }
 
     // Render to screen

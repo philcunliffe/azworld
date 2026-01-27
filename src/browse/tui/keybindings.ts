@@ -69,6 +69,8 @@ export function handleKeypress(key: string, state: TuiState): KeypressResult {
       return handleCommandMode(key, state);
     case "modal":
       return handleModalMode(key, state);
+    case "search":
+      return handleSearchMode(key, state);
     default:
       return { actions: [] };
   }
@@ -90,6 +92,12 @@ function handleNormalMode(key: string, state: TuiState): KeypressResult {
   // Enter command mode
   if (key === ":") {
     actions.push({ type: "SET_MODE", mode: "command" });
+    return { actions };
+  }
+
+  // Enter search mode
+  if (key === "/") {
+    actions.push({ type: "OPEN_SEARCH" });
     return { actions };
   }
 
@@ -422,10 +430,89 @@ function handleModalMode(key: string, state: TuiState): KeypressResult {
 }
 
 /**
+ * Handle keys in search mode
+ */
+function handleSearchMode(key: string, state: TuiState): KeypressResult {
+  const actions: TuiAction[] = [];
+
+  // Escape - close search
+  if (key === ESCAPE) {
+    actions.push({ type: "CLOSE_SEARCH" });
+    return { actions };
+  }
+
+  // Enter - navigate to selected result
+  if (key === ENTER) {
+    if (state.search?.results.length) {
+      return { actions, callback: "navigate_to_search_result" };
+    }
+    actions.push({ type: "CLOSE_SEARCH" });
+    return { actions };
+  }
+
+  // Backspace
+  if (key === BACKSPACE || key === DELETE) {
+    if (state.search?.query.length === 0) {
+      actions.push({ type: "CLOSE_SEARCH" });
+    } else {
+      actions.push({ type: "BACKSPACE_SEARCH" });
+    }
+    return { actions };
+  }
+
+  // Navigation in results (j/k or arrows)
+  if (key === "j" || key === DOWN_ARROW) {
+    actions.push({ type: "SEARCH_SELECT", direction: "down" });
+    return { actions };
+  }
+  if (key === "k" || key === UP_ARROW) {
+    actions.push({ type: "SEARCH_SELECT", direction: "up" });
+    return { actions };
+  }
+
+  // Page navigation
+  if (key === PAGE_DOWN) {
+    for (let i = 0; i < 5; i++) {
+      actions.push({ type: "SEARCH_SELECT", direction: "down" });
+    }
+    return { actions };
+  }
+  if (key === PAGE_UP) {
+    for (let i = 0; i < 5; i++) {
+      actions.push({ type: "SEARCH_SELECT", direction: "up" });
+    }
+    return { actions };
+  }
+
+  // Cursor movement
+  if (key === LEFT_ARROW) {
+    actions.push({ type: "MOVE_SEARCH_CURSOR", direction: "left" });
+    return { actions };
+  }
+  if (key === RIGHT_ARROW) {
+    actions.push({ type: "MOVE_SEARCH_CURSOR", direction: "right" });
+    return { actions };
+  }
+
+  // Ctrl+C - cancel
+  if (key === CTRL_C) {
+    actions.push({ type: "CLOSE_SEARCH" });
+    return { actions };
+  }
+
+  // Regular character - insert into query
+  if (key.length === 1 && key.charCodeAt(0) >= 32) {
+    actions.push({ type: "INSERT_SEARCH_CHAR", char: key });
+  }
+
+  return { actions };
+}
+
+/**
  * Check if we're in a mode that captures all input
  */
 export function isInputCaptured(state: TuiState): boolean {
-  return state.mode === "command" || state.mode === "modal";
+  return state.mode === "command" || state.mode === "modal" || state.mode === "search";
 }
 
 /**
@@ -435,14 +522,16 @@ export function getModeHelpText(mode: InputMode, focus: string): string {
   switch (mode) {
     case "normal":
       if (focus === "tree") {
-        return "j/k: move  Enter: expand/select  l: expand/→  h: collapse/←  1/2: focus  :: command  q: quit";
+        return "j/k: move  Enter: expand/select  l: expand/→  h: collapse/←  /: search  :: command  q: quit";
       } else {
-        return "j/k: section  Space: toggle  h: ← tree  1/2: focus  :: command  q: quit";
+        return "j/k: section  Space: toggle  h: ← tree  /: search  :: command  q: quit";
       }
     case "command":
       return "Enter: execute  Esc: cancel  ←/→: cursor  ↑/↓: history";
     case "modal":
       return "j/k: select  Enter: confirm  Esc: close";
+    case "search":
+      return "Type to search  j/k: select  Enter: go  Esc: close";
     default:
       return "";
   }

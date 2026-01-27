@@ -10,6 +10,7 @@ export const InputModeEnum = z.enum([
   "normal",   // vim-style navigation in tree
   "command",  // typing commands after ':'
   "modal",    // viewing generation results modal
+  "search",   // global search modal
 ]);
 
 export type InputMode = z.infer<typeof InputModeEnum>;
@@ -70,6 +71,30 @@ export const ApprovalChoiceSchema = z.object({
 });
 
 export type ApprovalChoice = z.infer<typeof ApprovalChoiceSchema>;
+
+// Search result for global search modal
+export const SearchResultSchema = z.object({
+  id: z.string(),                              // Node ID (e.g., "burg:42", "npc:abc123")
+  name: z.string(),                            // Display name
+  kind: EntityKindEnum,                        // Entity type for color coding
+  score: z.number(),                           // Match score for ranking
+  breadcrumb: z.string().optional(),           // Path context (e.g., "Valenwood > Solitude")
+  source: z.enum(["world", "canon"]),          // Origin of result
+});
+
+export type SearchResult = z.infer<typeof SearchResultSchema>;
+
+// Search modal state
+export const SearchStateSchema = z.object({
+  visible: z.boolean(),
+  query: z.string(),                           // Current search input
+  cursorPos: z.number(),                       // Cursor position in query
+  results: z.array(SearchResultSchema),
+  selectedIndex: z.number(),                   // Currently highlighted result
+  scrollOffset: z.number(),                    // Scroll position in results list
+});
+
+export type SearchState = z.infer<typeof SearchStateSchema>;
 
 // Modal state for generation progress/results
 export const ModalStateSchema = z.object({
@@ -152,6 +177,9 @@ export const TuiStateSchema = z.object({
   // Modal
   modal: ModalStateSchema.nullable(),
 
+  // Search modal
+  search: SearchStateSchema.nullable(),
+
   // Screen dimensions (updated on resize)
   terminalRows: z.number(),
   terminalCols: z.number(),
@@ -216,6 +244,15 @@ export type TuiAction =
   // Planning modal (shown while gen agent creates plan)
   | { type: "SHOW_PLANNING_MODAL"; title: string }
 
+  // Search modal
+  | { type: "OPEN_SEARCH" }
+  | { type: "CLOSE_SEARCH" }
+  | { type: "INSERT_SEARCH_CHAR"; char: string }
+  | { type: "BACKSPACE_SEARCH" }
+  | { type: "SET_SEARCH_RESULTS"; results: SearchResult[] }
+  | { type: "SEARCH_SELECT"; direction: "up" | "down" }
+  | { type: "MOVE_SEARCH_CURSOR"; direction: "left" | "right" }
+
   // Terminal
   | { type: "RESIZE"; rows: number; cols: number }
 
@@ -250,6 +287,6 @@ export type TuiCallbacks = {
 // Keypress result from keybinding handler
 export type KeypressResult = {
   actions: TuiAction[];
-  callback?: "execute_command" | "navigate_to_entity" | "sync_browse_state" | "quit" | "execute_approved_generation" | "execute_approved_modification" | "toggle_current_section" | null;
+  callback?: "execute_command" | "navigate_to_entity" | "sync_browse_state" | "quit" | "execute_approved_generation" | "execute_approved_modification" | "toggle_current_section" | "navigate_to_search_result" | null;
   entityRef?: EntityRef;
 };

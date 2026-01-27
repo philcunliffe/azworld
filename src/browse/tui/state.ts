@@ -4,7 +4,7 @@
  * Redux-like reducer pattern for deterministic state updates.
  */
 
-import type { TuiState, TuiAction, TreeNode, ModalState, InputMode, FocusArea, ApprovalChoice, ModelInfo, TokenCounts } from "./types";
+import type { TuiState, TuiAction, TreeNode, ModalState, InputMode, FocusArea, ApprovalChoice, ModelInfo, TokenCounts, SearchResult, SearchState } from "./types";
 
 /**
  * Create initial TUI state
@@ -34,6 +34,9 @@ export function createInitialTuiState(): TuiState {
 
     // Modal
     modal: null,
+
+    // Search modal
+    search: null,
 
     // Terminal dimensions
     terminalRows: process.stdout.rows || 24,
@@ -486,6 +489,108 @@ export function tuiReducer(state: TuiState, action: TuiAction): TuiState {
           progress: "Analyzing context and planning entities...",
         },
       };
+
+    // Search modal
+    case "OPEN_SEARCH":
+      return {
+        ...state,
+        mode: "search",
+        search: {
+          visible: true,
+          query: "",
+          cursorPos: 0,
+          results: [],
+          selectedIndex: 0,
+          scrollOffset: 0,
+        },
+      };
+
+    case "CLOSE_SEARCH":
+      return {
+        ...state,
+        mode: "normal",
+        search: null,
+      };
+
+    case "INSERT_SEARCH_CHAR": {
+      if (!state.search) return state;
+      const before = state.search.query.slice(0, state.search.cursorPos);
+      const after = state.search.query.slice(state.search.cursorPos);
+      return {
+        ...state,
+        search: {
+          ...state.search,
+          query: before + action.char + after,
+          cursorPos: state.search.cursorPos + 1,
+        },
+      };
+    }
+
+    case "BACKSPACE_SEARCH": {
+      if (!state.search || state.search.cursorPos === 0) return state;
+      const before = state.search.query.slice(0, state.search.cursorPos - 1);
+      const after = state.search.query.slice(state.search.cursorPos);
+      return {
+        ...state,
+        search: {
+          ...state.search,
+          query: before + after,
+          cursorPos: state.search.cursorPos - 1,
+        },
+      };
+    }
+
+    case "SET_SEARCH_RESULTS":
+      return state.search
+        ? {
+            ...state,
+            search: {
+              ...state.search,
+              results: action.results,
+              selectedIndex: 0,
+              scrollOffset: 0,
+            },
+          }
+        : state;
+
+    case "SEARCH_SELECT": {
+      if (!state.search || state.search.results.length === 0) return state;
+      const count = state.search.results.length;
+      const newIndex =
+        action.direction === "down"
+          ? (state.search.selectedIndex + 1) % count
+          : (state.search.selectedIndex - 1 + count) % count;
+
+      // Adjust scroll to keep selection visible
+      const maxVisible = Math.floor((state.terminalRows - 10) / 1);
+      let newScroll = state.search.scrollOffset;
+      if (newIndex < newScroll) {
+        newScroll = newIndex;
+      } else if (newIndex >= newScroll + maxVisible) {
+        newScroll = newIndex - maxVisible + 1;
+      }
+
+      return {
+        ...state,
+        search: {
+          ...state.search,
+          selectedIndex: newIndex,
+          scrollOffset: newScroll,
+        },
+      };
+    }
+
+    case "MOVE_SEARCH_CURSOR": {
+      if (!state.search) return state;
+      const newPos =
+        action.direction === "left"
+          ? Math.max(0, state.search.cursorPos - 1)
+          : Math.min(state.search.query.length, state.search.cursorPos + 1);
+      return {
+        ...state,
+        search: { ...state.search, cursorPos: newPos },
+      };
+    }
 
     // Terminal
     case "RESIZE":
