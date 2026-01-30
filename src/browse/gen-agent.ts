@@ -23,12 +23,49 @@ import {
   setStack,
 } from "./state";
 
+// Field configurations for each entity type
+export const ENTITY_FIELD_CONFIGS: Record<string, { core: string[]; payload: string[] }> = {
+  npc: {
+    core: ["name", "summary", "details_md", "tags"],
+    payload: ["role", "background", "personality", "appearance", "hooks", "knows", "secrets", "motivations"],
+  },
+  location: {
+    core: ["name", "summary", "details_md", "tags"],
+    payload: ["kind", "briefDescription", "physicalDescription", "atmosphere", "features"],
+  },
+  faction: {
+    core: ["name", "summary", "details_md", "tags"],
+    payload: ["kind", "goals", "methods", "influence"],
+  },
+  event: {
+    core: ["name", "summary", "details_md", "tags"],
+    payload: ["scope", "severity", "daysAgo"],
+  },
+  meta: {
+    core: ["summary", "details_md"],
+    // Combined fields for both state and burg descriptions
+    payload: ["atmosphere", "politicalClimate", "notableFeatures", "history", "currentAffairs", "notableLandmarks", "dailyLife", "localCustoms", "reputation"],
+  },
+};
+
+// Field configurations for description meta entities (state/burg descriptions)
+export const STATE_DESCRIPTION_FIELDS = {
+  core: ["summary", "details_md"],
+  payload: ["atmosphere", "politicalClimate", "notableFeatures", "history", "currentAffairs"],
+};
+
+export const BURG_DESCRIPTION_FIELDS = {
+  core: ["summary", "details_md"],
+  payload: ["atmosphere", "notableLandmarks", "dailyLife", "localCustoms", "reputation"],
+};
+
 // Types for generation planning
 export type EntityPlan = {
   type: EntityType;
   name: string;
   kind?: string;
   reason: string;  // LLM-generated reason for THIS entity
+  customPrompt?: string;  // Additional user instructions for this entity's generation
   connectsTo: Array<{
     name: string;
     rel: string;
@@ -83,6 +120,29 @@ export type ModResult = {
   entityId: string;
   summary: string;
   appliedChanges: string[];
+  error?: string;
+};
+
+// Types for field-specific regeneration
+export type FieldRegenPlan = {
+  entityId: string;
+  entityName: string;
+  entityType: EntityType;
+  description: string;
+  userPrompt: string;
+  selectedFields: string[];  // Fields to regenerate (from both core and payload)
+  context: {
+    burgId?: number;
+    burgName?: string;
+    existingEntity: Partial<CanonEntity>;  // Current entity state for context
+  };
+};
+
+export type FieldRegenResult = {
+  success: boolean;
+  entityId: string;
+  summary: string;
+  regeneratedFields: string[];
   error?: string;
 };
 
@@ -141,14 +201,14 @@ const PLANNING_TOOLS: ToolDefinition[] = [
   },
   {
     name: "submit_plan",
-    description: "Submit the generation plan. Call this when you have gathered enough context. IMPORTANT: Entity names must NOT contain quotes or special characters that would break JSON parsing.",
+    description: "Submit the generation plan. Call this when you have gathered enough context. CRITICAL: Output must be valid JSON. To include quotes in text, use backslash-quote (\\\"word\\\"), NOT double-quotes (\"\"word\"\").",
     parameters: {
       type: "object",
       properties: {
         description: { type: "string", description: "Brief description of what will be generated" },
         entities: {
           type: "string",
-          description: "JSON array of entities to create. Each entity has: type (location/npc/faction/event), name (NO quotes in names!), kind (optional subtype), reason (why creating), connectsTo (array of {name, rel, isNew?, isExisting?}). Example: [{\"type\":\"location\",\"name\":\"The Red Dragon Inn\",\"kind\":\"tavern\",\"reason\":\"User requested tavern\",\"connectsTo\":[]}]",
+          description: "JSON array of entities to create. Each entity has: type (location/npc/faction/event), name (NO quotes in names!), kind (optional subtype), reason (why creating - use apostrophes instead of quotes if needed), connectsTo (array of {name, rel, isNew?, isExisting?}). Example: [{\"type\":\"location\",\"name\":\"The Red Dragon Inn\",\"kind\":\"tavern\",\"reason\":\"User requested tavern\",\"connectsTo\":[]}]",
         },
       },
       required: ["description", "entities"],
@@ -214,6 +274,7 @@ async function executePlanningTool(
     case "submit_plan": {
       // This is handled specially - return the plan data
       let entities: EntityPlan[] = [];
+      let parseError: string | null = null;
 
       // Debug: log the raw input
       const entitiesType = typeof args.entities;
@@ -224,26 +285,68 @@ async function executePlanningTool(
       debugLog(`[submit_plan] args.entities type: ${entitiesType}, isArray: ${isArray}, isStringObject: ${isStringObject}`);
       debugLog(`[submit_plan] args.entities constructor: ${args.entities?.constructor?.name}`);
 
+      // Helper to sanitize common LLM JSON mistakes
+      const sanitizeJson = (str: string): string => {
+        // Fix double-double quotes: "" -> \" (common Word-style quote escaping)
+        // But only within string values, not at string boundaries
+        // Pattern: look for "" that isn't at the start/end of a string value
+        let sanitized = str;
+
+        // Replace "" with \" when it appears to be an attempt to escape quotes
+        // This handles cases like: "passed as ""confessions"" in a booth"
+        sanitized = sanitized.replace(/([^\\])""/g, '$1\\"');
+        // Handle at start of value too
+        sanitized = sanitized.replace(/^""/g, '\\"');
+
+        return sanitized;
+      };
+
       // Handle entities as array (new format) or string (legacy format)
       if (isArray) {
         entities = args.entities;
         debugLog(`[submit_plan] Using array directly, length: ${entities.length}`);
       } else if ((entitiesType === "string" || isStringObject) && args.entities) {
         // Convert String object to primitive if needed
-        const entitiesStr = String(args.entities);
+        let entitiesStr = String(args.entities);
         debugLog(`[submit_plan] Parsing string, length: ${entitiesStr.length}`);
         debugLog(`[submit_plan] First 100 chars: ${entitiesStr.slice(0, 100)}`);
+
+        // Try parsing, and if it fails, try sanitized version
         try {
           const parsed = JSON.parse(entitiesStr);
           if (Array.isArray(parsed)) {
             entities = parsed;
             debugLog(`[submit_plan] Parsed successfully, got ${entities.length} entities`);
           } else {
-            debugLog(`[submit_plan] ERROR: Parsed entities is not an array: ${typeof parsed}`);
+            parseError = `Parsed entities is not an array: ${typeof parsed}`;
+            debugLog(`[submit_plan] ERROR: ${parseError}`);
           }
         } catch (e: any) {
-          debugLog(`[submit_plan] ERROR: Failed to parse entities JSON: ${e?.message || e}`);
-          debugLog(`[submit_plan] First 20 char codes: ${[...entitiesStr.slice(0, 20)].map(c => c.charCodeAt(0)).join(',')}`);
+          debugLog(`[submit_plan] Initial parse failed: ${e?.message || e}`);
+
+          // Try sanitizing the JSON
+          const sanitized = sanitizeJson(entitiesStr);
+          if (sanitized !== entitiesStr) {
+            debugLog(`[submit_plan] Attempting sanitized parse...`);
+            try {
+              const parsed = JSON.parse(sanitized);
+              if (Array.isArray(parsed)) {
+                entities = parsed;
+                debugLog(`[submit_plan] Sanitized parse successful, got ${entities.length} entities`);
+              } else {
+                parseError = `Sanitized entities is not an array: ${typeof parsed}`;
+                debugLog(`[submit_plan] ERROR: ${parseError}`);
+              }
+            } catch (e2: any) {
+              parseError = `Failed to parse entities JSON (even after sanitization): ${e?.message || e}`;
+              debugLog(`[submit_plan] ERROR: ${parseError}`);
+              debugLog(`[submit_plan] First 20 char codes: ${[...entitiesStr.slice(0, 20)].map(c => c.charCodeAt(0)).join(',')}`);
+            }
+          } else {
+            parseError = `Failed to parse entities JSON: ${e?.message || e}`;
+            debugLog(`[submit_plan] ERROR: ${parseError}`);
+            debugLog(`[submit_plan] First 20 char codes: ${[...entitiesStr.slice(0, 20)].map(c => c.charCodeAt(0)).join(',')}`);
+          }
         }
       } else if (args.entities && entitiesType === "object") {
         // Sometimes the LLM sends it as an object that got parsed by the provider
@@ -256,10 +359,12 @@ async function executePlanningTool(
             entities = Array.from(args.entities);
             debugLog(`[submit_plan] Converted array-like object, length: ${entities.length}`);
           } else {
-            debugLog(`[submit_plan] ERROR: array-like but first item is not object: ${typeof firstItem}`);
+            parseError = `array-like but first item is not object: ${typeof firstItem}`;
+            debugLog(`[submit_plan] ERROR: ${parseError}`);
           }
         } else {
-          debugLog(`[submit_plan] ERROR: entities is object but not valid array-like: ${JSON.stringify(args.entities).slice(0, 200)}`);
+          parseError = `entities is object but not valid array-like: ${JSON.stringify(args.entities).slice(0, 200)}`;
+          debugLog(`[submit_plan] ERROR: ${parseError}`);
         }
       } else {
         debugLog(`[submit_plan] WARNING: No entities provided or unhandled type`);
@@ -274,6 +379,7 @@ async function executePlanningTool(
         _isPlan: true,
         description: args.description,
         entities,
+        parseError,  // Include parse error so caller can surface it
       };
     }
 
@@ -394,6 +500,11 @@ Start by querying for existing ${genType}s in this burg, then check active event
 
       // Check if this is the plan submission
       if (toolResult?._isPlan) {
+        // Check for parse errors - if entities are empty and there was a parse error, surface it
+        if (toolResult.entities.length === 0 && toolResult.parseError) {
+          throw new Error(`LLM produced invalid JSON in plan: ${toolResult.parseError}`);
+        }
+
         const activeEvents = ctx.canon.getActiveEvents({ burgId, recencyDays: 90 });
         const existingEntities = ctx.canon.listEntities({
           type: genType as EntityType,
@@ -503,6 +614,7 @@ For factions, payload should include: kind, goals, methods, influence`;
       suggestedName: entityPlan.name,
       kind: entityPlan.kind,
       reason: entityPlan.reason,
+      customInstructions: entityPlan.customPrompt,  // Additional user instructions for this entity
       context: {
         burgName: plan.context.burgName,
         stateName: plan.context.stateName,
@@ -1111,6 +1223,199 @@ function truncateValue(value: any, maxLen: number): string {
 }
 
 /**
+ * Plan field-specific regeneration for an existing entity
+ */
+export function planFieldRegeneration(
+  entityId: string,
+  selectedFields: string[],
+  hint: string,
+  ctx: GenContext
+): FieldRegenPlan {
+  const entity = ctx.canon.getEntity(entityId);
+  if (!entity) {
+    throw new Error(`Entity not found: ${entityId}`);
+  }
+
+  const burgId = entity.anchors?.burgId as number | undefined;
+  const burg = burgId !== undefined ? ctx.world.getBurg(burgId) : undefined;
+
+  return {
+    entityId,
+    entityName: entity.name,
+    entityType: entity.type,
+    description: hint ? `Regenerate fields with hint: "${hint}"` : `Regenerate selected fields`,
+    userPrompt: hint || `Regenerate the following fields: ${selectedFields.join(", ")}`,
+    selectedFields,
+    context: {
+      burgId,
+      burgName: burg?.name,
+      existingEntity: {
+        name: entity.name,
+        summary: entity.summary,
+        details_md: entity.details_md,
+        tags: entity.tags,
+        payload: entity.payload,
+      },
+    },
+  };
+}
+
+/**
+ * Execute field-specific regeneration
+ */
+export async function executeFieldRegeneration(
+  plan: FieldRegenPlan,
+  ctx: GenContext
+): Promise<FieldRegenResult> {
+  const entity = ctx.canon.getEntity(plan.entityId);
+  if (!entity) {
+    return {
+      success: false,
+      entityId: plan.entityId,
+      summary: `Entity not found: ${plan.entityId}`,
+      regeneratedFields: [],
+      error: `Entity not found: ${plan.entityId}`,
+    };
+  }
+
+  const genLlm = ctx.generationLlm || ctx.llm;
+  const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+  const fieldConfig = ENTITY_FIELD_CONFIGS[entity.type] || { core: [], payload: [] };
+
+  // Separate core and payload fields
+  const coreFields = plan.selectedFields.filter(f => fieldConfig.core.includes(f));
+  const payloadFields = plan.selectedFields.filter(f => fieldConfig.payload.includes(f));
+
+  // Build the system prompt based on entity type
+  const systemPrompt = `You are a tabletop GM assistant. You are regenerating specific fields for an existing ${entity.type} entity.
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
+IMPORTANT:
+- You are ONLY regenerating the specified fields
+- Maintain consistency with the existing entity data where not regenerating
+- The user's hint should guide the regeneration style/content
+
+Output ONLY valid JSON with the regenerated field values.
+For core fields (name, summary, details_md, tags), include them at the top level.
+For payload fields, include them inside a "payload" object.`;
+
+  const userPrompt = JSON.stringify({
+    existingEntity: plan.context.existingEntity,
+    fieldsToRegenerate: {
+      core: coreFields,
+      payload: payloadFields,
+    },
+    hint: plan.userPrompt,
+    context: {
+      burgName: plan.context.burgName,
+    },
+  });
+
+  try {
+    ctx.onEntityStart?.(entity.name, 0, 1);
+    const startTime = Date.now();
+
+    const { data: result, usage } = await completeJsonWithUsage(genLlm, {
+      system: systemPrompt,
+      messages: [{ role: "user", content: userPrompt }],
+      maxTokens: 2000,
+      temperature: 0.7,
+    }) as { data: any; usage?: TokenUsage };
+
+    const elapsedMs = Date.now() - startTime;
+
+    if (usage && ctx.onTokens) {
+      ctx.onTokens(usage);
+    }
+
+    // Build the patch from the result
+    const patch: Record<string, any> = {};
+    const regeneratedFields: string[] = [];
+
+    // Apply core field changes
+    for (const field of coreFields) {
+      if (result[field] !== undefined) {
+        patch[field] = result[field];
+        regeneratedFields.push(field);
+      }
+    }
+
+    // Apply payload field changes
+    if (payloadFields.length > 0 && result.payload) {
+      const newPayload = { ...entity.payload };
+      for (const field of payloadFields) {
+        if (result.payload[field] !== undefined) {
+          newPayload[field] = result.payload[field];
+          regeneratedFields.push(`payload.${field}`);
+        }
+      }
+      patch.payload = newPayload;
+    }
+
+    // Apply the patch
+    if (Object.keys(patch).length > 0) {
+      ctx.canon.patchEntity(plan.entityId, patch);
+    }
+
+    ctx.onEntityComplete?.(
+      { id: entity.id, name: entity.name, type: entity.type },
+      0,
+      1,
+      usage?.totalTokens ?? 0,
+      elapsedMs
+    );
+
+    return {
+      success: true,
+      entityId: plan.entityId,
+      summary: `Regenerated ${regeneratedFields.length} field(s) on ${entity.name}`,
+      regeneratedFields,
+    };
+  } catch (e: any) {
+    return {
+      success: false,
+      entityId: plan.entityId,
+      summary: `Failed to regenerate fields: ${e?.message || String(e)}`,
+      regeneratedFields: [],
+      error: e?.message || String(e),
+    };
+  }
+}
+
+/**
+ * Format a field regeneration plan for user approval display
+ */
+export function formatFieldRegenPlanForApproval(plan: FieldRegenPlan, useColors?: boolean): string {
+  const BOLD = useColors ? "\x1b[1m" : "";
+  const DIM = useColors ? "\x1b[2m" : "";
+  const CYAN = useColors ? "\x1b[36m" : "";
+  const YELLOW = useColors ? "\x1b[33m" : "";
+  const RESET = useColors ? "\x1b[0m" : "";
+
+  const lines: string[] = [];
+
+  // Header
+  lines.push(`${BOLD}${CYAN}Field Regeneration Plan${RESET}`);
+  lines.push(`${DIM}${plan.userPrompt}${RESET}`);
+  lines.push("");
+
+  // Entity info
+  lines.push(`${BOLD}Entity:${RESET} ${plan.entityName} (${plan.entityType})`);
+  if (plan.context.burgName) {
+    lines.push(`${DIM}Location: ${plan.context.burgName}${RESET}`);
+  }
+  lines.push("");
+
+  // Fields to regenerate
+  lines.push(`${BOLD}Fields to regenerate:${RESET}`);
+  for (const field of plan.selectedFields) {
+    lines.push(`  ${YELLOW}•${RESET} ${field}`);
+  }
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+/**
  * Sync navigation state from chat state after generation
  */
 export function syncNavigationFromChatState(ctx: GenContext): void {
@@ -1134,4 +1439,466 @@ export function syncNavigationFromChatState(ctx: GenContext): void {
       }
     }
   }
+}
+
+// --- Description Generation for States and Burgs ---
+
+export type DescriptionTarget =
+  | { stateId: number }
+  | { burgId: number };
+
+export type DescriptionPlan = {
+  target: DescriptionTarget;
+  targetName: string;
+  targetType: "state" | "burg";
+  description: string;  // What will be generated
+  userHints: string;    // User-provided hints
+  context: {
+    geographic?: string;
+    culture?: { name: string; summary?: string; traits?: string[]; values?: string[] };
+    religion?: { name: string; summary?: string; deity?: string; beliefs?: string[] };
+    stateInfo?: { name: string; form: string; population: number };
+    burgInfo?: { name: string; population: number; traits: string[] };
+  };
+};
+
+export type DescriptionResult = {
+  success: boolean;
+  entityId?: string;
+  summary: string;
+  error?: string;
+};
+
+/**
+ * Check if a description meta entity exists for a state or burg
+ */
+export function getExistingDescription(
+  canon: CanonStore,
+  target: DescriptionTarget
+): CanonEntity | undefined {
+  const anchors = "stateId" in target
+    ? { stateId: target.stateId }
+    : { burgId: target.burgId };
+
+  const descriptions = canon.listEntities({
+    type: "meta",
+    anchors,
+    limit: 10,
+  }).filter(e => e.payload?.kind === "description");
+
+  return descriptions[0];
+}
+
+/**
+ * Plan description generation for a state or burg
+ */
+export function planDescriptionGeneration(
+  hints: string,
+  target: DescriptionTarget,
+  ctx: GenContext
+): DescriptionPlan {
+  const isState = "stateId" in target;
+
+  if (isState) {
+    const stateId = target.stateId;
+    const state = ctx.world.getState(stateId);
+    if (!state) {
+      throw new Error(`State ${stateId} not found`);
+    }
+
+    const stateContext = ctx.world.getStateContext(stateId);
+
+    // Get culture details if generated
+    let cultureDetails: DescriptionPlan["context"]["culture"] | undefined;
+    if (stateContext?.culture?.id !== undefined) {
+      const cultureEntities = ctx.canon.listEntities({
+        type: "culture",
+        anchors: { cultureId: stateContext.culture.id },
+        limit: 1,
+      });
+      if (cultureEntities.length > 0) {
+        const ce = cultureEntities[0];
+        cultureDetails = {
+          name: ce.name,
+          summary: ce.summary || undefined,
+          traits: ce.payload?.traits as string[] | undefined,
+          values: ce.payload?.values as string[] | undefined,
+        };
+      } else if (stateContext.culture.name) {
+        cultureDetails = { name: stateContext.culture.name };
+      }
+    }
+
+    // Get religion details if generated
+    let religionDetails: DescriptionPlan["context"]["religion"] | undefined;
+    const dominantReligion = ctx.world.getStateDominantReligion(stateId);
+    if (dominantReligion) {
+      const religionEntities = ctx.canon.listEntities({
+        type: "religion",
+        limit: 100,
+      }).filter(e => e.anchors?.azgaarReligionId === dominantReligion.id);
+      if (religionEntities.length > 0) {
+        const re = religionEntities[0];
+        religionDetails = {
+          name: re.name,
+          summary: re.summary || undefined,
+          deity: re.payload?.deity as string | undefined,
+          beliefs: (re.payload?.beliefs as string[] | undefined)?.slice(0, 3),
+        };
+      } else {
+        religionDetails = { name: dominantReligion.name };
+      }
+    }
+
+    const burgs = ctx.world.listBurgs().filter(b => b.state === stateId);
+    const totalPop = burgs.reduce((sum, b) => sum + (b.population ?? b.pop ?? 0), 0);
+
+    return {
+      target,
+      targetName: state.name,
+      targetType: "state",
+      description: `Generate atmospheric description for ${state.name}`,
+      userHints: hints,
+      context: {
+        stateInfo: {
+          name: state.name,
+          form: stateContext?.formName || stateContext?.form || "unknown",
+          population: totalPop,
+        },
+        culture: cultureDetails,
+        religion: religionDetails,
+      },
+    };
+  } else {
+    const burgId = target.burgId;
+    const burg = ctx.world.getBurg(burgId);
+    if (!burg) {
+      throw new Error(`Burg ${burgId} not found`);
+    }
+
+    // Always get geographic context for burgs
+    const geoContext = ctx.world.getBurgGeographicContext(burgId);
+
+    // Get culture details if generated
+    let cultureDetails: DescriptionPlan["context"]["culture"] | undefined;
+    if (typeof burg.culture === "number") {
+      const cultureEntities = ctx.canon.listEntities({
+        type: "culture",
+        anchors: { cultureId: burg.culture },
+        limit: 1,
+      });
+      if (cultureEntities.length > 0) {
+        const ce = cultureEntities[0];
+        cultureDetails = {
+          name: ce.name,
+          summary: ce.summary || undefined,
+          traits: ce.payload?.traits as string[] | undefined,
+          values: ce.payload?.values as string[] | undefined,
+        };
+      } else {
+        const culture = ctx.world.getCulture(burg.culture);
+        if (culture) {
+          cultureDetails = { name: culture.name };
+        }
+      }
+    }
+
+    // Get religion details from cell
+    let religionDetails: DescriptionPlan["context"]["religion"] | undefined;
+    const cell = typeof burg.cell === "number" ? ctx.world.getCell(burg.cell) : undefined;
+    if (cell?.religionId !== undefined) {
+      const religionEntities = ctx.canon.listEntities({
+        type: "religion",
+        limit: 100,
+      }).filter(e => e.anchors?.azgaarReligionId === cell.religionId);
+      if (religionEntities.length > 0) {
+        const re = religionEntities[0];
+        religionDetails = {
+          name: re.name,
+          summary: re.summary || undefined,
+          deity: re.payload?.deity as string | undefined,
+          beliefs: (re.payload?.beliefs as string[] | undefined)?.slice(0, 3),
+        };
+      } else {
+        const religion = ctx.world.getReligion(cell.religionId);
+        if (religion) {
+          religionDetails = { name: religion.name };
+        }
+      }
+    }
+
+    const traits: string[] = [];
+    if (burg.capital) traits.push("Capital");
+    if (burg.port) traits.push("Port");
+
+    return {
+      target,
+      targetName: burg.name,
+      targetType: "burg",
+      description: `Generate atmospheric description for ${burg.name}`,
+      userHints: hints,
+      context: {
+        geographic: geoContext || undefined,
+        burgInfo: {
+          name: burg.name,
+          population: burg.population ?? burg.pop ?? 0,
+          traits,
+        },
+        culture: cultureDetails,
+        religion: religionDetails,
+      },
+    };
+  }
+}
+
+/**
+ * Execute description generation and store as meta entity
+ */
+export async function executeDescriptionGeneration(
+  plan: DescriptionPlan,
+  ctx: GenContext
+): Promise<DescriptionResult> {
+  const genLlm = ctx.generationLlm || ctx.llm;
+  const isState = plan.targetType === "state";
+  const nowIso = () => new Date().toISOString();
+
+  // Build the prompt based on target type
+  let systemPrompt: string;
+  let userPrompt: string;
+
+  if (isState) {
+    systemPrompt = `You are a world-building assistant for a fantasy tabletop RPG.
+Generate an evocative, atmospheric description for a state/kingdom that can be used for GM reference.
+
+Output ONLY valid JSON:
+{
+  "summary": "One-line atmospheric tagline (max 100 chars)",
+  "details_md": "2-3 paragraphs of rich descriptive text covering the land, its people, and character",
+  "payload": {
+    "atmosphere": "Overall mood and feel (1-2 sentences)",
+    "politicalClimate": "Current political situation and tensions",
+    "notableFeatures": ["3-5 distinctive characteristics"],
+    "history": "Brief historical note that shapes current identity",
+    "currentAffairs": "What's happening now that visitors would notice"
+  }
+}
+
+IMPORTANT:
+- Focus on evocative, sensory details a GM can use
+- Consider how the culture and religion shape daily life
+- Include hooks for adventure or intrigue
+- Keep the summary punchy and memorable`;
+
+    userPrompt = JSON.stringify({
+      state: plan.context.stateInfo,
+      culture: plan.context.culture,
+      religion: plan.context.religion,
+      userHints: plan.userHints || null,
+    });
+  } else {
+    systemPrompt = `You are a world-building assistant for a fantasy tabletop RPG.
+Generate an evocative, atmospheric description for a town/city that can be used for GM reference.
+
+Output ONLY valid JSON:
+{
+  "summary": "One-line atmospheric tagline (max 100 chars)",
+  "details_md": "2-3 paragraphs of rich descriptive text covering the settlement's character",
+  "payload": {
+    "atmosphere": "Overall mood and feel (1-2 sentences)",
+    "notableLandmarks": ["3-5 distinctive features or buildings"],
+    "dailyLife": "What daily life looks like for residents",
+    "localCustoms": "Unique local customs or traditions",
+    "reputation": "What the settlement is known for to outsiders"
+  }
+}
+
+IMPORTANT:
+- Focus on evocative, sensory details a GM can use
+- Consider the geographic context, culture, and religion
+- Include hooks for adventure or intrigue
+- Keep the summary punchy and memorable`;
+
+    userPrompt = JSON.stringify({
+      burg: plan.context.burgInfo,
+      geographic: plan.context.geographic,
+      culture: plan.context.culture,
+      religion: plan.context.religion,
+      userHints: plan.userHints || null,
+    });
+  }
+
+  try {
+    ctx.onEntityStart?.(plan.targetName, 0, 1);
+    const startTime = Date.now();
+
+    const { data: result, usage } = await completeJsonWithUsage(genLlm, {
+      system: systemPrompt,
+      messages: [{ role: "user", content: userPrompt }],
+      maxTokens: 2000,
+      temperature: 0.7,
+    }) as { data: any; usage?: TokenUsage };
+
+    const elapsedMs = Date.now() - startTime;
+
+    if (usage && ctx.onTokens) {
+      ctx.onTokens(usage);
+    }
+
+    // Build anchors based on target type
+    const anchors = "stateId" in plan.target
+      ? { stateId: plan.target.stateId }
+      : { burgId: plan.target.burgId };
+
+    // Create the meta entity
+    const entity = ctx.canon.addEntity({
+      type: "meta",
+      name: `${plan.targetName} Description`,
+      summary: result.summary || null,
+      details_md: result.details_md || null,
+      tags: ["description", plan.targetType],
+      anchors,
+      payload: {
+        kind: "description",
+        descriptionType: plan.targetType,
+        ...result.payload,
+      },
+      provenance: {
+        generated_by: "azbrowse",
+        provider: genLlm.provider,
+        model: genLlm.model,
+        reason: `User requested ${plan.targetType} description`,
+        user_prompt: plan.userHints || undefined,
+        approved_at: nowIso(),
+      },
+    });
+
+    ctx.onEntityComplete?.(
+      { id: entity.id, name: entity.name, type: entity.type },
+      0,
+      1,
+      usage?.totalTokens ?? 0,
+      elapsedMs
+    );
+
+    return {
+      success: true,
+      entityId: entity.id,
+      summary: `Created description for ${plan.targetName}`,
+    };
+  } catch (e: any) {
+    return {
+      success: false,
+      summary: `Failed to generate description: ${e?.message || String(e)}`,
+      error: e?.message || String(e),
+    };
+  }
+}
+
+/**
+ * Format a description plan for user approval display
+ */
+export function formatDescriptionPlanForApproval(plan: DescriptionPlan, useColors?: boolean): string {
+  const BOLD = useColors ? "\x1b[1m" : "";
+  const DIM = useColors ? "\x1b[2m" : "";
+  const CYAN = useColors ? "\x1b[36m" : "";
+  const GREEN = useColors ? "\x1b[32m" : "";
+  const YELLOW = useColors ? "\x1b[33m" : "";
+  const RESET = useColors ? "\x1b[0m" : "";
+
+  const lines: string[] = [];
+
+  // Header
+  lines.push(`${BOLD}${CYAN}Description Generation Plan${RESET}`);
+  if (plan.userHints) {
+    lines.push(`${DIM}Hints: ${plan.userHints}${RESET}`);
+  }
+  lines.push("");
+
+  // Target info
+  const icon = plan.targetType === "state" ? "🏛️" : "🏘️";
+  lines.push(`${BOLD}Target:${RESET} ${icon} ${GREEN}${plan.targetName}${RESET} (${plan.targetType})`);
+  lines.push("");
+
+  // Context
+  lines.push(`${BOLD}Context:${RESET}`);
+  if (plan.context.stateInfo) {
+    lines.push(`  Government: ${plan.context.stateInfo.form}`);
+    lines.push(`  Population: ${plan.context.stateInfo.population.toLocaleString()}`);
+  }
+  if (plan.context.burgInfo) {
+    lines.push(`  Population: ${plan.context.burgInfo.population.toLocaleString()}`);
+    if (plan.context.burgInfo.traits.length > 0) {
+      lines.push(`  Traits: ${plan.context.burgInfo.traits.join(", ")}`);
+    }
+  }
+  if (plan.context.geographic) {
+    lines.push(`  ${DIM}Geography: ${plan.context.geographic.slice(0, 80)}...${RESET}`);
+  }
+  if (plan.context.culture) {
+    lines.push(`  Culture: ${YELLOW}${plan.context.culture.name}${RESET}`);
+  }
+  if (plan.context.religion) {
+    lines.push(`  Religion: ${YELLOW}${plan.context.religion.name}${RESET}`);
+  }
+  lines.push("");
+
+  // Fields to generate
+  const fields = plan.targetType === "state"
+    ? STATE_DESCRIPTION_FIELDS
+    : BURG_DESCRIPTION_FIELDS;
+  lines.push(`${BOLD}Will generate:${RESET}`);
+  lines.push(`  Core: ${fields.core.join(", ")}`);
+  lines.push(`  Details: ${fields.payload.join(", ")}`);
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+/**
+ * Plan field regeneration for an existing description entity
+ */
+export function planDescriptionFieldRegeneration(
+  entityId: string,
+  selectedFields: string[],
+  hint: string,
+  ctx: GenContext
+): FieldRegenPlan {
+  const entity = ctx.canon.getEntity(entityId);
+  if (!entity) {
+    throw new Error(`Entity not found: ${entityId}`);
+  }
+
+  // Determine if this is a state or burg description
+  const descType = entity.payload?.descriptionType as "state" | "burg" | undefined;
+  const fieldConfig = descType === "state" ? STATE_DESCRIPTION_FIELDS : BURG_DESCRIPTION_FIELDS;
+
+  // Get context based on type
+  let burgName: string | undefined;
+  if (entity.anchors?.burgId !== undefined) {
+    const burg = ctx.world.getBurg(entity.anchors.burgId);
+    burgName = burg?.name;
+  } else if (entity.anchors?.stateId !== undefined) {
+    const state = ctx.world.getState(entity.anchors.stateId);
+    burgName = state?.name; // Use state name as "location" for display
+  }
+
+  return {
+    entityId,
+    entityName: entity.name,
+    entityType: entity.type,
+    description: hint ? `Regenerate fields with hint: "${hint}"` : `Regenerate selected fields`,
+    userPrompt: hint || `Regenerate the following fields: ${selectedFields.join(", ")}`,
+    selectedFields,
+    context: {
+      burgId: entity.anchors?.burgId as number | undefined,
+      burgName,
+      existingEntity: {
+        name: entity.name,
+        summary: entity.summary,
+        details_md: entity.details_md,
+        tags: entity.tags,
+        payload: entity.payload,
+      },
+    },
+  };
 }

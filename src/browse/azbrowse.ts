@@ -15,12 +15,23 @@ import {
   getEffectiveModel,
   getEffectiveGenerationProvider,
   getEffectiveGenerationModel,
+  getEffectiveTalkProvider,
+  getEffectiveTalkModel,
   type LLMConfig,
 } from "../llm/config";
 import { extractGlobals } from "../util/args";
 import { getCampaignSettings, runOnboarding, GenerationFlags, OnboardingResult } from "../chat/campaign-settings";
 import { CampaignSettings } from "../chat/schema";
-import { generateStateContent, generateReligionContent, generateCultureContent, WorldGenContext } from "./world-init-gen";
+import {
+  generateStateContent,
+  generateReligionContent,
+  generateCultureContent,
+  planWorldGeneration,
+  executeWorldGeneration,
+  formatWorldGenPlan,
+  WorldGenContext,
+  WorldGenPlan,
+} from "./world-init-gen";
 import { npcTurn } from "../chat/npc";
 import { SceneContext } from "../chat/director";
 import { StatusBar } from "../chat/status-bar";
@@ -33,6 +44,7 @@ import { TuiController, type TuiControllerOptions } from "./tui";
 
 // ANSI color codes
 const RESET = "\x1b[0m";
+const BOLD = "\x1b[1m";
 const DIM = "\x1b[2m";
 const RED = "\x1b[31m";
 const GREEN = "\x1b[32m";
@@ -53,12 +65,12 @@ function createCompleter(
     const arg = parts.slice(1).join(" ").toLowerCase();
 
     // Commands that need completion
-    const navCommands = ["loc", "cd", "state", "npc", "/talk"];
+    const navCommands = ["loc", "cd", "state", "npc", "talk"];
 
     if (!navCommands.includes(cmd)) {
       // Complete command names
       if (parts.length === 1) {
-        const commands = ["loc", "cd", "state", "npc", "ls", "info", "search", "gen", "mod", "rm", "help", "exit", "/talk", "/back", "/init", "/tokens", "/model", "/genmodel"];
+        const commands = ["loc", "cd", "state", "npc", "ls", "info", "search", "gen", "mod", "rm", "help", "exit", "talk", "back", "init", "tokens", "model", "genmodel"];
         const matches = commands.filter(c => c.startsWith(cmd));
         return [matches, cmd];
       }
@@ -70,7 +82,7 @@ function createCompleter(
 
     if (cmd === "state") {
       candidates = world.listStates().map(s => s.name);
-    } else if (cmd === "npc" || cmd === "/talk") {
+    } else if (cmd === "npc" || cmd === "talk") {
       // NPCs in current context
       const burgId = currentBurgId(state);
       const locationId = currentLocationId(state);
@@ -252,6 +264,14 @@ async function main() {
     generationLlm = createLLMClient({ provider: genProvider, model: genModel });
   }
 
+  // Optional talk LLM (for NPC conversations)
+  let talkLlm: ReturnType<typeof createLLMClient> | undefined;
+  const talkProvider = getEffectiveTalkProvider(config);
+  if (talkProvider) {
+    const talkModel = getEffectiveTalkModel(config, talkProvider);
+    talkLlm = createLLMClient({ provider: talkProvider, model: talkModel });
+  }
+
   // Load campaign settings if they exist
   let campaignSettings: CampaignSettings | undefined = getCampaignSettings(canon);
 
@@ -266,7 +286,9 @@ async function main() {
   console.log(`\nazbrowse - World Navigation CLI`);
   console.log(`  World: ${counts.states} states, ${counts.burgs} burgs`);
   console.log(`  Canon: ${canon.listEntities({ limit: 100000 }).length} entities`);
-  console.log(`  LLM: ${llm.provider}/${llm.model}${generationLlm ? ` (gen: ${generationLlm.provider}/${generationLlm.model})` : ""}`);
+  const genInfo = generationLlm ? ` (gen: ${generationLlm.provider}/${generationLlm.model})` : "";
+  const talkInfo = talkLlm ? ` (talk: ${talkLlm.provider}/${talkLlm.model})` : "";
+  console.log(`  LLM: ${llm.provider}/${llm.model}${genInfo}${talkInfo}`);
   console.log(`\nType 'help' for commands.\n`);
 
   // Create readline interface with tab completion
@@ -280,7 +302,7 @@ async function main() {
   const ask = (prompt: string): Promise<string> =>
     new Promise((resolve) => rl.question(prompt, resolve));
 
-  // Helper to run world generation based on flags
+  // Helper to run world generation based on flags (two-phase: plan then parallel execution)
   async function runWorldGeneration(flags: GenerationFlags) {
     const genLlm = generationLlm || llm;
     const genCtx: WorldGenContext = {
@@ -289,6 +311,13 @@ async function main() {
       llm: genLlm,
       campaignSettings,
       onProgress: (msg) => console.log(`\n${msg}`),
+      onPlanProgress: (msg) => {
+        if (useColors) {
+          console.log(`${DIM}${msg}${RESET}`);
+        } else {
+          console.log(msg);
+        }
+      },
       onEntityStart: (name, index, total) => {
         if (useColors) {
           console.log(`${DIM}[${index + 1}/${total}] Generating: ${name}...${RESET}`);
@@ -305,39 +334,48 @@ async function main() {
       onTokens: (usage) => statusBar.addTokens(usage),
     };
 
-    const results: string[] = [];
-    const errors: string[] = [];
-
-    if (flags.states) {
-      const stateResult = await generateStateContent(genCtx);
-      results.push(`States: ${stateResult.created} entities`);
-      errors.push(...stateResult.errors);
+    // Check if any generation flags are set
+    const hasGeneration = flags.states || flags.religions || flags.cultures;
+    if (!hasGeneration) {
+      console.log("No generation flags selected.");
+      return;
     }
 
-    if (flags.religions) {
-      const religionResult = await generateReligionContent(genCtx);
-      results.push(`Religions: ${religionResult.created} entities`);
-      errors.push(...religionResult.errors);
+    // PHASE 1: Create generation plan
+    console.log(`\n${useColors ? BOLD : ""}Phase 1: Planning generation...${useColors ? RESET : ""}`);
+    let plan: WorldGenPlan;
+    try {
+      plan = await planWorldGeneration(genCtx, flags);
+    } catch (e: any) {
+      console.log(`${useColors ? RED : ""}Planning failed: ${e?.message || String(e)}${useColors ? RESET : ""}`);
+      return;
     }
 
-    if (flags.cultures) {
-      const cultureResult = await generateCultureContent(genCtx);
-      results.push(`Cultures: ${cultureResult.created} entities`);
-      errors.push(...cultureResult.errors);
+    // Show plan to user
+    console.log("");
+    console.log(formatWorldGenPlan(plan, useColors));
+
+    // Ask for approval
+    const approval = (await ask("Proceed with generation? [Y/n]: ")).trim().toLowerCase();
+    if (approval === "n" || approval === "no") {
+      console.log("Generation cancelled.");
+      return;
     }
+
+    // PHASE 2: Execute generation in parallel
+    console.log(`\n${useColors ? BOLD : ""}Phase 2: Generating entities in parallel...${useColors ? RESET : ""}`);
+    const result = await executeWorldGeneration(genCtx, plan);
 
     console.log(`\n${useColors ? GREEN : ""}Generation complete:${useColors ? RESET : ""}`);
-    for (const r of results) {
-      console.log(`  ${r}`);
-    }
+    console.log(`  Created: ${result.created} entities`);
 
-    if (errors.length > 0) {
-      console.log(`\n${useColors ? RED : ""}Errors (${errors.length}):${useColors ? RESET : ""}`);
-      for (const e of errors.slice(0, 5)) {
+    if (result.errors.length > 0) {
+      console.log(`\n${useColors ? RED : ""}Errors (${result.errors.length}):${useColors ? RESET : ""}`);
+      for (const e of result.errors.slice(0, 5)) {
         console.log(`  ${e}`);
       }
-      if (errors.length > 5) {
-        console.log(`  ... and ${errors.length - 5} more`);
+      if (result.errors.length > 5) {
+        console.log(`  ... and ${result.errors.length - 5} more`);
       }
     }
   }
@@ -369,6 +407,7 @@ async function main() {
       canon,
       llm,
       generationLlm,
+      talkLlm,
       campaignSettings,
       useColors,
       onToolCall: (name, args) => {
@@ -396,6 +435,7 @@ async function main() {
       onConfigChange: (newConfig) => { config = newConfig; },
       onLlmChange: (newLlm) => { llm = newLlm; },
       onGenerationLlmChange: (newGenLlm) => { generationLlm = newGenLlm; },
+      onTalkLlmChange: (newTalkLlm) => { talkLlm = newTalkLlm; },
       setStatusBarProvider: (p, m) => statusBar.setProvider(p as any, m),
     };
 
@@ -438,9 +478,10 @@ async function main() {
 
       // Handle talk mode (NPC roleplay)
       if (talkMode && !line.startsWith("/")) {
-        // Send to NPC
+        // Send to NPC (use talk LLM if available, else generation LLM, else main LLM)
         const reply = await npcTurn({
           llm,
+          talkLlm: talkLlm || generationLlm,
           world,
           canon,
           state: state.chatState,
@@ -462,6 +503,7 @@ async function main() {
         canon,
         llm,
         generationLlm,
+        talkLlm,
         campaignSettings,
         useColors,
         onToolCall: (name, args) => {
@@ -504,6 +546,7 @@ async function main() {
         onConfigChange: (newConfig) => { config = newConfig; },
         onLlmChange: (newLlm) => { llm = newLlm; },
         onGenerationLlmChange: (newGenLlm) => { generationLlm = newGenLlm; },
+        onTalkLlmChange: (newTalkLlm) => { talkLlm = newTalkLlm; },
         setStatusBarProvider: (p, m) => statusBar.setProvider(p as any, m),
       };
 

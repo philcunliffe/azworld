@@ -4,7 +4,7 @@
  * Renders the left sidebar with collapsible tree navigation.
  */
 
-import type { TreeNode, TuiState } from "../types";
+import type { TreeNode, TuiState, TabId } from "../types";
 import type { LayoutDimensions } from "../layout";
 import {
   RESET,
@@ -14,12 +14,66 @@ import {
   TREE,
   FG_WHITE,
   FG_GRAY,
+  FG_CYAN,
+  FG_MAGENTA,
+  FG_ORANGE,
   BG_SELECTION,
+  REVERSE,
   getEntityColor,
   padRight,
   truncate,
   visibleLength,
 } from "../renderer";
+import type { EntityKind } from "../types";
+
+// Tab definitions for the tab bar
+// Labels kept to 3 chars to fit in narrow tree panel (~24 chars available)
+const TABS: Array<{ id: TabId; label: string; kind: EntityKind }> = [
+  { id: "world", label: "Wld", kind: "world" },
+  { id: "factions", label: "Fac", kind: "faction" },
+  { id: "religions", label: "Rel", kind: "religion" },
+  { id: "cultures", label: "Cul", kind: "culture" },
+];
+
+/**
+ * Render the tab bar for the tree panel
+ */
+function renderTabBar(activeTab: TabId, innerWidth: number): string {
+  let tabBar = "";
+  for (let i = 0; i < TABS.length; i++) {
+    const tab = TABS[i];
+    const isActive = tab.id === activeTab;
+    const num = i + 1;
+    const label = `${num}:${tab.label}`;
+    const color = getEntityColor(tab.kind);
+
+    if (isActive) {
+      tabBar += `${REVERSE}${color}${label}${RESET}`;
+    } else {
+      tabBar += `${DIM}${color}${label}${RESET}`;
+    }
+    if (i < TABS.length - 1) {
+      tabBar += " ";
+    }
+  }
+  return tabBar;
+}
+
+/**
+ * Get title for the current tab
+ */
+function getTabTitle(activeTab: TabId): string {
+  switch (activeTab) {
+    case "world":
+      return " World Tree ";
+    case "factions":
+      return " Factions ";
+    case "religions":
+      return " Religions ";
+    case "cultures":
+      return " Cultures ";
+  }
+}
 
 /**
  * Render the tree panel
@@ -36,8 +90,8 @@ export function renderTreePanel(
   // innerWidth accounts for only the left border (no right border - detail provides divider)
   const innerWidth = treeWidth - 1;
 
-  // Title bar - no right corner, detail panel will provide T-junction
-  const title = " World Tree ";
+  // Title bar - dynamic based on active tab
+  const title = getTabTitle(state.activeTab);
   const titlePadding = Math.floor((innerWidth - title.length) / 2);
   lines.push(
     `${BOX.topLeft}${BOX.horizontal.repeat(titlePadding)}${BOLD}${title}${RESET}${BOX.horizontal.repeat(
@@ -45,14 +99,22 @@ export function renderTreePanel(
     )}`
   );
 
+  // Tab bar row
+  const tabBar = renderTabBar(state.activeTab, innerWidth);
+  const tabBarPadded = padRight(tabBar, innerWidth);
+  lines.push(`${BOX.vertical}${tabBarPadded}`);
+
+  // Adjust content height for the tab bar row
+  const adjustedContentHeight = treeContentHeight - 1;
+
   // Get visible nodes with scroll offset
   const visibleNodes = state.treeNodes.slice(
     state.treeScrollOffset,
-    state.treeScrollOffset + treeContentHeight
+    state.treeScrollOffset + adjustedContentHeight
   );
 
   // Render tree nodes
-  for (let i = 0; i < treeContentHeight; i++) {
+  for (let i = 0; i < adjustedContentHeight; i++) {
     const node = visibleNodes[i];
     if (node) {
       lines.push(renderTreeLine(node, innerWidth, state.focus === "tree"));
@@ -65,9 +127,9 @@ export function renderTreePanel(
   // Bottom border with scroll indicator - no right corner
   const totalNodes = state.treeNodes.length;
   const scrollInfo =
-    totalNodes > treeContentHeight
+    totalNodes > adjustedContentHeight
       ? ` ${state.treeScrollOffset + 1}-${Math.min(
-          state.treeScrollOffset + treeContentHeight,
+          state.treeScrollOffset + adjustedContentHeight,
           totalNodes
         )}/${totalNodes} `
       : "";

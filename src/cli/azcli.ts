@@ -30,7 +30,7 @@ function usage(): string {
     "  cell <cellId>",
     "  search <term> [--kinds states,burgs,cultures,religions,rivers] [--limit N]",
     "  canon init",
-    "  canon add <npc|faction|location|event|rumor|hook|meta> --name <name> [--summary ...] [--details-md ...] [--tags a,b] [--payload-json <jsonOr@file>] [--burg <id>]",
+    "  canon add <npc|faction|location|event|rumor|hook|meta|culture|religion> --name <name> [--summary ...] [--details-md ...] [--tags a,b] [--payload-json <jsonOr@file>] [--burg <id>]",
     "  canon show <id>",
     "  canon list [--type ...] [--burg <id>] [--tag <tag>] [--text <substr>] [--limit N]",
     "  canon patch <id> --patch-json <jsonOr@file>",

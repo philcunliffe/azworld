@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { mergePatch } from "../util/mergePatch";
 import { nowIso } from "../util/time";
 
-export type EntityType = "npc" | "faction" | "location" | "event" | "rumor" | "hook" | "meta" | "culture";
+export type EntityType = "npc" | "faction" | "location" | "event" | "rumor" | "hook" | "meta" | "culture" | "religion";
 
 export type CanonEntity = {
   id: string;
@@ -46,7 +46,7 @@ PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS entities (
   id TEXT PRIMARY KEY,
-  type TEXT NOT NULL CHECK(type IN ('npc','faction','location','event','rumor','hook','meta','culture')),
+  type TEXT NOT NULL CHECK(type IN ('npc','faction','location','event','rumor','hook','meta','culture','religion')),
   name TEXT NOT NULL,
   summary TEXT,
   details_md TEXT,

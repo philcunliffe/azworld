@@ -4,13 +4,15 @@
  * Renders centered overlay modals for generation progress and results.
  */
 
-import type { ModalState, EntityKind } from "../types";
+import type { ModalState, EntityKind, EntityEditField } from "../types";
 import type { LayoutDimensions } from "../layout";
 import { calculateModalDimensions } from "../layout";
+import type { EntityPlan } from "../../gen-agent";
 import {
   RESET,
   BOLD,
   DIM,
+  REVERSE,
   BOX,
   FG_WHITE,
   FG_GRAY,
@@ -18,6 +20,7 @@ import {
   FG_RED,
   FG_YELLOW,
   FG_CYAN,
+  FG_MAGENTA,
   BG_MODAL,
   BG_SELECTION,
   getEntityColor,
@@ -63,46 +66,294 @@ export function renderModal(
     contentLines.push("");
     contentLines.push(`${DIM}Press Esc to close${RESET}`);
   } else if (modal.approvalChoices?.length && !modal.isComplete) {
-    // Approval mode - show plan and choices
-    // Parse the plan text and display it
-    const planText = modal.pendingPlanText || "(No plan details available)";
-    const planLines = planText.split("\n");
-    for (const planLine of planLines) {
-      contentLines.push(truncate(planLine, innerWidth - 4));
+    // Approval mode - show entities on left, plan details on right
+    const entities = (modal.pendingEntities || []) as EntityPlan[];
+    const hasEntities = entities.length > 0;
+
+    // Calculate split: left panel (entities) ~45%, right panel (context) ~55%
+    const leftPanelWidth = hasEntities ? Math.floor((innerWidth - 3) * 0.45) : 0;  // -3 for border
+    const rightPanelWidth = hasEntities ? innerWidth - leftPanelWidth - 3 : innerWidth - 2;
+
+    // Calculate available height for content
+    // Reserve: separator (1), actions (1), empty (1), help (1) = 4 lines
+    const reservedLines = 4;
+    const availableContentHeight = Math.max(1, contentHeight - reservedLines);
+
+    if (hasEntities) {
+      // Build left panel lines (entity list)
+      const leftLines: string[] = [];
+      leftLines.push(`${BOLD}ENTITIES TO CREATE${RESET}`);
+      leftLines.push(`${DIM}${"─".repeat(leftPanelWidth - 2)}${RESET}`);
+
+      const selectedIdx = modal.entitySelectionIndex ?? 0;
+      const editingField = modal.editingEntityField;
+      const editBuffer = modal.editBuffer ?? "";
+      const editCursorPos = modal.editCursorPos ?? 0;
+
+      for (let i = 0; i < entities.length; i++) {
+        const entity = entities[i];
+        const isSelected = i === selectedIdx;
+        const icon = entity.type === "location" ? "📍" :
+                     entity.type === "npc" ? "👤" :
+                     entity.type === "faction" ? "🏛️" :
+                     entity.type === "event" ? "⚡" : "📄";
+
+        // Selection marker
+        const marker = isSelected ? `${BG_SELECTION}${FG_WHITE} > ` : "   ";
+        const suffix = isSelected ? ` ${RESET}` : "";
+
+        // Entity header line with name - read-only display, editing happens in right panel
+        const kindStr = entity.kind ? ` (${entity.kind})` : "";
+        const nameDisplay = truncate(entity.name, leftPanelWidth - 10);
+
+        leftLines.push(`${marker}${icon} ${FG_GREEN}${nameDisplay}${RESET}${isSelected ? BG_SELECTION : ""}${DIM}${kindStr}${RESET}${suffix}`);
+
+        // Reason line (indented) - read-only display, editing happens in right panel
+        const reasonDisplay = truncate(entity.reason || "(no reason)", leftPanelWidth - 8);
+        const reasonPrefix = isSelected ? `${BG_SELECTION}     ` : "     ";
+        const reasonSuffix = isSelected ? ` ${RESET}` : "";
+        leftLines.push(`${reasonPrefix}${DIM}"${reasonDisplay}"${RESET}${reasonSuffix}`);
+
+        // Show links (connectsTo) for this entity
+        if (entity.connectsTo && entity.connectsTo.length > 0) {
+          for (const conn of entity.connectsTo) {
+            const linkPrefix = isSelected ? `${BG_SELECTION}     ` : "     ";
+            const linkSuffix = isSelected ? ` ${RESET}` : "";
+            const relMarker = conn.isNew ? "" : conn.isExisting ? `${FG_YELLOW}*${RESET}` : "";
+            const linkDisplay = truncate(`└─ ${conn.rel}: ${conn.name}`, leftPanelWidth - 8);
+            leftLines.push(`${linkPrefix}${FG_CYAN}${linkDisplay}${RESET}${relMarker}${linkSuffix}`);
+          }
+        }
+
+        // Custom prompt line (if any) - read-only display, editing happens in right panel
+        const hasCustomPrompt = entity.customPrompt && entity.customPrompt.length > 0;
+        if (isSelected || hasCustomPrompt) {
+          const promptDisplay = hasCustomPrompt
+            ? truncate(entity.customPrompt!, leftPanelWidth - 12)
+            : "none";
+
+          const promptPrefix = isSelected ? `${BG_SELECTION}     ` : "     ";
+          const promptSuffix = isSelected ? ` ${RESET}` : "";
+          const promptColor = hasCustomPrompt ? FG_MAGENTA : DIM;
+          leftLines.push(`${promptPrefix}${promptColor}[prompt: ${promptDisplay}]${RESET}${promptSuffix}`);
+        }
+
+        // Empty line between entities
+        if (i < entities.length - 1) {
+          leftLines.push(isSelected ? `${BG_SELECTION}${" ".repeat(leftPanelWidth)}${RESET}` : "");
+        }
+      }
+
+      // Build right panel lines (entity details for selected entity)
+      const rightLines: string[] = [];
+      const selectedEntity = entities[selectedIdx];
+
+      if (selectedEntity) {
+        rightLines.push(`${BOLD}ENTITY DETAILS${RESET}`);
+        rightLines.push(`${DIM}${"─".repeat(rightPanelWidth - 2)}${RESET}`);
+
+        // Entity type and kind
+        const icon = selectedEntity.type === "location" ? "📍" :
+                     selectedEntity.type === "npc" ? "👤" :
+                     selectedEntity.type === "faction" ? "🏛️" :
+                     selectedEntity.type === "event" ? "⚡" : "📄";
+
+        // Name section (editable)
+        if (editingField === "name") {
+          const before = editBuffer.slice(0, editCursorPos);
+          const cursorChar = editBuffer[editCursorPos] ?? " ";
+          const after = editBuffer.slice(editCursorPos + 1);
+          rightLines.push(`${icon} ${FG_GREEN}${BOLD}${before}${REVERSE}${cursorChar}${RESET}${FG_GREEN}${BOLD}${after}${RESET}`);
+        } else {
+          rightLines.push(`${icon} ${FG_GREEN}${BOLD}${selectedEntity.name}${RESET}`);
+        }
+        rightLines.push(`   Type: ${FG_CYAN}${selectedEntity.type}${RESET}${selectedEntity.kind ? ` (${selectedEntity.kind})` : ""}`);
+        rightLines.push("");
+
+        // Reason section
+        rightLines.push(`${BOLD}Reason:${RESET}`);
+        if (editingField === "reason") {
+          // Show edit buffer with cursor (single line for simplicity)
+          const before = editBuffer.slice(0, editCursorPos);
+          const cursorChar = editBuffer[editCursorPos] ?? " ";
+          const after = editBuffer.slice(editCursorPos + 1);
+          rightLines.push(`   ${before}${REVERSE}${cursorChar}${RESET}${after}`);
+        } else {
+          const reasonText = selectedEntity.reason || "(no reason specified)";
+          // Word wrap reason text
+          const reasonWords = reasonText.split(" ");
+          let currentLine = "   ";
+          for (const word of reasonWords) {
+            if (currentLine.length + word.length + 1 > rightPanelWidth - 2) {
+              rightLines.push(currentLine);
+              currentLine = "   " + word;
+            } else {
+              currentLine += (currentLine.length > 3 ? " " : "") + word;
+            }
+          }
+          if (currentLine.length > 3) rightLines.push(currentLine);
+        }
+        rightLines.push("");
+
+        // Connections section
+        if (selectedEntity.connectsTo && selectedEntity.connectsTo.length > 0) {
+          rightLines.push(`${BOLD}Connections:${RESET}`);
+          for (const conn of selectedEntity.connectsTo) {
+            const marker = conn.isNew ? `${FG_GREEN}(new)${RESET}` :
+                          conn.isExisting ? `${FG_YELLOW}(existing)${RESET}` : "";
+            rightLines.push(`   ${FG_CYAN}${conn.rel}${RESET} → ${conn.name} ${marker}`);
+          }
+          rightLines.push("");
+        }
+
+        // Custom prompt section (always show when editing, otherwise only if has content)
+        if (editingField === "customPrompt" || selectedEntity.customPrompt) {
+          rightLines.push(`${BOLD}Custom Prompt:${RESET}`);
+          if (editingField === "customPrompt") {
+            const before = editBuffer.slice(0, editCursorPos);
+            const cursorChar = editBuffer[editCursorPos] ?? " ";
+            const after = editBuffer.slice(editCursorPos + 1);
+            rightLines.push(`   ${FG_MAGENTA}${before}${REVERSE}${cursorChar}${RESET}${FG_MAGENTA}${after}${RESET}`);
+          } else {
+            const promptWords = selectedEntity.customPrompt!.split(" ");
+            let promptLine = "   ";
+            for (const word of promptWords) {
+              if (promptLine.length + word.length + 1 > rightPanelWidth - 2) {
+                rightLines.push(`${FG_MAGENTA}${promptLine}${RESET}`);
+                promptLine = "   " + word;
+              } else {
+                promptLine += (promptLine.length > 3 ? " " : "") + word;
+              }
+            }
+            if (promptLine.length > 3) rightLines.push(`${FG_MAGENTA}${promptLine}${RESET}`);
+          }
+          rightLines.push("");
+        }
+
+        // Edit hints at bottom
+        rightLines.push(`${DIM}${"─".repeat(rightPanelWidth - 2)}${RESET}`);
+        rightLines.push(`${DIM}Press to edit:${RESET}`);
+        rightLines.push(`  ${FG_GREEN}n${RESET} name  ${FG_GREEN}r${RESET} reason  ${FG_GREEN}p${RESET} prompt  ${FG_GREEN}e${RESET} $EDITOR`);
+      } else {
+        rightLines.push(`${BOLD}PLAN DETAILS${RESET}`);
+        rightLines.push(`${DIM}${"─".repeat(rightPanelWidth - 2)}${RESET}`);
+
+        // Fallback to plan text if no entity selected
+        const planText = modal.pendingPlanText || "";
+        const planLines = planText.split("\n");
+        const scrollOffset = modal.planScrollOffset ?? 0;
+        const availableRightHeight = availableContentHeight - 2;
+        const maxOffset = Math.max(0, planLines.length - availableRightHeight);
+        const clampedOffset = Math.min(scrollOffset, maxOffset);
+        const visiblePlanLines = planLines.slice(clampedOffset, clampedOffset + availableRightHeight);
+
+        for (const line of visiblePlanLines) {
+          rightLines.push(truncate(line, rightPanelWidth - 2));
+        }
+      }
+
+      // Pad right panel if needed
+      while (rightLines.length < availableContentHeight) {
+        rightLines.push("");
+      }
+
+      // Pad left panel if needed
+      while (leftLines.length < availableContentHeight) {
+        leftLines.push("");
+      }
+
+      // Combine panels horizontally
+      for (let i = 0; i < availableContentHeight; i++) {
+        // Truncate then pad to ensure lines fit within panel width
+        const leftTruncated = sliceByVisible(leftLines[i] || "", 0, leftPanelWidth);
+        const rightTruncated = sliceByVisible(rightLines[i] || "", 0, rightPanelWidth);
+        const leftLine = padRight(leftTruncated, leftPanelWidth);
+        const rightLine = padRight(rightTruncated, rightPanelWidth);
+        contentLines.push(`${leftLine}${DIM}│${RESET}${rightLine}`);
+      }
+
+      // Separator line
+      contentLines.push(`${DIM}${"─".repeat(leftPanelWidth)}┴${"─".repeat(rightPanelWidth)}${RESET}`);
+
+    } else {
+      // No entities - just show plan text (for modals without entity editing like description gen)
+      const planText = modal.pendingPlanText || "(No plan details available)";
+      const planLines = planText.split("\n");
+
+      const scrollOffset = modal.planScrollOffset ?? 0;
+      const maxOffset = Math.max(0, planLines.length - availableContentHeight);
+      const clampedOffset = Math.min(scrollOffset, maxOffset);
+      const visibleLines = planLines.slice(clampedOffset, clampedOffset + availableContentHeight);
+
+      for (const line of visibleLines) {
+        contentLines.push(truncate(line, innerWidth - 4));
+      }
+
+      // Pad if shorter
+      while (contentLines.length < availableContentHeight) {
+        contentLines.push("");
+      }
+
+      // Scroll indicator
+      const scrollIndicator = planLines.length > availableContentHeight
+        ? ` [${clampedOffset + 1}-${Math.min(clampedOffset + availableContentHeight, planLines.length)}/${planLines.length}]`
+        : "";
+      contentLines.push(`${DIM}${"─".repeat(innerWidth - 10 - scrollIndicator.length)}${scrollIndicator}${RESET}`);
     }
-    contentLines.push("");
 
-    contentLines.push(`${DIM}─── Select an action ───${RESET}`);
-    contentLines.push("");
+    // Action hints
+    const approveChoice = modal.approvalChoices.find(c => c.value !== "cancel");
+    const approveLabel = approveChoice?.label || "Approve";
+    contentLines.push(`  ${FG_GREEN}Enter${RESET} ${approveLabel}    ${FG_RED}Esc${RESET} Cancel`);
 
-    const selectedIdx = modal.approvalSelectedIndex ?? 0;
-    for (let i = 0; i < modal.approvalChoices.length; i++) {
-      const choice = modal.approvalChoices[i];
-      const isSelected = i === selectedIdx;
-      const prefix = isSelected ? `${BG_SELECTION}${FG_WHITE} > ` : "   ";
-      const suffix = isSelected ? ` ${RESET}` : "";
-      const hint = choice.hint ? ` ${DIM}- ${choice.hint}${RESET}` : "";
-      contentLines.push(
-        `${prefix}${BOLD}${choice.label}${RESET}${isSelected ? BG_SELECTION : ""}${hint}${suffix}`
-      );
-    }
-
-    contentLines.push("");
-    contentLines.push(`${DIM}j/k: select  Enter: confirm  Esc: cancel${RESET}`);
   } else if (!modal.isComplete) {
-    // Progress state - differentiate planning vs execution
+    // Progress state - differentiate planning vs execution vs talk
     const isPlanningPhase = modal.title.toLowerCase().includes("plan");
-    contentLines.push("");
-    contentLines.push(`${FG_YELLOW}${BOLD}${isPlanningPhase ? "Planning..." : "Generating..."}${RESET}`);
-    contentLines.push("");
+    const isTalkMode = modal.title.toLowerCase().includes("talking to");
 
-    if (modal.progress) {
-      contentLines.push(truncate(modal.progress, innerWidth - 4));
+    if (isTalkMode) {
+      // Talk mode - show full multi-line conversation with word wrap
+      contentLines.push("");
+      if (modal.progress) {
+        const progressLines = modal.progress.split("\n");
+        const maxLineWidth = innerWidth - 4;
+        for (const line of progressLines) {
+          if (line.length <= maxLineWidth) {
+            contentLines.push(line);
+          } else {
+            // Word wrap long lines
+            const words = line.split(" ");
+            let currentLine = "";
+            for (const word of words) {
+              if (currentLine.length === 0) {
+                currentLine = word;
+              } else if (currentLine.length + 1 + word.length <= maxLineWidth) {
+                currentLine += " " + word;
+              } else {
+                contentLines.push(currentLine);
+                currentLine = word;
+              }
+            }
+            if (currentLine.length > 0) {
+              contentLines.push(currentLine);
+            }
+          }
+        }
+      }
+    } else {
+      // Regular progress mode (planning/generating)
+      contentLines.push("");
+      contentLines.push(`${FG_YELLOW}${BOLD}${isPlanningPhase ? "Planning..." : "Generating..."}${RESET}`);
+      contentLines.push("");
+
+      if (modal.progress) {
+        contentLines.push(truncate(modal.progress, innerWidth - 4));
+      }
+
+      // Show appropriate waiting message
+      contentLines.push("");
+      contentLines.push(`${DIM}${isPlanningPhase ? "Press Esc to cancel" : "Please wait..."}${RESET}`);
     }
-
-    // Show appropriate waiting message
-    contentLines.push("");
-    contentLines.push(`${DIM}${isPlanningPhase ? "Press Esc to cancel" : "Please wait..."}${RESET}`);
 
     // Show entities created so far
     if (modal.createdEntities.length > 0) {
@@ -157,10 +408,19 @@ export function renderModal(
 
   // Help line
   const isPlanningPhase = modal.title.toLowerCase().includes("plan");
+  const isTalkMode = modal.title.toLowerCase().includes("talking to");
+  const hasEntities = modal.pendingEntities && modal.pendingEntities.length > 0;
+  const isEditing = modal.editingEntityField !== null && modal.editingEntityField !== undefined;
   const helpText = modal.isComplete
     ? "Press Enter to navigate, Esc to close"
     : modal.approvalChoices?.length
-    ? "j/k: select  Enter: confirm  Esc: cancel"
+    ? isEditing
+      ? "Type to edit  Enter: save  Esc: cancel"
+      : hasEntities
+        ? "j/k: select  n/r/p: edit  e: $EDITOR  Enter: approve  Esc: cancel"
+        : "j/k: scroll  Enter: approve  Esc: cancel"
+    : isTalkMode
+    ? "Type below, Enter to send, Esc to exit"
     : isPlanningPhase
     ? "Creating plan... Esc to cancel"
     : "Generating content...";

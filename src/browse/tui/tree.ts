@@ -24,6 +24,12 @@ export function refToNodeId(ref: EntityRef): string {
       return `location:${ref.locationId}`;
     case "npc":
       return `npc:${ref.npcId}`;
+    case "faction":
+      return `faction:${ref.factionId}`;
+    case "culture":
+      return `culture:${ref.cultureId}`;
+    case "religion":
+      return `religion:${ref.religionId}`;
   }
 }
 
@@ -45,6 +51,12 @@ export function nodeIdToRef(nodeId: string): EntityRef {
       return { kind: "location", locationId: id };
     case "npc":
       return { kind: "npc", npcId: id };
+    case "faction":
+      return { kind: "faction", factionId: id };
+    case "culture":
+      return { kind: "culture", cultureId: parseInt(id, 10) };
+    case "religion":
+      return { kind: "religion", religionId: parseInt(id, 10) };
     default:
       return { kind: "world" };
   }
@@ -164,7 +176,7 @@ export function createNpcNode(npc: CanonEntity, depth: number): TreeNode {
 export function createFactionNode(faction: CanonEntity, depth: number): TreeNode {
   return {
     id: `faction:${faction.id}`,
-    ref: { kind: "location", locationId: faction.id }, // Use location kind for navigation
+    ref: { kind: "faction", factionId: faction.id },
     name: faction.name,
     kind: "faction",
     expanded: false,
@@ -214,22 +226,58 @@ export function getTreeChildren(
     }
 
     case "state": {
-      // State -> Burgs in that state
+      // State -> Burgs in that state + NPCs with stateId but no burgId/location
       const burgs = world.listBurgs().filter((b) => b.state === ref.stateId);
       burgs.sort((a, b) => (b.population ?? b.pop ?? 0) - (a.population ?? a.pop ?? 0));
-      return burgs.slice(0, 50).map((b) => createBurgNode(b, depth + 1, expandedNodes.has(`burg:${b.id}`)));
+      const burgNodes = burgs.slice(0, 50).map((b) => createBurgNode(b, depth + 1, expandedNodes.has(`burg:${b.id}`)));
+
+      // Find NPCs that have stateId but no burgId and no location
+      const stateNpcs = canon.listEntities({
+        type: "npc",
+        anchors: { stateId: ref.stateId },
+        limit: 100,
+      }).filter((npc) => {
+        // Exclude NPCs that have a burgId (they'll show under their burg)
+        if (npc.anchors?.burgId !== undefined) return false;
+        // Exclude NPCs that have a location relation
+        const rels = canon.listRelations({ entity_id: npc.id, limit: 50 });
+        const hasLocation = rels.some(
+          (r) => r.rel_type === "located_at" && r.from_id === npc.id
+        );
+        return !hasLocation;
+      });
+
+      const npcNodes = stateNpcs.map((n) => createNpcNode(n, depth + 1));
+      return [...burgNodes, ...npcNodes];
     }
 
     case "burg": {
-      // Burg -> Locations in that burg
+      // Burg -> Locations in that burg + NPCs with burgId but no location
       const locations = canon.listEntities({
         type: "location",
         anchors: { burgId: ref.burgId },
         limit: 100,
       });
-      return locations.map((l) =>
+      const locationNodes = locations.map((l) =>
         createLocationNode(l, depth + 1, expandedNodes.has(`location:${l.id}`))
       );
+
+      // Find NPCs that have burgId but no location
+      const burgNpcs = canon.listEntities({
+        type: "npc",
+        anchors: { burgId: ref.burgId },
+        limit: 100,
+      }).filter((npc) => {
+        // Exclude NPCs that have a location relation
+        const rels = canon.listRelations({ entity_id: npc.id, limit: 50 });
+        const hasLocation = rels.some(
+          (r) => r.rel_type === "located_at" && r.from_id === npc.id
+        );
+        return !hasLocation;
+      });
+
+      const npcNodes = burgNpcs.map((n) => createNpcNode(n, depth + 1));
+      return [...locationNodes, ...npcNodes];
     }
 
     case "location": {
@@ -296,6 +344,85 @@ export function buildTree(
 }
 
 /**
+ * Create tree node from a culture
+ */
+export function createCultureNode(
+  culture: { id: number; name: string; type?: string },
+  selectedNodeId: string | null
+): TreeNode {
+  return {
+    id: `culture:${culture.id}`,
+    ref: { kind: "culture", cultureId: culture.id },
+    name: culture.name,
+    kind: "culture",
+    expanded: false,
+    hasChildren: false,  // Flat list, no children
+    depth: 0,
+    isSelected: selectedNodeId === `culture:${culture.id}`,
+    extra: culture.type,
+  };
+}
+
+/**
+ * Create tree node from a religion
+ */
+export function createReligionNode(
+  religion: { id: number; name: string; type?: string; form?: string },
+  selectedNodeId: string | null
+): TreeNode {
+  return {
+    id: `religion:${religion.id}`,
+    ref: { kind: "religion", religionId: religion.id },
+    name: religion.name,
+    kind: "religion",
+    expanded: false,
+    hasChildren: false,  // Flat list, no children
+    depth: 0,
+    isSelected: selectedNodeId === `religion:${religion.id}`,
+    extra: religion.type || religion.form,
+  };
+}
+
+/**
+ * Build flat alphabetical list of factions from canon DB
+ */
+export function buildFactionsList(
+  canon: CanonStore,
+  selectedNodeId: string | null
+): TreeNode[] {
+  const factions = canon.listEntities({ type: "faction", limit: 500 });
+  factions.sort((a, b) => a.name.localeCompare(b.name));
+
+  return factions.map((f) => createFactionNode(f, 0));
+}
+
+/**
+ * Build flat alphabetical list of religions from Azgaar world
+ */
+export function buildReligionsList(
+  world: AzgaarWorld,
+  selectedNodeId: string | null
+): TreeNode[] {
+  const religions = world.listReligions();
+  religions.sort((a, b) => a.name.localeCompare(b.name));
+
+  return religions.map((r) => createReligionNode(r, selectedNodeId));
+}
+
+/**
+ * Build flat alphabetical list of cultures from Azgaar world
+ */
+export function buildCulturesList(
+  world: AzgaarWorld,
+  selectedNodeId: string | null
+): TreeNode[] {
+  const cultures = world.listCultures();
+  cultures.sort((a, b) => a.name.localeCompare(b.name));
+
+  return cultures.map((c) => createCultureNode(c, selectedNodeId));
+}
+
+/**
  * Find the path from root to a given node ID
  */
 export function findPathToNode(
@@ -340,21 +467,27 @@ export function findPathToNode(
     case "npc": {
       const npc = canon.getEntity(ref.npcId);
       const burgId = npc?.anchors?.burgId as number | undefined;
-      if (burgId !== undefined) {
-        const burg = world.getBurg(burgId);
-        if (burg?.state !== undefined) {
-          path.push(`state:${burg.state}`);
-        }
-        path.push(`burg:${burgId}`);
-      }
+      const stateId = npc?.anchors?.stateId as number | undefined;
 
       // Check if NPC is at a location
       const rels = canon.listRelations({ entity_id: ref.npcId, limit: 50 });
       const locationRel = rels.find(
         (r) => r.rel_type === "located_at" && r.from_id === ref.npcId
       );
-      if (locationRel) {
-        path.push(`location:${locationRel.to_id}`);
+
+      if (burgId !== undefined) {
+        // NPC has a burg - show path through burg
+        const burg = world.getBurg(burgId);
+        if (burg?.state !== undefined) {
+          path.push(`state:${burg.state}`);
+        }
+        path.push(`burg:${burgId}`);
+        if (locationRel) {
+          path.push(`location:${locationRel.to_id}`);
+        }
+      } else if (stateId !== undefined && !locationRel) {
+        // NPC has only state (no burg, no location) - show directly under state
+        path.push(`state:${stateId}`);
       }
 
       path.push(`npc:${ref.npcId}`);

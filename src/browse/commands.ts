@@ -16,6 +16,7 @@ import {
   saveConfig,
   getEffectiveModel,
   getEffectiveGenerationModel,
+  getEffectiveTalkModel,
   validateProviderSwitch,
 } from "../llm/config";
 import { directScene, SceneContext } from "../chat/director";
@@ -55,6 +56,19 @@ import {
   planModification,
   executeModification,
   formatModPlanForApproval,
+  ENTITY_FIELD_CONFIGS,
+  planFieldRegeneration,
+  executeFieldRegeneration,
+  formatFieldRegenPlanForApproval,
+  // Description generation for states/burgs
+  STATE_DESCRIPTION_FIELDS,
+  BURG_DESCRIPTION_FIELDS,
+  planDescriptionGeneration,
+  executeDescriptionGeneration,
+  formatDescriptionPlanForApproval,
+  getExistingDescription,
+  planDescriptionFieldRegeneration,
+  type DescriptionPlan,
 } from "./gen-agent";
 import { selectPrompt } from "./select-prompt";
 
@@ -73,6 +87,7 @@ export type CommandContext = {
   canon: CanonStore;
   llm: LLMClient;
   generationLlm?: LLMClient;
+  talkLlm?: LLMClient;  // Optional separate LLM for NPC conversations
   campaignSettings?: CampaignSettings;
   useColors?: boolean;
   tuiMode?: boolean;  // When true, gen commands return plan for TUI approval instead of using console
@@ -88,11 +103,12 @@ export type CommandContext = {
   onConfigChange?: (config: LLMConfig) => void;
   onLlmChange?: (llm: LLMClient) => void;
   onGenerationLlmChange?: (llm: LLMClient | undefined) => void;
+  onTalkLlmChange?: (llm: LLMClient | undefined) => void;
   setStatusBarProvider?: (provider: string, model: string) => void;
 };
 
-// Import GenPlan and ModPlan types for pending operations
-import type { GenPlan, ModPlan } from "./gen-agent";
+// Import GenPlan, ModPlan, FieldRegenPlan types for pending operations
+import type { GenPlan, ModPlan, FieldRegenPlan } from "./gen-agent";
 
 export type CommandResult = {
   output?: string;           // Text to display
@@ -113,6 +129,25 @@ export type CommandResult = {
   // TUI-specific: pending modification needing approval
   pendingModification?: {
     plan: ModPlan;
+    formattedPlan: string;
+  };
+  // TUI-specific: show field selection modal for existing entity regeneration
+  showFieldSelection?: {
+    entityId: string;
+    entityType: string;
+    entityName: string;
+    coreFields: string[];
+    payloadFields: string[];
+    hint: string;
+  };
+  // TUI-specific: pending field regeneration needing approval
+  pendingFieldRegeneration?: {
+    plan: FieldRegenPlan;
+    formattedPlan: string;
+  };
+  // TUI-specific: pending description generation needing approval
+  pendingDescriptionGeneration?: {
+    plan: DescriptionPlan;
     formattedPlan: string;
   };
 };
@@ -341,9 +376,12 @@ export async function executeCommand(
   }
 
   // Smart Generation with planning and permission: gen location <kind> [hints]
+  // OR description generation for states/burgs: gen [hints] when on a state/burg
+  // OR field regeneration for existing entities: gen [hints] when on a canon entity
   if (cmd === "gen") {
     const [subCmd, ...subArgs] = args;
 
+    // Check if we have explicit entity type (new entity generation)
     if (subCmd === "location" || subCmd === "npc" || subCmd === "faction") {
       const kind = subCmd === "npc" ? undefined : (subArgs[0] || (subCmd === "location" ? "tavern" : "guild"));
       const hints = subCmd === "npc" ? subArgs.join(" ") : subArgs.slice(1).join(" ");
@@ -351,6 +389,49 @@ export async function executeCommand(
 
       return runSmartGeneration(subCmd as "location" | "npc" | "faction", kind, fullPrompt, ctx);
     }
+
+    // Check for explicit "description" subcommand
+    if (subCmd === "description") {
+      const hints = subArgs.join(" ");
+      return runDescriptionGeneration(hints, ctx);
+    }
+
+    // No explicit type - check context for what to generate
+    if (ctx.tuiMode) {
+      const cur = currentRef(ctx.state);
+      const hints = args.join(" "); // Everything after "gen" is the hint
+
+      // Check if on a state - generate state description
+      if (cur.kind === "state") {
+        return runDescriptionGeneration(hints, ctx, { stateId: cur.stateId });
+      }
+
+      // Check if on a burg - generate burg description
+      if (cur.kind === "burg") {
+        return runDescriptionGeneration(hints, ctx, { burgId: cur.burgId });
+      }
+
+      // Check if on an existing canon entity for field regeneration
+      const currentEntityId = getCurrentEntityId(ctx.state);
+      if (currentEntityId) {
+        const entity = ctx.canon.getEntity(currentEntityId);
+        if (entity && ENTITY_FIELD_CONFIGS[entity.type]) {
+          // Return field selection info for the TUI
+          const fieldConfig = ENTITY_FIELD_CONFIGS[entity.type];
+          return {
+            showFieldSelection: {
+              entityId: entity.id,
+              entityType: entity.type,
+              entityName: entity.name,
+              coreFields: fieldConfig.core,
+              payloadFields: fieldConfig.payload,
+              hint: hints,
+            },
+          };
+        }
+      }
+    }
+
     return { error: "Usage: gen location|npc|faction <kind> [hints]" };
   }
 
@@ -390,31 +471,31 @@ export async function executeCommand(
     return runScene(argStr, ctx);
   }
 
-  // Talk mode: /talk [npc]
-  if (cmd === "/talk") {
+  // Talk mode: talk or /talk [npc]
+  if (cmd === "talk" || cmd === "/talk") {
     if (!argStr) {
       if (isAtNpc(ctx.state)) {
         return { output: "(Entering talk mode with current NPC)", enterTalkMode: true };
       }
-      return { error: "Usage: /talk <npc name>" };
+      return { error: "Usage: talk <npc name>" };
     }
     const result = await navigateToNpc(argStr, ctx);
     if (result.error) return result;
     return { ...result, enterTalkMode: true };
   }
 
-  // Director mode: /director
-  if (cmd === "/director") {
+  // Director mode: director or /director
+  if (cmd === "director" || cmd === "/director") {
     return { output: "(Entering director mode. Use natural language.)" };
   }
 
-  // Campaign settings: /init
-  if (cmd === "/init" || cmd === "/setup") {
+  // Campaign settings: init (or /init for REPL mode)
+  if (cmd === "init" || cmd === "setup" || cmd === "/init" || cmd === "/setup") {
     return { runOnboarding: true };
   }
 
-  // Token usage: /tokens
-  if (cmd === "/tokens") {
+  // Token usage: tokens or /tokens
+  if (cmd === "tokens" || cmd === "/tokens") {
     if (!ctx.getTokens) {
       return { output: "(Token tracking not available)" };
     }
@@ -425,14 +506,19 @@ export async function executeCommand(
     };
   }
 
-  // Model switching: /model
-  if (cmd === "/model") {
+  // Model switching: model or /model
+  if (cmd === "model" || cmd === "/model") {
     return handleModelCommand(argStr, ctx);
   }
 
-  // Generation model switching: /genmodel
-  if (cmd === "/genmodel") {
+  // Generation model switching: genmodel or /genmodel
+  if (cmd === "genmodel" || cmd === "/genmodel") {
     return handleGenModelCommand(argStr, ctx);
+  }
+
+  // Talk model switching: talkmodel or /talkmodel
+  if (cmd === "talkmodel" || cmd === "/talkmodel") {
+    return handleTalkModelCommand(argStr, ctx);
   }
 
   // Unknown command
@@ -760,6 +846,221 @@ export function executePendingModification(
     output: `${green}${result.summary}${reset}\n` +
       (result.appliedChanges.length > 0 ? result.appliedChanges.map(c => `  + ${c}`).join("\n") : "  (no changes)"),
   };
+}
+
+/**
+ * Plan field regeneration for TUI approval
+ */
+export function planFieldRegen(
+  entityId: string,
+  selectedFields: string[],
+  hint: string,
+  ctx: CommandContext
+): CommandResult {
+  const genCtx: GenContext = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
+  };
+
+  try {
+    const plan = planFieldRegeneration(entityId, selectedFields, hint, genCtx);
+    const formattedPlan = formatFieldRegenPlanForApproval(plan, ctx.useColors);
+
+    return {
+      pendingFieldRegeneration: {
+        plan,
+        formattedPlan,
+      },
+    };
+  } catch (e: any) {
+    return { error: `Planning failed: ${e?.message || String(e)}` };
+  }
+}
+
+/**
+ * Execute a pending field regeneration after TUI approval
+ */
+export async function executePendingFieldRegeneration(
+  plan: FieldRegenPlan,
+  ctx: CommandContext
+): Promise<CommandResult> {
+  const genCtx: GenContext = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
+    onEntityStart: ctx.onEntityStart,
+    onEntityComplete: ctx.onEntityComplete,
+  };
+
+  try {
+    const result = await executeFieldRegeneration(plan, genCtx);
+
+    if (!result.success) {
+      return { error: result.error || "Field regeneration failed" };
+    }
+
+    const green = ctx.useColors ? GREEN : "";
+    const reset = ctx.useColors ? RESET : "";
+    return {
+      output: `${green}${result.summary}${reset}\n` +
+        (result.regeneratedFields.length > 0 ? result.regeneratedFields.map(f => `  + ${f}`).join("\n") : "  (no changes)"),
+    };
+  } catch (e: any) {
+    return { error: `Field regeneration failed: ${e?.message || String(e)}` };
+  }
+}
+
+/**
+ * Run description generation for a state or burg
+ */
+async function runDescriptionGeneration(
+  hints: string,
+  ctx: CommandContext,
+  explicitTarget?: { stateId: number } | { burgId: number }
+): Promise<CommandResult> {
+  const genCtx: GenContext = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
+    onEntityStart: ctx.onEntityStart,
+    onEntityComplete: ctx.onEntityComplete,
+  };
+
+  // Determine target from explicit param or current position
+  let target: { stateId: number } | { burgId: number };
+  if (explicitTarget) {
+    target = explicitTarget;
+  } else {
+    const cur = currentRef(ctx.state);
+    if (cur.kind === "state") {
+      target = { stateId: cur.stateId };
+    } else if (cur.kind === "burg") {
+      target = { burgId: cur.burgId };
+    } else {
+      return { error: "Navigate to a state or burg first to generate a description" };
+    }
+  }
+
+  try {
+    // Check if description already exists
+    const existingDesc = getExistingDescription(ctx.canon, target);
+
+    if (existingDesc) {
+      // Return field selection for regeneration
+      const descType = existingDesc.payload?.descriptionType as "state" | "burg" | undefined;
+      const fieldConfig = descType === "state" ? STATE_DESCRIPTION_FIELDS : BURG_DESCRIPTION_FIELDS;
+
+      return {
+        showFieldSelection: {
+          entityId: existingDesc.id,
+          entityType: "meta",
+          entityName: existingDesc.name,
+          coreFields: fieldConfig.core,
+          payloadFields: fieldConfig.payload,
+          hint: hints,
+        },
+      };
+    }
+
+    // Plan new description generation
+    const plan = planDescriptionGeneration(hints, target, genCtx);
+    const formattedPlan = formatDescriptionPlanForApproval(plan, ctx.useColors);
+
+    // TUI Mode: Return plan for TUI approval
+    if (ctx.tuiMode) {
+      return {
+        pendingDescriptionGeneration: {
+          plan,
+          formattedPlan,
+        },
+      };
+    }
+
+    // Non-TUI: Use console and selectPrompt
+    console.log(formattedPlan);
+
+    const answer = await selectPrompt({
+      message: "What would you like to do?",
+      options: [
+        { label: "Generate", value: "generate", hint: "Generate the description" },
+        { label: "Cancel", value: "cancel", hint: "Abort without generating" },
+      ],
+      useColors: ctx.useColors,
+      defaultIndex: 0,
+    });
+
+    if (answer === null || answer === "cancel") {
+      return { output: "(Cancelled)" };
+    }
+
+    // Execute generation
+    const result = await executeDescriptionGeneration(plan, genCtx);
+
+    if (!result.success) {
+      return { error: result.error || "Description generation failed" };
+    }
+
+    const green = ctx.useColors ? GREEN : "";
+    const reset = ctx.useColors ? RESET : "";
+    return { output: `${green}${result.summary}${reset}` };
+  } catch (e: any) {
+    return { error: `Description generation failed: ${e?.message || String(e)}` };
+  }
+}
+
+/**
+ * Execute a pending description generation after TUI approval
+ */
+export async function executePendingDescriptionGeneration(
+  plan: DescriptionPlan,
+  ctx: CommandContext
+): Promise<CommandResult> {
+  const genCtx: GenContext = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
+    onEntityStart: ctx.onEntityStart,
+    onEntityComplete: ctx.onEntityComplete,
+  };
+
+  try {
+    const result = await executeDescriptionGeneration(plan, genCtx);
+
+    if (!result.success) {
+      return { error: result.error || "Description generation failed" };
+    }
+
+    const green = ctx.useColors ? GREEN : "";
+    const reset = ctx.useColors ? RESET : "";
+    return { output: `${green}${result.summary}${reset}` };
+  } catch (e: any) {
+    return { error: `Description generation failed: ${e?.message || String(e)}` };
+  }
 }
 
 // Simple generation commands (legacy single-shot behavior)
@@ -1139,11 +1440,12 @@ function findByName(name: string, entities: CanonEntity[]): CanonEntity | undefi
   return undefined;
 }
 
-// Helper: get current entity ID
+// Helper: get current entity ID (for canon entities only)
 function getCurrentEntityId(state: BrowseState): string | undefined {
   const cur = currentRef(state);
   if (cur.kind === "location") return cur.locationId;
   if (cur.kind === "npc") return cur.npcId;
+  if (cur.kind === "faction") return cur.factionId;
   return undefined;
 }
 
@@ -1246,6 +1548,13 @@ async function handleModelCommand(argStr: string, ctx: CommandContext): Promise<
       lines.push(`Generation: ${ctx.generationLlm.provider}/${ctx.generationLlm.model}`);
     } else {
       lines.push(`Generation: (using chat model)`);
+    }
+    if (ctx.talkLlm) {
+      lines.push(`Talk:       ${ctx.talkLlm.provider}/${ctx.talkLlm.model}`);
+    } else if (ctx.generationLlm) {
+      lines.push(`Talk:       (using generation model)`);
+    } else {
+      lines.push(`Talk:       (using chat model)`);
     }
     return { output: lines.join("\n") };
   }
@@ -1410,6 +1719,78 @@ async function handleGenModelCommand(argStr: string, ctx: CommandContext): Promi
   }
 }
 
+// Talk model command handler
+async function handleTalkModelCommand(argStr: string, ctx: CommandContext): Promise<CommandResult> {
+  // Disable separate talk model
+  if (argStr === "off" || argStr === "none" || argStr === "disable") {
+    if (!ctx.config || !ctx.onConfigChange || !ctx.onTalkLlmChange) {
+      return { error: "Model switching not available (no config context)" };
+    }
+
+    const newConfig: LLMConfig = {
+      ...ctx.config,
+      talkProvider: undefined,
+      talkModels: undefined,
+    };
+    await saveConfig(newConfig);
+    ctx.onConfigChange(newConfig);
+    ctx.onTalkLlmChange(undefined);
+    return { output: "Talk model disabled (using generation/chat model)" };
+  }
+
+  // No args: show current
+  if (!argStr) {
+    if (ctx.talkLlm) {
+      return { output: `Talk: ${ctx.talkLlm.provider}/${ctx.talkLlm.model}` };
+    } else if (ctx.generationLlm) {
+      return { output: `Talk: (using generation model: ${ctx.generationLlm.provider}/${ctx.generationLlm.model})` };
+    } else {
+      return { output: `Talk: (using chat model: ${ctx.llm.provider}/${ctx.llm.model})` };
+    }
+  }
+
+  // Parse provider/model
+  const parts = argStr.split("/", 2);
+  const newProvider = parts[0] as LLMProviderName;
+  const newModel = parts[1];
+
+  if (!["ollama", "openai", "anthropic"].includes(newProvider)) {
+    return { error: `Unknown provider: ${newProvider}. Use: ollama, openai, anthropic` };
+  }
+
+  const validationError = validateProviderSwitch(newProvider);
+  if (validationError) {
+    return { error: `Cannot switch: ${validationError}` };
+  }
+
+  if (!ctx.config || !ctx.onConfigChange || !ctx.onTalkLlmChange) {
+    return { error: "Model switching not available (no config context)" };
+  }
+
+  try {
+    const effectiveModel = newModel || getEffectiveTalkModel(ctx.config, newProvider);
+    const newTalkLlm = createLLMClient({ provider: newProvider, model: effectiveModel });
+
+    // Update and save config
+    const newConfig: LLMConfig = {
+      ...ctx.config,
+      talkProvider: newProvider,
+      talkModels: {
+        ...ctx.config.talkModels,
+        [newProvider]: effectiveModel,
+      },
+    };
+    await saveConfig(newConfig);
+
+    ctx.onConfigChange(newConfig);
+    ctx.onTalkLlmChange(newTalkLlm);
+
+    return { output: `Talk model: ${newTalkLlm.provider}/${newTalkLlm.model}` };
+  } catch (e: any) {
+    return { error: `Failed to switch: ${e?.message ?? String(e)}` };
+  }
+}
+
 // Help text
 function helpText(useColors?: boolean): string {
   const bold = useColors ? BOLD : "";
@@ -1465,13 +1846,15 @@ ${cyan}LLM/Chat${reset}
   /back              Exit roleplay mode
 
 ${cyan}Settings${reset}
-  /init              Configure campaign settings (vibe, quest, tone, rating)
+  init               Configure campaign settings (vibe, quest, tone, rating)
   /tokens            Show session token usage
-  /model             Show current LLM provider/model (chat + generation)
+  /model             Show current LLM provider/model (chat, generation, talk)
   /model list        List available providers and models
   /model <p>/<m>     Switch chat model (e.g., /model openai/gpt-4o)
   /genmodel <p>/<m>  Switch generation model (e.g., /genmodel anthropic/claude-sonnet-4-5-20250929)
   /genmodel off      Use chat model for generation (disable separate model)
+  /talkmodel <p>/<m> Switch talk model (e.g., /talkmodel ollama/llama3.2)
+  /talkmodel off     Use generation/chat model for NPC conversations
 
 ${cyan}Other${reset}
   help               Show this help

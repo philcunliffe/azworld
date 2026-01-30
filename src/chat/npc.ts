@@ -158,6 +158,7 @@ export function getNpcFactions(canon: CanonStore, npcId: string): Array<{ name: 
 
 export async function npcTurn(opts: {
   llm: LLMClient;
+  talkLlm?: LLMClient;  // Optional separate LLM for NPC conversations
   world: AzgaarWorld;
   canon: CanonStore;
   state: ChatState;
@@ -177,7 +178,9 @@ export async function npcTurn(opts: {
   const history = (opts.state.npcHistories[npcId] ??= []);
   history.push({ role: "user", content: opts.userText });
 
-  const res = await opts.llm.complete({
+  // Use talk LLM if provided, otherwise fall back to main LLM
+  const llm = opts.talkLlm || opts.llm;
+  const res = await llm.complete({
     system: npcSystemPrompt({
       npc,
       scene: opts.scene,

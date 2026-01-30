@@ -18,6 +18,13 @@ export const LLMConfigSchema = z.object({
     openai: z.string().optional(),
     anthropic: z.string().optional(),
   }).optional(),
+  // Separate talk model config (for NPC conversations)
+  talkProvider: z.enum(["ollama", "openai", "anthropic"]).optional(),
+  talkModels: z.object({
+    ollama: z.string().optional(),
+    openai: z.string().optional(),
+    anthropic: z.string().optional(),
+  }).optional(),
 }).strict();
 
 export type LLMConfig = z.infer<typeof LLMConfigSchema>;
@@ -126,6 +133,50 @@ export function hasGenerationConfig(config: LLMConfig): boolean {
     config.generationModels?.openai ||
     config.generationModels?.anthropic ||
     process.env.LLM_GENERATION_PROVIDER
+  );
+}
+
+/**
+ * Get the effective talk provider. Returns undefined if not set (falls back to generation/main).
+ */
+export function getEffectiveTalkProvider(config: LLMConfig): LLMProviderName | undefined {
+  if (config.talkProvider) return config.talkProvider;
+  // Check for env var
+  const envProvider = process.env.LLM_TALK_PROVIDER?.toLowerCase();
+  if (envProvider === "openai" || envProvider === "anthropic" || envProvider === "ollama") {
+    return envProvider;
+  }
+  return undefined; // Will fall back to generation provider or main provider
+}
+
+/**
+ * Get the effective talk model for a provider.
+ * Fallback chain: talkModel → generationModel → chatModel
+ */
+export function getEffectiveTalkModel(config: LLMConfig, provider: LLMProviderName): string {
+  // Check talk-specific config first
+  const configModel = config.talkModels?.[provider];
+  if (configModel) return configModel;
+
+  // Check env var
+  const envKey = `LLM_TALK_${provider.toUpperCase()}_MODEL`;
+  const envModel = process.env[envKey];
+  if (envModel) return envModel;
+
+  // Fall back to generation model config, then main model
+  return getEffectiveGenerationModel(config, provider);
+}
+
+/**
+ * Check if a separate talk model is configured.
+ */
+export function hasTalkConfig(config: LLMConfig): boolean {
+  return !!(
+    config.talkProvider ||
+    config.talkModels?.ollama ||
+    config.talkModels?.openai ||
+    config.talkModels?.anthropic ||
+    process.env.LLM_TALK_PROVIDER
   );
 }
 

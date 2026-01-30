@@ -62,6 +62,9 @@ export const TREE = {
   leaf: "•",
 };
 
+// Orange color for cultures (256-color mode)
+export const FG_ORANGE = `${CSI}38;5;214m`;
+
 // Entity type color mapping
 export const ENTITY_COLORS: Record<EntityKind, string> = {
   world: FG_WHITE,
@@ -71,6 +74,8 @@ export const ENTITY_COLORS: Record<EntityKind, string> = {
   npc: FG_YELLOW,
   faction: FG_MAGENTA,
   event: FG_RED,
+  culture: FG_ORANGE,
+  religion: FG_CYAN,
 };
 
 /**
@@ -88,22 +93,81 @@ export function stripAnsi(str: string): string {
 }
 
 /**
- * Get visible length of string (excluding ANSI codes)
+ * Check if a character is a wide character (emoji or East Asian wide)
+ * Returns 2 for wide characters, 1 for normal, 0 for combining/zero-width
+ */
+function charWidth(char: string): number {
+  const code = char.codePointAt(0);
+  if (code === undefined) return 0;
+
+  // Zero-width characters and combining marks
+  if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return 0;
+  if (code >= 0x0300 && code <= 0x036f) return 0; // Combining diacritics
+  if (code >= 0x200b && code <= 0x200f) return 0; // Zero-width spaces
+  if (code >= 0x2028 && code <= 0x202e) return 0; // Line separators, etc.
+  if (code >= 0xfe00 && code <= 0xfe0f) return 0; // Variation selectors
+
+  // Emoji ranges - render as 2 cells wide
+  // Miscellaneous Symbols and Pictographs
+  if (code >= 0x1f300 && code <= 0x1f5ff) return 2;
+  // Emoticons
+  if (code >= 0x1f600 && code <= 0x1f64f) return 2;
+  // Transport and Map Symbols
+  if (code >= 0x1f680 && code <= 0x1f6ff) return 2;
+  // Supplemental Symbols and Pictographs
+  if (code >= 0x1f900 && code <= 0x1f9ff) return 2;
+  // Symbols and Pictographs Extended-A
+  if (code >= 0x1fa00 && code <= 0x1fa6f) return 2;
+  // Symbols and Pictographs Extended-B
+  if (code >= 0x1fa70 && code <= 0x1faff) return 2;
+  // Dingbats
+  if (code >= 0x2700 && code <= 0x27bf) return 2;
+  // Miscellaneous Symbols
+  if (code >= 0x2600 && code <= 0x26ff) return 2;
+  // Regional indicator symbols (flags)
+  if (code >= 0x1f1e0 && code <= 0x1f1ff) return 2;
+
+  // CJK ranges - render as 2 cells wide
+  if (code >= 0x4e00 && code <= 0x9fff) return 2; // CJK Unified Ideographs
+  if (code >= 0x3400 && code <= 0x4dbf) return 2; // CJK Extension A
+  if (code >= 0x20000 && code <= 0x2a6df) return 2; // CJK Extension B
+  if (code >= 0xf900 && code <= 0xfaff) return 2; // CJK Compatibility Ideographs
+  if (code >= 0xff00 && code <= 0xff60) return 2; // Fullwidth ASCII
+  if (code >= 0xffe0 && code <= 0xffe6) return 2; // Fullwidth punctuation
+
+  return 1;
+}
+
+/**
+ * Get visible length of string (excluding ANSI codes, accounting for wide chars)
  */
 export function visibleLength(str: string): number {
-  return stripAnsi(str).length;
+  const stripped = stripAnsi(str);
+  let width = 0;
+  for (const char of stripped) {
+    width += charWidth(char);
+  }
+  return width;
 }
 
 /**
  * Truncate string to fit width, adding ellipsis if needed
+ * Properly handles wide characters (emoji, CJK)
  */
 export function truncate(str: string, maxLen: number): string {
   const visible = stripAnsi(str);
-  if (visible.length <= maxLen) return str;
+  if (visibleLength(str) <= maxLen) return str;
 
-  // Simple truncation - doesn't preserve ANSI codes across truncation
-  const stripped = visible.slice(0, maxLen - 1) + "…";
-  return stripped;
+  // Build truncated string character by character, tracking width
+  let result = "";
+  let width = 0;
+  for (const char of visible) {
+    const cw = charWidth(char);
+    if (width + cw > maxLen - 1) break;
+    result += char;
+    width += cw;
+  }
+  return result + "…";
 }
 
 /**
@@ -129,6 +193,7 @@ export function padCenter(str: string, width: number): string {
 /**
  * Slice string by visible position, preserving ANSI codes
  * Returns characters from visible position start to end (exclusive)
+ * Properly handles wide characters (emoji, CJK)
  */
 export function sliceByVisible(str: string, start: number, end?: number): string {
   const ansiRegex = /\x1b\[[0-9;]*m/g;
@@ -145,6 +210,7 @@ export function sliceByVisible(str: string, start: number, end?: number): string
     // Process text before this ANSI code
     const textBefore = str.slice(lastIndex, match.index);
     for (const char of textBefore) {
+      const cw = charWidth(char);
       if (visiblePos >= start && visiblePos < actualEnd) {
         // If this is the first visible char, prepend any pending ANSI codes
         if (result === "" && pendingAnsi) {
@@ -153,7 +219,7 @@ export function sliceByVisible(str: string, start: number, end?: number): string
         }
         result += char;
       }
-      visiblePos++;
+      visiblePos += cw;
       if (visiblePos >= actualEnd) break;
     }
 
@@ -177,6 +243,7 @@ export function sliceByVisible(str: string, start: number, end?: number): string
   // Process remaining text after last ANSI code
   const remaining = str.slice(lastIndex);
   for (const char of remaining) {
+    const cw = charWidth(char);
     if (visiblePos >= start && visiblePos < actualEnd) {
       if (result === "" && pendingAnsi) {
         result += pendingAnsi;
@@ -184,7 +251,7 @@ export function sliceByVisible(str: string, start: number, end?: number): string
       }
       result += char;
     }
-    visiblePos++;
+    visiblePos += cw;
     if (visiblePos >= actualEnd) break;
   }
 

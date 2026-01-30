@@ -499,6 +499,55 @@ export class AzgaarWorld {
   }
 
   /**
+   * Get the dominant religion for a state, weighted by cell population.
+   * Returns the most common religion's id, name, and type.
+   */
+  getStateDominantReligion(stateId: number): { id: number; name: string; type: string } | undefined {
+    const cells = this.pack.cells;
+    if (!cells || typeof cells !== "object" || Array.isArray(cells)) return undefined;
+
+    const stateArr = cells.state;
+    const religionArr = cells.religion;
+    const popArr = cells.pop;
+    if (!Array.isArray(stateArr) || !Array.isArray(religionArr)) return undefined;
+
+    this.buildIndexes();
+
+    // Count religions weighted by population
+    const religionCounts: Record<number, number> = {};
+    for (let i = 0; i < stateArr.length; i++) {
+      if (stateArr[i] === stateId) {
+        const religionId = religionArr[i];
+        if (typeof religionId === "number" && religionId > 0) {
+          const pop = Array.isArray(popArr) && typeof popArr[i] === "number" ? popArr[i] : 1;
+          religionCounts[religionId] = (religionCounts[religionId] || 0) + pop;
+        }
+      }
+    }
+
+    // Find the religion with highest count
+    let maxCount = 0;
+    let dominantId: number | undefined;
+    for (const [id, count] of Object.entries(religionCounts)) {
+      if (count > maxCount) {
+        maxCount = count;
+        dominantId = Number(id);
+      }
+    }
+
+    if (dominantId === undefined) return undefined;
+
+    const religion = this.religionsById.get(dominantId);
+    if (!religion || religion.removed) return undefined;
+
+    return {
+      id: dominantId,
+      name: religion.name || "Unknown",
+      type: religion.type || "Unknown",
+    };
+  }
+
+  /**
    * Get dominant biomes for a culture's territory
    */
   private getBiomesForCulture(cultureId: number): string[] {
@@ -603,7 +652,7 @@ export class AzgaarWorld {
   /**
    * Get biome name by ID from biomesData.name array.
    */
-  private getBiomeName(biomeId: number): string {
+  getBiomeName(biomeId: number): string {
     const names = this.root.biomesData?.name;
     if (Array.isArray(names) && names[biomeId]) {
       return names[biomeId];

@@ -104,13 +104,13 @@ export function calculateModalDimensions(
   layout: LayoutDimensions,
   large?: boolean
 ): { left: number; top: number; width: number; height: number } {
-  // Large modal for approval (plan display)
+  // Large modal for approval (plan display with entity editor)
   if (large) {
-    const modalWidth = Math.min(80, Math.floor(layout.terminalCols * 0.85));
-    const modalHeight = Math.min(layout.terminalRows - 4, Math.floor(layout.terminalRows * 0.85));
+    const modalWidth = Math.min(100, Math.floor(layout.terminalCols * 0.90));
+    const modalHeight = Math.max(layout.terminalRows - 4, Math.floor(layout.terminalRows * 0.90));
     return {
       left: Math.floor((layout.terminalCols - modalWidth) / 2),
-      top: Math.floor((layout.terminalRows - modalHeight) / 2),
+      top: Math.max(2, Math.floor((layout.terminalRows - modalHeight) / 2)),
       width: modalWidth,
       height: modalHeight,
     };
