@@ -30,6 +30,12 @@ export function refToNodeId(ref: EntityRef): string {
       return `culture:${ref.cultureId}`;
     case "religion":
       return `religion:${ref.religionId}`;
+    case "event":
+      return `event:${ref.eventId}`;
+    case "rumor":
+      return `rumor:${ref.rumorId}`;
+    case "hook":
+      return `hook:${ref.hookId}`;
   }
 }
 
@@ -57,6 +63,12 @@ export function nodeIdToRef(nodeId: string): EntityRef {
       return { kind: "culture", cultureId: parseInt(id, 10) };
     case "religion":
       return { kind: "religion", religionId: parseInt(id, 10) };
+    case "event":
+      return { kind: "event", eventId: id };
+    case "rumor":
+      return { kind: "rumor", rumorId: id };
+    case "hook":
+      return { kind: "hook", hookId: id };
     default:
       return { kind: "world" };
   }

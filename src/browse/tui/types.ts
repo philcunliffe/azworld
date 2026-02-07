@@ -38,6 +38,8 @@ export const EntityKindEnum = z.enum([
   "npc",
   "faction",
   "event",
+  "rumor",
+  "hook",
   "culture",
   "religion",
 ]);

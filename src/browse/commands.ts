@@ -69,8 +69,21 @@ import {
   getExistingDescription,
   planDescriptionFieldRegeneration,
   type DescriptionPlan,
+  // Rumor and hook generation
+  planRumorGeneration,
+  executeRumorGeneration,
+  formatRumorPlanForApproval,
+  planHookGeneration,
+  executeHookGeneration,
+  formatHookPlanForApproval,
+  type RumorPlan,
+  type HookPlan,
+  // Comprehensive burg generation
+  planBurgGeneration,
+  formatBurgPlanForApproval,
 } from "./gen-agent";
 import { selectPrompt } from "./select-prompt";
+import { buildEntityContext, buildAskSystemPrompt } from "./entity-context";
 
 // Color codes
 const RESET = "\x1b[0m";
@@ -148,6 +161,21 @@ export type CommandResult = {
   // TUI-specific: pending description generation needing approval
   pendingDescriptionGeneration?: {
     plan: DescriptionPlan;
+    formattedPlan: string;
+  };
+  // TUI-specific: pending rumor generation needing approval
+  pendingRumorGeneration?: {
+    plan: RumorPlan;
+    formattedPlan: string;
+  };
+  // TUI-specific: pending hook generation needing approval
+  pendingHookGeneration?: {
+    plan: HookPlan;
+    formattedPlan: string;
+  };
+  // TUI-specific: pending comprehensive burg generation needing approval
+  pendingBurgGeneration?: {
+    plan: GenPlan;
     formattedPlan: string;
   };
 };
@@ -390,6 +418,20 @@ export async function executeCommand(
       return runSmartGeneration(subCmd as "location" | "npc" | "faction", kind, fullPrompt, ctx);
     }
 
+    // Rumor generation: gen rumor <topic> [hints]
+    if (subCmd === "rumor") {
+      const topic = subArgs[0] || "local gossip";
+      const hints = subArgs.slice(1).join(" ");
+      return runRumorGeneration(topic, hints, ctx);
+    }
+
+    // Hook generation: gen hook <concept> [hints]
+    if (subCmd === "hook") {
+      const concept = subArgs[0] || "adventure opportunity";
+      const hints = subArgs.slice(1).join(" ");
+      return runHookGeneration(concept, hints, ctx);
+    }
+
     // Check for explicit "description" subcommand
     if (subCmd === "description") {
       const hints = subArgs.join(" ");
@@ -406,8 +448,13 @@ export async function executeCommand(
         return runDescriptionGeneration(hints, ctx, { stateId: cur.stateId });
       }
 
-      // Check if on a burg - generate burg description
+      // Check if on a burg - comprehensive generation with hints, or description if no hints
       if (cur.kind === "burg") {
+        // If hints provided, do comprehensive burg generation
+        if (hints.trim()) {
+          return runBurgGeneration(hints, ctx);
+        }
+        // No hints - generate burg description (old behavior)
         return runDescriptionGeneration(hints, ctx, { burgId: cur.burgId });
       }
 
@@ -432,7 +479,7 @@ export async function executeCommand(
       }
     }
 
-    return { error: "Usage: gen location|npc|faction <kind> [hints]" };
+    return { error: "Usage: gen location|npc|faction|rumor|hook <kind/topic> [hints]" };
   }
 
   // Simple Generation (old behavior, no planning): simplegen location <kind> [hints]
@@ -640,6 +687,30 @@ async function navigateToAny(name: string, ctx: CommandContext): Promise<Command
     return {};
   }
 
+  // Try event
+  const events = ctx.canon.listEntities({ type: "event", limit: 500 });
+  const event = findByName(name, events);
+  if (event) {
+    navigateTo(ctx.state, { kind: "event", eventId: event.id });
+    return {};
+  }
+
+  // Try rumor
+  const rumors = ctx.canon.listEntities({ type: "rumor", limit: 500 });
+  const rumor = findByName(name, rumors);
+  if (rumor) {
+    navigateTo(ctx.state, { kind: "rumor", rumorId: rumor.id });
+    return {};
+  }
+
+  // Try hook
+  const hooks = ctx.canon.listEntities({ type: "hook", limit: 500 });
+  const hook = findByName(name, hooks);
+  if (hook) {
+    navigateTo(ctx.state, { kind: "hook", hookId: hook.id });
+    return {};
+  }
+
   return { error: `Not found: ${name}` };
 }
 
@@ -696,7 +767,11 @@ function deleteEntity(idOrEmpty: string, ctx: CommandContext): CommandResult {
     // If we deleted current entity, navigate up
     const cur = currentRef(ctx.state);
     if ((cur.kind === "location" && cur.locationId === entityId) ||
-        (cur.kind === "npc" && cur.npcId === entityId)) {
+        (cur.kind === "npc" && cur.npcId === entityId) ||
+        (cur.kind === "faction" && cur.factionId === entityId) ||
+        (cur.kind === "event" && cur.eventId === entityId) ||
+        (cur.kind === "rumor" && cur.rumorId === entityId) ||
+        (cur.kind === "hook" && cur.hookId === entityId)) {
       navigateUp(ctx.state);
     }
     return { output: `Deleted: ${entity.name} (${entityId})` };
@@ -1063,6 +1138,309 @@ export async function executePendingDescriptionGeneration(
   }
 }
 
+/**
+ * Run rumor generation with planning and approval
+ */
+async function runRumorGeneration(
+  topic: string,
+  hints: string,
+  ctx: CommandContext
+): Promise<CommandResult> {
+  const genCtx: GenContext = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
+    onEntityStart: ctx.onEntityStart,
+    onEntityComplete: ctx.onEntityComplete,
+  };
+
+  try {
+    const plan = planRumorGeneration(topic, hints, genCtx);
+    const formattedPlan = formatRumorPlanForApproval(plan, ctx.useColors);
+
+    // TUI Mode: Return plan for TUI approval
+    if (ctx.tuiMode) {
+      return {
+        pendingRumorGeneration: {
+          plan,
+          formattedPlan,
+        },
+      };
+    }
+
+    // Non-TUI: Use console and selectPrompt
+    console.log(formattedPlan);
+
+    const answer = await selectPrompt({
+      message: "What would you like to do?",
+      options: [
+        { label: "Generate", value: "generate", hint: "Generate the rumor" },
+        { label: "Cancel", value: "cancel", hint: "Abort without generating" },
+      ],
+      useColors: ctx.useColors,
+      defaultIndex: 0,
+    });
+
+    if (answer === null || answer === "cancel") {
+      return { output: "(Cancelled)" };
+    }
+
+    const result = await executeRumorGeneration(plan, genCtx);
+
+    if (!result.success) {
+      return { error: result.error || "Rumor generation failed" };
+    }
+
+    const green = ctx.useColors ? GREEN : "";
+    const reset = ctx.useColors ? RESET : "";
+    return { output: `${green}${result.summary}${reset}` };
+  } catch (e: any) {
+    return { error: `Rumor generation failed: ${e?.message || String(e)}` };
+  }
+}
+
+/**
+ * Execute a pending rumor generation after TUI approval
+ */
+export async function executePendingRumorGeneration(
+  plan: RumorPlan,
+  ctx: CommandContext
+): Promise<CommandResult> {
+  const genCtx: GenContext = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
+    onEntityStart: ctx.onEntityStart,
+    onEntityComplete: ctx.onEntityComplete,
+  };
+
+  try {
+    const result = await executeRumorGeneration(plan, genCtx);
+
+    if (!result.success) {
+      return { error: result.error || "Rumor generation failed" };
+    }
+
+    const green = ctx.useColors ? GREEN : "";
+    const reset = ctx.useColors ? RESET : "";
+    return { output: `${green}${result.summary}${reset}` };
+  } catch (e: any) {
+    return { error: `Rumor generation failed: ${e?.message || String(e)}` };
+  }
+}
+
+/**
+ * Run hook generation with planning and approval
+ */
+async function runHookGeneration(
+  concept: string,
+  hints: string,
+  ctx: CommandContext
+): Promise<CommandResult> {
+  const genCtx: GenContext = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
+    onEntityStart: ctx.onEntityStart,
+    onEntityComplete: ctx.onEntityComplete,
+  };
+
+  try {
+    const plan = planHookGeneration(concept, hints, genCtx);
+    const formattedPlan = formatHookPlanForApproval(plan, ctx.useColors);
+
+    // TUI Mode: Return plan for TUI approval
+    if (ctx.tuiMode) {
+      return {
+        pendingHookGeneration: {
+          plan,
+          formattedPlan,
+        },
+      };
+    }
+
+    // Non-TUI: Use console and selectPrompt
+    console.log(formattedPlan);
+
+    const answer = await selectPrompt({
+      message: "What would you like to do?",
+      options: [
+        { label: "Generate", value: "generate", hint: "Generate the hook" },
+        { label: "Cancel", value: "cancel", hint: "Abort without generating" },
+      ],
+      useColors: ctx.useColors,
+      defaultIndex: 0,
+    });
+
+    if (answer === null || answer === "cancel") {
+      return { output: "(Cancelled)" };
+    }
+
+    const result = await executeHookGeneration(plan, genCtx);
+
+    if (!result.success) {
+      return { error: result.error || "Hook generation failed" };
+    }
+
+    const green = ctx.useColors ? GREEN : "";
+    const reset = ctx.useColors ? RESET : "";
+    return { output: `${green}${result.summary}${reset}` };
+  } catch (e: any) {
+    return { error: `Hook generation failed: ${e?.message || String(e)}` };
+  }
+}
+
+/**
+ * Execute a pending hook generation after TUI approval
+ */
+export async function executePendingHookGeneration(
+  plan: HookPlan,
+  ctx: CommandContext
+): Promise<CommandResult> {
+  const genCtx: GenContext = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
+    onEntityStart: ctx.onEntityStart,
+    onEntityComplete: ctx.onEntityComplete,
+  };
+
+  try {
+    const result = await executeHookGeneration(plan, genCtx);
+
+    if (!result.success) {
+      return { error: result.error || "Hook generation failed" };
+    }
+
+    const green = ctx.useColors ? GREEN : "";
+    const reset = ctx.useColors ? RESET : "";
+    return { output: `${green}${result.summary}${reset}` };
+  } catch (e: any) {
+    return { error: `Hook generation failed: ${e?.message || String(e)}` };
+  }
+}
+
+/**
+ * Run comprehensive burg generation with planning and approval
+ */
+async function runBurgGeneration(
+  hints: string,
+  ctx: CommandContext
+): Promise<CommandResult> {
+  const genCtx: GenContext = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
+    onEntityStart: ctx.onEntityStart,
+    onEntityComplete: ctx.onEntityComplete,
+  };
+
+  try {
+    const plan = await planBurgGeneration(hints, genCtx);
+    const formattedPlan = formatBurgPlanForApproval(plan, ctx.useColors);
+
+    // TUI Mode: Return plan for TUI approval
+    if (ctx.tuiMode) {
+      return {
+        pendingBurgGeneration: {
+          plan,
+          formattedPlan,
+        },
+      };
+    }
+
+    // Non-TUI: Use console and selectPrompt
+    console.log(formattedPlan);
+
+    const answer = await selectPrompt({
+      message: "What would you like to do?",
+      options: [
+        { label: "Create All", value: "create", hint: "Generate all planned entities" },
+        { label: "Cancel", value: "cancel", hint: "Abort without generating" },
+      ],
+      useColors: ctx.useColors,
+      defaultIndex: 0,
+    });
+
+    if (answer === null || answer === "cancel") {
+      return { output: "(Cancelled)" };
+    }
+
+    // Execute generation using the existing executeGeneration function
+    const result = await executeGeneration(plan, genCtx);
+    syncNavigationFromChatState(genCtx);
+
+    const green = ctx.useColors ? GREEN : "";
+    const reset = ctx.useColors ? RESET : "";
+    return { output: `${green}${result.summary}${reset}` };
+  } catch (e: any) {
+    return { error: `Burg generation failed: ${e?.message || String(e)}` };
+  }
+}
+
+/**
+ * Execute a pending burg generation after TUI approval
+ */
+export async function executePendingBurgGeneration(
+  plan: GenPlan,
+  ctx: CommandContext
+): Promise<CommandResult> {
+  const genCtx: GenContext = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
+    onEntityStart: ctx.onEntityStart,
+    onEntityComplete: ctx.onEntityComplete,
+  };
+
+  try {
+    const result = await executeGeneration(plan, genCtx);
+    syncNavigationFromChatState(genCtx);
+
+    const green = ctx.useColors ? GREEN : "";
+    const reset = ctx.useColors ? RESET : "";
+    return { output: `${green}${result.summary}${reset}` };
+  } catch (e: any) {
+    return { error: `Burg generation failed: ${e?.message || String(e)}` };
+  }
+}
+
 // Simple generation commands (legacy single-shot behavior)
 async function generateLocation(kind: string, hints: string, ctx: CommandContext): Promise<CommandResult> {
   const burgId = currentBurgId(ctx.state);
@@ -1386,14 +1764,19 @@ async function modifyEntity(args: string[], ctx: CommandContext): Promise<Comman
 
 // Ask question with context
 async function askQuestion(question: string, ctx: CommandContext): Promise<CommandResult> {
-  const current = getCurrentEntity(ctx.state, ctx.world, ctx.canon);
+  const ref = currentRef(ctx.state);
+  const entityContext = buildEntityContext(ref, ctx.world, ctx.canon);
 
-  const context = current ? `Current context: ${current.kind} "${current.entity?.name || "unknown"}"` : "";
+  if (!entityContext) {
+    return { error: "No entity selected. Navigate to an entity first." };
+  }
+
+  const systemPrompt = buildAskSystemPrompt(entityContext, ctx.campaignSettings);
 
   const result = await ctx.llm.complete({
-    system: `You are a helpful tabletop RPG assistant. Answer questions about the world and canon entities. ${context}`,
+    system: systemPrompt,
     messages: [{ role: "user", content: question }],
-    maxTokens: 500,
+    maxTokens: 1000,
     temperature: 0.7,
   });
 
@@ -1446,6 +1829,9 @@ function getCurrentEntityId(state: BrowseState): string | undefined {
   if (cur.kind === "location") return cur.locationId;
   if (cur.kind === "npc") return cur.npcId;
   if (cur.kind === "faction") return cur.factionId;
+  if (cur.kind === "event") return cur.eventId;
+  if (cur.kind === "rumor") return cur.rumorId;
+  if (cur.kind === "hook") return cur.hookId;
   return undefined;
 }
 
@@ -1815,6 +2201,8 @@ ${cyan}Listing${reset}
   ls npcs            NPCs at current location
   ls factions        Factions in context
   ls events          Active events affecting context
+  ls rumors          Rumors circulating in burg
+  ls hooks           Adventure hooks available in burg
 
 ${cyan}Information${reset}
   info               Show details of current entity
@@ -1823,9 +2211,12 @@ ${cyan}Information${reset}
   search <term>      Fuzzy search across world and canon
 
 ${cyan}Generation (LLM)${reset}
+  gen <theme>                   Comprehensive burg generation (factions, locations, NPCs, hooks, rumors)
   gen location <kind> [hints]   Smart generation with planning & approval
   gen npc [hints]               Smart NPC generation with connections
   gen faction <kind> [hints]    Smart faction generation with context
+  gen rumor <topic> [hints]     Generate rumor (truth/spread levels, linked entities)
+  gen hook <concept> [hints]    Generate adventure hook (type, urgency, difficulty)
   simplegen location <kind>     Quick generation (no planning step)
   simplegen npc [hints]         Quick NPC generation
   simplegen faction <kind>      Quick faction generation

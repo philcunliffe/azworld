@@ -90,6 +90,42 @@ export function renderModal(
       const editBuffer = modal.editBuffer ?? "";
       const editCursorPos = modal.editCursorPos ?? 0;
 
+      // Calculate how many lines each entity takes (for scrolling)
+      // Each entity: 1 header + 1 reason + N connections + 0-1 custom prompt + 0-1 separator
+      const entityLineStarts: number[] = [];  // Line index where each entity starts
+      let lineCount = 2;  // Start after header lines
+      for (let i = 0; i < entities.length; i++) {
+        entityLineStarts.push(lineCount);
+        const entity = entities[i];
+        const isSelected = i === selectedIdx;
+        lineCount += 2;  // Header + reason
+        if (entity.connectsTo) lineCount += entity.connectsTo.length;
+        if (isSelected || (entity.customPrompt && entity.customPrompt.length > 0)) lineCount += 1;
+        if (i < entities.length - 1) lineCount += 1;  // Separator
+      }
+
+      // Calculate scroll offset to keep selected entity visible
+      const headerLines = 2;
+      const availableForEntities = availableContentHeight - headerLines;
+      let entityScrollOffset = 0;
+      if (entityLineStarts.length > 0 && availableForEntities > 0) {
+        const selectedStart = entityLineStarts[selectedIdx] - headerLines;
+        // Calculate lines needed for selected entity
+        const selectedEnd = selectedIdx < entities.length - 1
+          ? entityLineStarts[selectedIdx + 1] - headerLines
+          : lineCount - headerLines;
+        const totalEntityLines = lineCount - headerLines;
+
+        if (totalEntityLines > availableForEntities) {
+          // Need scrolling - position so selected entity is visible
+          // Try to show selected entity near the top (1/4 down) with some context
+          const targetOffset = Math.max(0, selectedStart - Math.floor(availableForEntities / 4));
+          // But ensure we don't scroll past the end
+          const maxOffset = Math.max(0, totalEntityLines - availableForEntities);
+          entityScrollOffset = Math.min(targetOffset, maxOffset);
+        }
+      }
+
       for (let i = 0; i < entities.length; i++) {
         const entity = entities[i];
         const isSelected = i === selectedIdx;
@@ -257,15 +293,29 @@ export function renderModal(
         rightLines.push("");
       }
 
+      // Apply scroll offset to left panel
+      // Keep header lines (first 2), then slice entity content
+      const leftHeader = leftLines.slice(0, headerLines);
+      const leftContent = leftLines.slice(headerLines);
+      const visibleLeftContent = leftContent.slice(entityScrollOffset, entityScrollOffset + availableForEntities);
+      const scrolledLeftLines = [...leftHeader, ...visibleLeftContent];
+
       // Pad left panel if needed
-      while (leftLines.length < availableContentHeight) {
-        leftLines.push("");
+      while (scrolledLeftLines.length < availableContentHeight) {
+        scrolledLeftLines.push("");
+      }
+
+      // Add scroll indicator to header if scrolled
+      const totalEntityLines = leftContent.length;
+      if (totalEntityLines > availableForEntities) {
+        const scrollInfo = ` [${entityScrollOffset + 1}-${Math.min(entityScrollOffset + availableForEntities, totalEntityLines)}/${totalEntityLines}]`;
+        scrolledLeftLines[1] = `${DIM}${"─".repeat(Math.max(0, leftPanelWidth - 2 - scrollInfo.length))}${scrollInfo}${RESET}`;
       }
 
       // Combine panels horizontally
       for (let i = 0; i < availableContentHeight; i++) {
         // Truncate then pad to ensure lines fit within panel width
-        const leftTruncated = sliceByVisible(leftLines[i] || "", 0, leftPanelWidth);
+        const leftTruncated = sliceByVisible(scrolledLeftLines[i] || "", 0, leftPanelWidth);
         const rightTruncated = sliceByVisible(rightLines[i] || "", 0, rightPanelWidth);
         const leftLine = padRight(leftTruncated, leftPanelWidth);
         const rightLine = padRight(rightTruncated, rightPanelWidth);

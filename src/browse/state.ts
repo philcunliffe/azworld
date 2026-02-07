@@ -15,7 +15,10 @@ export type EntityRef =
   | { kind: "npc"; npcId: string }
   | { kind: "faction"; factionId: string }
   | { kind: "culture"; cultureId: number }
-  | { kind: "religion"; religionId: number };
+  | { kind: "religion"; religionId: number }
+  | { kind: "event"; eventId: string }
+  | { kind: "rumor"; rumorId: string }
+  | { kind: "hook"; hookId: string };
 
 export type BrowseState = {
   stack: EntityRef[];           // Navigation path (current path, root is world)
@@ -205,6 +208,18 @@ export function refToName(ref: EntityRef, world: AzgaarWorld, canon: CanonStore)
       const r = world.getReligion(ref.religionId);
       return r?.name || `religion:${ref.religionId}`;
     }
+    case "event": {
+      const e = canon.getEntity(ref.eventId);
+      return e?.name || ref.eventId;
+    }
+    case "rumor": {
+      const r = canon.getEntity(ref.rumorId);
+      return r?.name || ref.rumorId;
+    }
+    case "hook": {
+      const h = canon.getEntity(ref.hookId);
+      return h?.name || ref.hookId;
+    }
   }
 }
 
@@ -257,6 +272,18 @@ export function getCurrentEntity(
     case "religion": {
       const r = world.getReligion(cur.religionId);
       return r ? { kind: "religion", entity: r, id: cur.religionId } : undefined;
+    }
+    case "event": {
+      const e = canon.getEntity(cur.eventId);
+      return e ? { kind: "event", entity: e, id: cur.eventId } : undefined;
+    }
+    case "rumor": {
+      const r = canon.getEntity(cur.rumorId);
+      return r ? { kind: "rumor", entity: r, id: cur.rumorId } : undefined;
+    }
+    case "hook": {
+      const h = canon.getEntity(cur.hookId);
+      return h ? { kind: "hook", entity: h, id: cur.hookId } : undefined;
     }
   }
 }

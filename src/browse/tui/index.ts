@@ -480,13 +480,18 @@ export class TuiController {
 
     // Check if this is a gen command (but not simplegen) - show planning modal immediately
     const isGenCommand = /^gen\s+(location|npc|faction)/i.test(trimmed);
+    // Check if this is a burg gen command (gen followed by anything that's not a known subcommand)
+    // This matches: gen "theme", gen something, etc. when on a burg
+    const isBurgGenCommand = /^gen\s+/i.test(trimmed) &&
+      !/^gen\s+(location|npc|faction|rumor|hook|description)\b/i.test(trimmed);
     // Check if this is a mod command - show planning modal immediately
     const isModCommand = /^mod\s+/i.test(trimmed);
 
-    if (isGenCommand) {
+    if (isGenCommand || isBurgGenCommand) {
       // Reset token counts for new generation command
       this.dispatch({ type: "RESET_TOKEN_COUNTS" });
-      this.dispatch({ type: "SHOW_PLANNING_MODAL", title: "Creating Generation Plan" });
+      const planTitle = isBurgGenCommand ? "Creating Burg Generation Plan" : "Creating Generation Plan";
+      this.dispatch({ type: "SHOW_PLANNING_MODAL", title: planTitle });
       this.render();
     } else if (isModCommand) {
       // Reset token counts for new modification command
@@ -517,7 +522,7 @@ export class TuiController {
           }
         },
         // Track planner tokens during planning phase
-        onTokens: (isGenCommand || isModCommand) ? (usage) => {
+        onTokens: (isGenCommand || isBurgGenCommand || isModCommand) ? (usage) => {
           this.dispatch({ type: "ADD_PLANNER_TOKENS", usage });
           this.render();
         } : this.options.commandContext.onTokens,
@@ -533,7 +538,7 @@ export class TuiController {
 
       if (result.error) {
         // Show error in modal (only if we're still in modal mode, i.e., user didn't cancel)
-        if ((isGenCommand || isModCommand) && this.state.mode !== "modal") {
+        if ((isGenCommand || isBurgGenCommand || isModCommand) && this.state.mode !== "modal") {
           // User cancelled during planning, don't show error modal
         } else {
           this.dispatch({ type: "SHOW_MODAL", title: "Error" });
@@ -541,7 +546,7 @@ export class TuiController {
         }
       } else if (result.pendingGeneration) {
         // Show approval modal for gen command (only if we're still in modal mode, i.e., user didn't cancel)
-        if ((isGenCommand || isModCommand) && this.state.mode !== "modal") {
+        if ((isGenCommand || isBurgGenCommand || isModCommand) && this.state.mode !== "modal") {
           // User cancelled during planning, don't show approval modal
         } else {
           this.pendingPlan = result.pendingGeneration.plan;
@@ -604,6 +609,21 @@ export class TuiController {
             { label: "Cancel", value: "cancel", hint: "Abort without generating" },
           ],
           planText: planText || "(Plan text missing)",
+        });
+      } else if (result.pendingBurgGeneration) {
+        // Show approval modal for comprehensive burg generation
+        // This uses the same GenPlan flow as regular generation
+        this.pendingPlan = result.pendingBurgGeneration.plan;
+        const planText = result.pendingBurgGeneration.formattedPlan;
+        this.dispatch({
+          type: "SHOW_APPROVAL_MODAL",
+          title: "Burg Generation Plan",
+          choices: [
+            { label: "Create All", value: "create", hint: "Generate all planned entities" },
+            { label: "Cancel", value: "cancel", hint: "Abort without generating" },
+          ],
+          planText: planText || "(Plan text missing)",
+          entities: result.pendingBurgGeneration.plan.entities,
         });
       } else if (result.enterTalkMode) {
         // Enter talk mode with current NPC

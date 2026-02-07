@@ -27,6 +27,46 @@ export const EventPayloadSchema = z.object({
 export type EventPayload = z.infer<typeof EventPayloadSchema>;
 export type EventConsequence = z.infer<typeof EventConsequenceSchema>;
 
+// Rumor schemas
+export const RumorTruthLevelEnum = z.enum(["false", "distorted", "mostly-true", "true"]);
+export const RumorSpreadLevelEnum = z.enum(["whisper", "local", "regional", "widespread"]);
+export const RumorSourceTypeEnum = z.enum(["gossip", "observation", "leak", "planted", "unknown"]);
+
+export const RumorPayloadSchema = z.object({
+  truthLevel: RumorTruthLevelEnum,
+  spreadLevel: RumorSpreadLevelEnum,
+  sourceType: RumorSourceTypeEnum,
+  linkedEventId: z.string().optional(),
+  linkedNpcId: z.string().optional(),
+  actualTruth: z.string().optional(), // GM-only: what's really true
+});
+
+export type RumorPayload = z.infer<typeof RumorPayloadSchema>;
+
+// Hook (quest/adventure) schemas
+export const HookTypeEnum = z.enum([
+  "investigation", "rescue", "exploration", "negotiation",
+  "combat", "heist", "escort", "delivery", "mystery", "social"
+]);
+export const HookUrgencyEnum = z.enum(["background", "whenever", "soon", "urgent", "critical"]);
+export const HookDifficultyEnum = z.enum(["trivial", "easy", "moderate", "hard", "deadly"]);
+export const HookRewardTypeEnum = z.enum(["gold", "information", "favor", "item", "reputation", "mixed"]);
+
+export const HookPayloadSchema = z.object({
+  hookType: HookTypeEnum,
+  urgency: HookUrgencyEnum,
+  difficulty: HookDifficultyEnum,
+  rewardType: HookRewardTypeEnum,
+  rewardDetails: z.string().optional(),
+  linkedEventId: z.string().optional(),
+  linkedNpcId: z.string().optional(),
+  linkedFactionId: z.string().optional(),
+  complications: z.array(z.string()).optional(), // Potential twists
+  failureConsequences: z.string().optional(),
+});
+
+export type HookPayload = z.infer<typeof HookPayloadSchema>;
+
 // Reaction schemas for LLM-assisted reactions
 export const ReactionCategoryEnum = z.enum(["political", "economic", "social", "factional"]);
 export const ReactionIntensityEnum = z.enum(["subtle", "moderate", "dramatic"]);

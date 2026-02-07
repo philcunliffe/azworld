@@ -212,8 +212,8 @@ export function listEvents(canon: CanonStore, opts: { burgId?: number; stateId?:
   };
 }
 
-// List rumors and hooks
-export function listRumors(canon: CanonStore, burgId?: number): ListResult {
+// List rumors and hooks (combined)
+export function listRumorsAndHooks(canon: CanonStore, burgId?: number): ListResult {
   const rumors = canon.listEntities({
     type: "rumor",
     anchors: burgId !== undefined ? { burgId } : undefined,
@@ -233,10 +233,56 @@ export function listRumors(canon: CanonStore, burgId?: number): ListResult {
       kind: r.type,
       tags: r.tags,
       id: r.id,
+      extra: r.type === "rumor"
+        ? `${r.payload?.truthLevel || "?"} · ${r.payload?.spreadLevel || "local"}`
+        : `${r.payload?.hookType || "quest"} · ${r.payload?.urgency || "whenever"}`,
     })),
     context: "rumors & hooks",
   };
 }
+
+// List only rumors
+export function listRumorsOnly(canon: CanonStore, burgId?: number): ListResult {
+  const rumors = canon.listEntities({
+    type: "rumor",
+    anchors: burgId !== undefined ? { burgId } : undefined,
+    limit: 50,
+  });
+
+  return {
+    items: rumors.map(r => ({
+      name: r.name,
+      kind: `${r.payload?.truthLevel || "?"} truth`,
+      tags: [r.payload?.spreadLevel as string, r.payload?.sourceType as string].filter(Boolean),
+      id: r.id,
+      extra: r.summary?.slice(0, 50) || undefined,
+    })),
+    context: "rumors",
+  };
+}
+
+// List only hooks
+export function listHooksOnly(canon: CanonStore, burgId?: number): ListResult {
+  const hooks = canon.listEntities({
+    type: "hook",
+    anchors: burgId !== undefined ? { burgId } : undefined,
+    limit: 50,
+  });
+
+  return {
+    items: hooks.map(h => ({
+      name: h.name,
+      kind: h.payload?.hookType as string | undefined,
+      tags: [h.payload?.difficulty as string, h.payload?.urgency as string].filter(Boolean),
+      id: h.id,
+      extra: h.payload?.rewardType as string | undefined,
+    })),
+    context: "hooks",
+  };
+}
+
+// Alias for backward compatibility
+export const listRumors = listRumorsAndHooks;
 
 // Context-aware listing based on current navigation state
 export function listContextual(
@@ -271,7 +317,9 @@ export function listContextual(
         const stateId = typeof burg?.state === "number" ? burg.state : undefined;
         return listEvents(canon, { burgId: cur.burgId, stateId });
       }
-      if (filter === "rumors") return listRumors(canon, cur.burgId);
+      if (filter === "rumors") return listRumorsOnly(canon, cur.burgId);
+      if (filter === "hooks") return listHooksOnly(canon, cur.burgId);
+      if (filter === "rumors&hooks" || filter === "quests") return listRumorsAndHooks(canon, cur.burgId);
       return listLocations(canon, world, { burgId: cur.burgId, kind: filter });
 
     case "location":

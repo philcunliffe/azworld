@@ -83,6 +83,8 @@ export { npcTemplate } from "./npc";
 export { factionTemplate } from "./faction";
 export { locationTemplate } from "./location";
 export { eventTemplate } from "./event";
+export { rumorTemplate } from "./rumor";
+export { hookTemplate } from "./hook";
 
 /**
  * Get the appropriate template for an entity type
@@ -97,6 +99,10 @@ export function getTemplate(type: string): EntityTemplate {
       return require("./location").locationTemplate;
     case "event":
       return require("./event").eventTemplate;
+    case "rumor":
+      return require("./rumor").rumorTemplate;
+    case "hook":
+      return require("./hook").hookTemplate;
     default:
       return defaultTemplate;
   }

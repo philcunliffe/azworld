@@ -74,6 +74,8 @@ export const ENTITY_COLORS: Record<EntityKind, string> = {
   npc: FG_YELLOW,
   faction: FG_MAGENTA,
   event: FG_RED,
+  rumor: FG_BLUE,    // Rumors are information-related
+  hook: FG_ORANGE,   // Hooks are action-oriented quest seeds
   culture: FG_ORANGE,
   religion: FG_CYAN,
 };

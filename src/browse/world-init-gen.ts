@@ -1594,7 +1594,9 @@ export async function executePhasedWorldGeneration(
 // --- Phase-Specific Planning and Execution ---
 
 /**
- * Get religion IDs that are dominant in the specified states
+ * Get religion IDs that are relevant to the specified states.
+ * First tries to find dominant religions from cell data.
+ * Falls back to religions associated with each state's culture if no dominant religion is found.
  */
 function getReligionsForStates(world: AzgaarWorld, stateIds: number[]): Set<number> {
   const religionIds = new Set<number>();
@@ -1602,6 +1604,17 @@ function getReligionsForStates(world: AzgaarWorld, stateIds: number[]): Set<numb
     const dominantReligion = world.getStateDominantReligion(stateId);
     if (dominantReligion) {
       religionIds.add(dominantReligion.id);
+    } else {
+      // Fallback: use religions associated with the state's culture
+      const sc = world.getStateContext(stateId);
+      if (sc?.culture?.id !== undefined) {
+        const cultureCtx = world.getCultureContext(sc.culture.id);
+        if (cultureCtx?.religions) {
+          for (const rel of cultureCtx.religions) {
+            religionIds.add(rel.id);
+          }
+        }
+      }
     }
   }
   return religionIds;

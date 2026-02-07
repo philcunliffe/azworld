@@ -41,6 +41,14 @@ export const ENTITY_FIELD_CONFIGS: Record<string, { core: string[]; payload: str
     core: ["name", "summary", "details_md", "tags"],
     payload: ["scope", "severity", "daysAgo"],
   },
+  rumor: {
+    core: ["name", "summary", "details_md", "tags"],
+    payload: ["truthLevel", "spreadLevel", "sourceType", "actualTruth"],
+  },
+  hook: {
+    core: ["name", "summary", "details_md", "tags"],
+    payload: ["hookType", "urgency", "difficulty", "rewardType", "rewardDetails", "complications", "failureConsequences"],
+  },
   meta: {
     core: ["summary", "details_md"],
     // Combined fields for both state and burg descriptions
@@ -607,7 +615,10 @@ For NPCs, payload MUST include ALL of these structured fields:
 IMPORTANT for NPCs: Put ALL descriptive content in the payload fields above. The "details_md" field should be empty or minimal - do NOT duplicate background/personality/appearance there.
 
 For locations, payload should include: kind, briefDescription (3-5 sentences for quick reference), physicalDescription (detailed sensory description - sights, sounds, smells, layout, lighting, notable features), atmosphere, features
-For factions, payload should include: kind, goals, methods, influence`;
+For factions, payload should include: kind, goals, methods, influence
+For rumors, payload should include: truthLevel (false/distorted/mostly-true/true), spreadLevel (whisper/local/regional/widespread), sourceType (gossip/observation/leak/planted/unknown), actualTruth (GM-only information)
+For hooks, payload should include: hookType (investigation/rescue/exploration/negotiation/combat/heist/escort/delivery/mystery/social), urgency (background/whenever/soon/urgent/critical), difficulty (trivial/easy/moderate/hard/deadly), rewardType (gold/information/favor/item/reputation/mixed), rewardDetails, complications (array), failureConsequences
+For events, payload should include: scope (local/city/regional), severity (minor/moderate/major/critical), daysAgo (how many days ago it happened, 0 for ongoing)`;
 
     const userPrompt = JSON.stringify({
       type: entityPlan.type,
@@ -1901,4 +1912,817 @@ export function planDescriptionFieldRegeneration(
       },
     },
   };
+}
+
+// =============================================================================
+// RUMOR GENERATION
+// =============================================================================
+
+export type RumorPlan = {
+  topic: string;
+  truthLevel: "false" | "distorted" | "mostly-true" | "true";
+  spreadLevel: "whisper" | "local" | "regional" | "widespread";
+  sourceType: "gossip" | "observation" | "leak" | "planted" | "unknown";
+  burgId: number;
+  burgName: string;
+  linkedEventId?: string;
+  linkedEventName?: string;
+  linkedNpcId?: string;
+  linkedNpcName?: string;
+  hints?: string;
+};
+
+/**
+ * Plan rumor generation based on context
+ */
+export function planRumorGeneration(
+  topic: string,
+  hints: string,
+  ctx: GenContext
+): RumorPlan {
+  const burgId = currentBurgId(ctx.state);
+  if (burgId === undefined) {
+    throw new Error("Navigate to a burg first to generate rumors");
+  }
+
+  const burg = ctx.world.getBurg(burgId);
+  if (!burg) {
+    throw new Error(`Burg ${burgId} not found`);
+  }
+
+  // Parse hints for truth/spread/source
+  const hintsLower = hints.toLowerCase();
+  let truthLevel: RumorPlan["truthLevel"] = "distorted";
+  let spreadLevel: RumorPlan["spreadLevel"] = "local";
+  let sourceType: RumorPlan["sourceType"] = "gossip";
+
+  if (hintsLower.includes("true") || hintsLower.includes("accurate")) truthLevel = "true";
+  else if (hintsLower.includes("mostly true")) truthLevel = "mostly-true";
+  else if (hintsLower.includes("false") || hintsLower.includes("lie")) truthLevel = "false";
+
+  if (hintsLower.includes("widespread") || hintsLower.includes("everywhere")) spreadLevel = "widespread";
+  else if (hintsLower.includes("regional") || hintsLower.includes("state")) spreadLevel = "regional";
+  else if (hintsLower.includes("whisper") || hintsLower.includes("secret")) spreadLevel = "whisper";
+
+  if (hintsLower.includes("planted") || hintsLower.includes("deliberate")) sourceType = "planted";
+  else if (hintsLower.includes("leak")) sourceType = "leak";
+  else if (hintsLower.includes("observation") || hintsLower.includes("witness")) sourceType = "observation";
+
+  return {
+    topic: topic || "local gossip",
+    truthLevel,
+    spreadLevel,
+    sourceType,
+    burgId,
+    burgName: burg.name,
+    hints: hints || undefined,
+  };
+}
+
+/**
+ * Execute rumor generation
+ */
+export async function executeRumorGeneration(
+  plan: RumorPlan,
+  ctx: GenContext
+): Promise<{ success: boolean; rumorId?: string; rumorName?: string; summary: string; error?: string }> {
+  const genLlm = ctx.generationLlm || ctx.llm;
+  const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+  const nowIso = () => new Date().toISOString();
+
+  const systemPrompt = `You are a tabletop GM assistant. Generate a rumor for a fantasy city.
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
+A rumor is something people are saying - it may be true, distorted, or completely false.
+The "actualTruth" field is GM-only information about what's really going on.
+
+Output ONLY valid JSON with:
+{
+  "name": "The rumor as people say it (e.g., 'They say the baron poisoned his wife')",
+  "summary": "1-2 sentences of what people claim",
+  "details_md": "Fuller version with variations and where you might hear it",
+  "tags": ["relevant", "tags"],
+  "actualTruth": "GM-only: what's really true behind this rumor"
+}`;
+
+  const userPrompt = JSON.stringify({
+    topic: plan.topic,
+    truthLevel: plan.truthLevel,
+    spreadLevel: plan.spreadLevel,
+    sourceType: plan.sourceType,
+    burg: { id: plan.burgId, name: plan.burgName },
+    linkedEvent: plan.linkedEventName ? { id: plan.linkedEventId, name: plan.linkedEventName } : null,
+    linkedNpc: plan.linkedNpcName ? { id: plan.linkedNpcId, name: plan.linkedNpcName } : null,
+    hints: plan.hints || null,
+  });
+
+  try {
+    ctx.onEntityStart?.("Rumor", 0, 1);
+    const startTime = Date.now();
+
+    const { data: result, usage } = await completeJsonWithUsage(genLlm, {
+      system: systemPrompt,
+      messages: [{ role: "user", content: userPrompt }],
+      maxTokens: 1500,
+      temperature: 0.8,
+    }) as { data: any; usage?: TokenUsage };
+
+    const elapsedMs = Date.now() - startTime;
+
+    if (usage && ctx.onTokens) {
+      ctx.onTokens(usage);
+    }
+
+    const rumorEntity = ctx.canon.addEntity({
+      type: "rumor",
+      name: result.name || `Rumor about ${plan.topic}`,
+      summary: result.summary || null,
+      details_md: result.details_md || null,
+      tags: result.tags || [plan.sourceType, plan.spreadLevel],
+      anchors: {
+        burgId: plan.burgId,
+        linkedEventId: plan.linkedEventId,
+        linkedNpcId: plan.linkedNpcId,
+      },
+      payload: {
+        truthLevel: plan.truthLevel,
+        spreadLevel: plan.spreadLevel,
+        sourceType: plan.sourceType,
+        actualTruth: result.actualTruth,
+      },
+      provenance: {
+        generated_by: "azbrowse",
+        provider: genLlm.provider,
+        model: genLlm.model,
+        reason: `User requested rumor about: ${plan.topic}`,
+        user_prompt: plan.hints || undefined,
+        approved_at: nowIso(),
+      },
+    });
+
+    // Create relations to linked entities
+    if (plan.linkedEventId) {
+      ctx.canon.addRelation({
+        from_id: rumorEntity.id,
+        to_id: plan.linkedEventId,
+        rel_type: "about",
+      });
+    }
+    if (plan.linkedNpcId) {
+      ctx.canon.addRelation({
+        from_id: rumorEntity.id,
+        to_id: plan.linkedNpcId,
+        rel_type: "spread_by",
+      });
+    }
+
+    const tokens = (usage?.promptTokens || 0) + (usage?.completionTokens || 0);
+    ctx.onEntityComplete?.(
+      { id: rumorEntity.id, name: rumorEntity.name, type: "rumor" },
+      0, 1, tokens, elapsedMs
+    );
+
+    return {
+      success: true,
+      rumorId: rumorEntity.id,
+      rumorName: rumorEntity.name,
+      summary: `Created rumor: ${rumorEntity.name}`,
+    };
+  } catch (e: any) {
+    return {
+      success: false,
+      summary: `Failed to generate rumor: ${e?.message || String(e)}`,
+      error: e?.message || String(e),
+    };
+  }
+}
+
+/**
+ * Format a rumor plan for user approval display
+ */
+export function formatRumorPlanForApproval(plan: RumorPlan, useColors?: boolean): string {
+  const BOLD = useColors ? "\x1b[1m" : "";
+  const DIM = useColors ? "\x1b[2m" : "";
+  const CYAN = useColors ? "\x1b[36m" : "";
+  const GREEN = useColors ? "\x1b[32m" : "";
+  const YELLOW = useColors ? "\x1b[33m" : "";
+  const RESET = useColors ? "\x1b[0m" : "";
+
+  const lines: string[] = [];
+
+  lines.push(`${BOLD}${CYAN}Rumor Generation Plan${RESET}`);
+  lines.push("");
+  lines.push(`${BOLD}Topic:${RESET} ${GREEN}${plan.topic}${RESET}`);
+  lines.push(`${BOLD}Location:${RESET} ${plan.burgName}`);
+  lines.push("");
+  lines.push(`${BOLD}Properties:${RESET}`);
+  lines.push(`  Truth Level: ${YELLOW}${plan.truthLevel}${RESET}`);
+  lines.push(`  Spread: ${YELLOW}${plan.spreadLevel}${RESET}`);
+  lines.push(`  Source: ${YELLOW}${plan.sourceType}${RESET}`);
+
+  if (plan.linkedEventName) {
+    lines.push(`  Linked Event: ${plan.linkedEventName}`);
+  }
+  if (plan.linkedNpcName) {
+    lines.push(`  Linked NPC: ${plan.linkedNpcName}`);
+  }
+  if (plan.hints) {
+    lines.push("");
+    lines.push(`${DIM}Hints: ${plan.hints}${RESET}`);
+  }
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+// =============================================================================
+// HOOK GENERATION
+// =============================================================================
+
+export type HookPlan = {
+  concept: string;
+  hookType: "investigation" | "rescue" | "exploration" | "negotiation" | "combat" | "heist" | "escort" | "delivery" | "mystery" | "social";
+  urgency: "background" | "whenever" | "soon" | "urgent" | "critical";
+  difficulty: "trivial" | "easy" | "moderate" | "hard" | "deadly";
+  rewardType: "gold" | "information" | "favor" | "item" | "reputation" | "mixed";
+  burgId: number;
+  burgName: string;
+  linkedEventId?: string;
+  linkedEventName?: string;
+  linkedNpcId?: string;
+  linkedNpcName?: string;
+  linkedFactionId?: string;
+  linkedFactionName?: string;
+  hints?: string;
+};
+
+/**
+ * Plan hook generation based on context
+ */
+export function planHookGeneration(
+  concept: string,
+  hints: string,
+  ctx: GenContext
+): HookPlan {
+  const burgId = currentBurgId(ctx.state);
+  if (burgId === undefined) {
+    throw new Error("Navigate to a burg first to generate hooks");
+  }
+
+  const burg = ctx.world.getBurg(burgId);
+  if (!burg) {
+    throw new Error(`Burg ${burgId} not found`);
+  }
+
+  // Parse hints for type/urgency/difficulty/reward
+  const hintsLower = hints.toLowerCase();
+  let hookType: HookPlan["hookType"] = "mystery";
+  let urgency: HookPlan["urgency"] = "whenever";
+  let difficulty: HookPlan["difficulty"] = "moderate";
+  let rewardType: HookPlan["rewardType"] = "mixed";
+
+  // Hook type detection
+  if (hintsLower.includes("investigate") || hintsLower.includes("investigation")) hookType = "investigation";
+  else if (hintsLower.includes("rescue") || hintsLower.includes("save")) hookType = "rescue";
+  else if (hintsLower.includes("explore") || hintsLower.includes("exploration")) hookType = "exploration";
+  else if (hintsLower.includes("negotiate") || hintsLower.includes("diplomacy")) hookType = "negotiation";
+  else if (hintsLower.includes("combat") || hintsLower.includes("fight") || hintsLower.includes("kill")) hookType = "combat";
+  else if (hintsLower.includes("heist") || hintsLower.includes("steal") || hintsLower.includes("theft")) hookType = "heist";
+  else if (hintsLower.includes("escort") || hintsLower.includes("protect")) hookType = "escort";
+  else if (hintsLower.includes("deliver") || hintsLower.includes("delivery")) hookType = "delivery";
+  else if (hintsLower.includes("social") || hintsLower.includes("party") || hintsLower.includes("gala")) hookType = "social";
+
+  // Urgency detection
+  if (hintsLower.includes("critical") || hintsLower.includes("emergency")) urgency = "critical";
+  else if (hintsLower.includes("urgent") || hintsLower.includes("hurry")) urgency = "urgent";
+  else if (hintsLower.includes("soon")) urgency = "soon";
+  else if (hintsLower.includes("background") || hintsLower.includes("no rush")) urgency = "background";
+
+  // Difficulty detection
+  if (hintsLower.includes("deadly") || hintsLower.includes("impossible")) difficulty = "deadly";
+  else if (hintsLower.includes("hard") || hintsLower.includes("difficult")) difficulty = "hard";
+  else if (hintsLower.includes("easy") || hintsLower.includes("simple")) difficulty = "easy";
+  else if (hintsLower.includes("trivial")) difficulty = "trivial";
+
+  // Reward detection
+  if (hintsLower.includes("gold") || hintsLower.includes("money") || hintsLower.includes("pay")) rewardType = "gold";
+  else if (hintsLower.includes("information") || hintsLower.includes("secret") || hintsLower.includes("knowledge")) rewardType = "information";
+  else if (hintsLower.includes("favor") || hintsLower.includes("alliance")) rewardType = "favor";
+  else if (hintsLower.includes("item") || hintsLower.includes("artifact") || hintsLower.includes("weapon")) rewardType = "item";
+  else if (hintsLower.includes("reputation") || hintsLower.includes("fame")) rewardType = "reputation";
+
+  return {
+    concept: concept || "adventure opportunity",
+    hookType,
+    urgency,
+    difficulty,
+    rewardType,
+    burgId,
+    burgName: burg.name,
+    hints: hints || undefined,
+  };
+}
+
+/**
+ * Execute hook generation
+ */
+export async function executeHookGeneration(
+  plan: HookPlan,
+  ctx: GenContext
+): Promise<{ success: boolean; hookId?: string; hookName?: string; summary: string; error?: string }> {
+  const genLlm = ctx.generationLlm || ctx.llm;
+  const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+  const nowIso = () => new Date().toISOString();
+
+  const systemPrompt = `You are a tabletop GM assistant. Generate an adventure hook for a fantasy TTRPG.
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
+A hook is a potential quest, job, or adventure that players might pursue.
+
+Output ONLY valid JSON with:
+{
+  "name": "Catchy hook title (e.g., 'The Merchant's Missing Daughter')",
+  "summary": "1-2 sentence player-facing pitch",
+  "details_md": "Full GM setup - what's really going on, key NPCs, locations involved",
+  "tags": ["relevant", "tags"],
+  "rewardDetails": "Specific reward details if applicable",
+  "complications": ["2-3 potential twists or complications"],
+  "failureConsequences": "What happens if players ignore or fail this hook"
+}`;
+
+  const userPrompt = JSON.stringify({
+    concept: plan.concept,
+    hookType: plan.hookType,
+    urgency: plan.urgency,
+    difficulty: plan.difficulty,
+    rewardType: plan.rewardType,
+    burg: { id: plan.burgId, name: plan.burgName },
+    linkedEvent: plan.linkedEventName ? { id: plan.linkedEventId, name: plan.linkedEventName } : null,
+    linkedNpc: plan.linkedNpcName ? { id: plan.linkedNpcId, name: plan.linkedNpcName } : null,
+    linkedFaction: plan.linkedFactionName ? { id: plan.linkedFactionId, name: plan.linkedFactionName } : null,
+    hints: plan.hints || null,
+  });
+
+  try {
+    ctx.onEntityStart?.("Hook", 0, 1);
+    const startTime = Date.now();
+
+    const { data: result, usage } = await completeJsonWithUsage(genLlm, {
+      system: systemPrompt,
+      messages: [{ role: "user", content: userPrompt }],
+      maxTokens: 2000,
+      temperature: 0.8,
+    }) as { data: any; usage?: TokenUsage };
+
+    const elapsedMs = Date.now() - startTime;
+
+    if (usage && ctx.onTokens) {
+      ctx.onTokens(usage);
+    }
+
+    const hookEntity = ctx.canon.addEntity({
+      type: "hook",
+      name: result.name || `Hook: ${plan.concept}`,
+      summary: result.summary || null,
+      details_md: result.details_md || null,
+      tags: result.tags || [plan.hookType, plan.urgency],
+      anchors: {
+        burgId: plan.burgId,
+        linkedEventId: plan.linkedEventId,
+        linkedNpcId: plan.linkedNpcId,
+        linkedFactionId: plan.linkedFactionId,
+      },
+      payload: {
+        hookType: plan.hookType,
+        urgency: plan.urgency,
+        difficulty: plan.difficulty,
+        rewardType: plan.rewardType,
+        rewardDetails: result.rewardDetails,
+        complications: result.complications,
+        failureConsequences: result.failureConsequences,
+      },
+      provenance: {
+        generated_by: "azbrowse",
+        provider: genLlm.provider,
+        model: genLlm.model,
+        reason: `User requested hook: ${plan.concept}`,
+        user_prompt: plan.hints || undefined,
+        approved_at: nowIso(),
+      },
+    });
+
+    // Create relations to linked entities
+    if (plan.linkedEventId) {
+      ctx.canon.addRelation({
+        from_id: hookEntity.id,
+        to_id: plan.linkedEventId,
+        rel_type: "caused_by",
+      });
+    }
+    if (plan.linkedNpcId) {
+      ctx.canon.addRelation({
+        from_id: hookEntity.id,
+        to_id: plan.linkedNpcId,
+        rel_type: "offered_by",
+      });
+    }
+    if (plan.linkedFactionId) {
+      ctx.canon.addRelation({
+        from_id: hookEntity.id,
+        to_id: plan.linkedFactionId,
+        rel_type: "involves",
+      });
+    }
+
+    const tokens = (usage?.promptTokens || 0) + (usage?.completionTokens || 0);
+    ctx.onEntityComplete?.(
+      { id: hookEntity.id, name: hookEntity.name, type: "hook" },
+      0, 1, tokens, elapsedMs
+    );
+
+    return {
+      success: true,
+      hookId: hookEntity.id,
+      hookName: hookEntity.name,
+      summary: `Created hook: ${hookEntity.name}`,
+    };
+  } catch (e: any) {
+    return {
+      success: false,
+      summary: `Failed to generate hook: ${e?.message || String(e)}`,
+      error: e?.message || String(e),
+    };
+  }
+}
+
+/**
+ * Format a hook plan for user approval display
+ */
+export function formatHookPlanForApproval(plan: HookPlan, useColors?: boolean): string {
+  const BOLD = useColors ? "\x1b[1m" : "";
+  const DIM = useColors ? "\x1b[2m" : "";
+  const CYAN = useColors ? "\x1b[36m" : "";
+  const GREEN = useColors ? "\x1b[32m" : "";
+  const YELLOW = useColors ? "\x1b[33m" : "";
+  const RESET = useColors ? "\x1b[0m" : "";
+
+  const lines: string[] = [];
+
+  lines.push(`${BOLD}${CYAN}Hook Generation Plan${RESET}`);
+  lines.push("");
+  lines.push(`${BOLD}Concept:${RESET} ${GREEN}${plan.concept}${RESET}`);
+  lines.push(`${BOLD}Location:${RESET} ${plan.burgName}`);
+  lines.push("");
+  lines.push(`${BOLD}Properties:${RESET}`);
+  lines.push(`  Type: ${YELLOW}${plan.hookType}${RESET}`);
+  lines.push(`  Urgency: ${YELLOW}${plan.urgency}${RESET}`);
+  lines.push(`  Difficulty: ${YELLOW}${plan.difficulty}${RESET}`);
+  lines.push(`  Reward: ${YELLOW}${plan.rewardType}${RESET}`);
+
+  if (plan.linkedEventName) {
+    lines.push(`  Linked Event: ${plan.linkedEventName}`);
+  }
+  if (plan.linkedNpcName) {
+    lines.push(`  Quest Giver: ${plan.linkedNpcName}`);
+  }
+  if (plan.linkedFactionName) {
+    lines.push(`  Faction: ${plan.linkedFactionName}`);
+  }
+  if (plan.hints) {
+    lines.push("");
+    lines.push(`${DIM}Hints: ${plan.hints}${RESET}`);
+  }
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+// =============================================================================
+// COMPREHENSIVE BURG GENERATION
+// =============================================================================
+
+/**
+ * Plan comprehensive generation for a burg based on a user hint/theme.
+ * Creates interconnected factions, locations, NPCs, rumors, hooks, and events.
+ */
+export async function planBurgGeneration(
+  prompt: string,
+  ctx: GenContext
+): Promise<GenPlan> {
+  const burgId = currentBurgId(ctx.state);
+  if (burgId === undefined) {
+    throw new Error("Navigate to a burg first (use: loc <burg name>)");
+  }
+
+  const burg = ctx.world.getBurg(burgId);
+  if (!burg) {
+    throw new Error(`Burg ${burgId} not found`);
+  }
+
+  const state = typeof burg.state === "number" ? ctx.world.getState(burg.state) : undefined;
+  const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+
+  // Get culture details if generated
+  let cultureDetails: { name: string; summary?: string; traits?: string[]; values?: string[] } | undefined;
+  if (typeof burg.culture === "number") {
+    const cultureEntities = ctx.canon.listEntities({
+      type: "culture",
+      anchors: { cultureId: burg.culture },
+      limit: 1,
+    });
+    if (cultureEntities.length > 0) {
+      const ce = cultureEntities[0];
+      cultureDetails = {
+        name: ce.name,
+        summary: ce.summary || undefined,
+        traits: ce.payload?.traits as string[] | undefined,
+        values: ce.payload?.values as string[] | undefined,
+      };
+    } else {
+      const culture = ctx.world.getCulture(burg.culture);
+      if (culture) {
+        cultureDetails = { name: culture.name };
+      }
+    }
+  }
+
+  // Get religion details from cell
+  let religionDetails: { name: string; summary?: string; deity?: string; beliefs?: string[] } | undefined;
+  const cell = typeof burg.cell === "number" ? ctx.world.getCell(burg.cell) : undefined;
+  if (cell?.religionId !== undefined) {
+    const religionEntities = ctx.canon.listEntities({
+      type: "religion",
+      limit: 100,
+    }).filter(e => e.anchors?.azgaarReligionId === cell.religionId);
+    if (religionEntities.length > 0) {
+      const re = religionEntities[0];
+      religionDetails = {
+        name: re.name,
+        summary: re.summary || undefined,
+        deity: re.payload?.deity as string | undefined,
+        beliefs: (re.payload?.beliefs as string[] | undefined)?.slice(0, 3),
+      };
+    } else {
+      const religion = ctx.world.getReligion(cell.religionId);
+      if (religion) {
+        religionDetails = { name: religion.name };
+      }
+    }
+  }
+
+  // Build burg traits
+  const burgTraits: string[] = [];
+  if (burg.capital) burgTraits.push("Capital");
+  if (burg.port) burgTraits.push("Port");
+
+  // Build culture/religion context strings
+  let cultureContext = "";
+  if (cultureDetails) {
+    cultureContext = `\nCULTURE: ${cultureDetails.name}`;
+    if (cultureDetails.summary) cultureContext += `\n  Summary: ${cultureDetails.summary}`;
+    if (cultureDetails.traits?.length) cultureContext += `\n  Traits: ${cultureDetails.traits.join(", ")}`;
+    if (cultureDetails.values?.length) cultureContext += `\n  Values: ${cultureDetails.values.join(", ")}`;
+  }
+
+  let religionContext = "";
+  if (religionDetails) {
+    religionContext = `\nRELIGION: ${religionDetails.name}`;
+    if (religionDetails.summary) religionContext += `\n  Summary: ${religionDetails.summary}`;
+    if (religionDetails.deity) religionContext += `\n  Deity: ${religionDetails.deity}`;
+    if (religionDetails.beliefs?.length) religionContext += `\n  Beliefs: ${religionDetails.beliefs.join(", ")}`;
+  }
+
+  const systemPrompt = `You are planning comprehensive content generation for a burg (city/town) in a fantasy TTRPG world.
+
+USER THEME/HINT: "${prompt}"
+
+BURG CONTEXT:
+- Name: ${burg.name}${state ? `, State: ${state.name}` : ""}
+- Population: ${burg.population ?? burg.pop ?? "unknown"}
+${burgTraits.length > 0 ? `- Traits: ${burgTraits.join(", ")}` : ""}
+${cultureContext}
+${religionContext}
+
+${campaignContext ? `CAMPAIGN SETTINGS:\n${campaignContext}\n` : ""}
+INSTRUCTIONS:
+1. Use canon_query to find existing entities in this burg (avoid duplicates and find connection opportunities)
+2. Use canon_getActiveEvents to understand current situation
+3. Use world_getBurgDetails for additional burg context
+4. Plan entities that weave together the user's theme/hint with the burg's character
+
+TARGET ENTITY MIX (adjust based on theme complexity):
+- Factions: 1-2 (central to the theme + optional opposing/allied faction)
+- Locations: 2-4 (primary faction base + public locations with hooks)
+- NPCs: 4-8 (faction members, townsfolk, allies/informants)
+- Rumors: 2-4 (mix of truth levels, link to events/NPCs)
+- Hooks: 1-3 (investigation, rescue, faction quests)
+- Events: 0-1 (if relevant - disappearances, rituals, etc)
+
+CONNECTION REQUIREMENTS:
+- Every NPC should have a location (connectsTo with rel "located_at")
+- Faction NPCs should have faction membership (connectsTo with rel "member_of" or "leads")
+- Rumors should reference events or NPCs (connectsTo with rel "about")
+- Hooks should involve factions/events (connectsTo with rel "involves" or "caused_by")
+- New entities connecting to other new entities should have isNew: true
+- Entities connecting to existing entities should have isExisting: true
+
+ENTITY TYPES AND KINDS:
+- location: tavern, temple, market, hideout, mansion, warehouse, guild hall, shrine, etc.
+- npc: (no kind needed)
+- faction: guild, cult, gang, order, council, family, etc.
+- rumor: (kind determined by truthLevel/spreadLevel in payload)
+- hook: investigation, rescue, exploration, negotiation, combat, heist, escort, delivery, mystery, social
+- event: (scope: local/city/regional, severity: minor/moderate/major/critical)
+
+Call submit_plan with all planned entities when ready.`;
+
+  const userMessage = `Theme: ${prompt}
+
+Current burg: ${burg.name} (ID: ${burgId})${state ? `, State: ${state.name}` : ""}
+
+Start by querying for existing entities in this burg, then check active events, then submit your comprehensive plan.`;
+
+  const llm = ctx.llm;
+  const messages: ChatMessage[] = [{ role: "user", content: userMessage }];
+
+  // Run the planning agent loop
+  let plan: GenPlan | null = null;
+  let iterations = 0;
+  const maxIterations = 6;
+
+  while (!plan && iterations < maxIterations) {
+    iterations++;
+
+    const result = await llm.complete({
+      system: systemPrompt,
+      messages,
+      tools: PLANNING_TOOLS,
+      toolChoice: iterations === maxIterations ? "required" : "auto",
+      maxTokens: 4000,
+      temperature: 0.4,
+    });
+
+    // Report token usage
+    if (result.usage && ctx.onTokens) {
+      ctx.onTokens(result.usage);
+    }
+
+    // If no tool calls, the agent is done
+    if (!result.toolCalls?.length) {
+      if (result.text) {
+        messages.push({ role: "assistant", content: result.text });
+      }
+      break;
+    }
+
+    // Process tool calls
+    const assistantMessage: ChatMessage = {
+      role: "assistant",
+      content: result.text || "",
+      toolCalls: result.toolCalls,
+    };
+    messages.push(assistantMessage);
+
+    for (const tc of result.toolCalls) {
+      if (ctx.onToolCall) ctx.onToolCall(tc.name, tc.arguments);
+      const startTime = Date.now();
+
+      const toolResult = await executePlanningTool(tc.name, tc.arguments, ctx);
+
+      if (ctx.onToolResult) {
+        ctx.onToolResult(tc.name, toolResult, Date.now() - startTime);
+      }
+
+      // Check if this is the plan submission
+      if (toolResult?._isPlan) {
+        // Check for parse errors
+        if (toolResult.entities.length === 0 && toolResult.parseError) {
+          throw new Error(`LLM produced invalid JSON in plan: ${toolResult.parseError}`);
+        }
+
+        const activeEvents = ctx.canon.getActiveEvents({ burgId, recencyDays: 90 });
+        const existingEntities = ctx.canon.listEntities({
+          anchors: { burgId },
+          limit: 50,
+        });
+
+        plan = {
+          description: toolResult.description,
+          userPrompt: prompt,
+          entities: toolResult.entities,
+          context: {
+            burgId,
+            burgName: burg.name,
+            stateName: state?.name,
+            activeEvents: activeEvents.map((e: CanonEntity) => e.name),
+            existingEntities: existingEntities.map((e: CanonEntity) => `${e.name} (${e.type})`),
+          },
+        };
+        break;
+      }
+
+      // Add tool result to messages
+      messages.push({
+        role: "tool",
+        content: JSON.stringify(toolResult),
+        toolCallId: tc.id,
+      });
+    }
+  }
+
+  if (!plan) {
+    // Fallback: create a minimal plan
+    plan = {
+      description: `Generate content for ${burg.name} based on theme: ${prompt}`,
+      userPrompt: prompt,
+      entities: [{
+        type: "location",
+        name: "New Location",
+        kind: "tavern",
+        reason: `User requested: ${prompt}`,
+        connectsTo: [],
+      }],
+      context: {
+        burgId,
+        burgName: burg.name,
+        stateName: state?.name,
+        activeEvents: [],
+        existingEntities: [],
+      },
+    };
+  }
+
+  return plan;
+}
+
+/**
+ * Format a burg generation plan for user approval display.
+ * Groups entities by type for clear overview.
+ */
+export function formatBurgPlanForApproval(plan: GenPlan, useColors?: boolean): string {
+  const BOLD = useColors ? "\x1b[1m" : "";
+  const DIM = useColors ? "\x1b[2m" : "";
+  const CYAN = useColors ? "\x1b[36m" : "";
+  const GREEN = useColors ? "\x1b[32m" : "";
+  const YELLOW = useColors ? "\x1b[33m" : "";
+  const MAGENTA = useColors ? "\x1b[35m" : "";
+  const RESET = useColors ? "\x1b[0m" : "";
+
+  const lines: string[] = [];
+
+  // Header
+  lines.push(`${BOLD}${CYAN}=== Burg Generation Plan ===${RESET}`);
+  lines.push(`${DIM}Theme: ${plan.userPrompt}${RESET}`);
+  lines.push(`${DIM}Location: ${plan.context.burgName}${plan.context.stateName ? ` (${plan.context.stateName})` : ""}${RESET}`);
+  lines.push("");
+
+  // Group entities by type
+  const byType: Record<string, EntityPlan[]> = {};
+  for (const entity of plan.entities) {
+    if (!byType[entity.type]) byType[entity.type] = [];
+    byType[entity.type].push(entity);
+  }
+
+  // Display order and icons
+  const typeOrder: Array<{ type: string; icon: string; label: string }> = [
+    { type: "faction", icon: "🏛️", label: "FACTIONS" },
+    { type: "location", icon: "📍", label: "LOCATIONS" },
+    { type: "npc", icon: "👤", label: "NPCS" },
+    { type: "event", icon: "⚡", label: "EVENTS" },
+    { type: "rumor", icon: "💬", label: "RUMORS" },
+    { type: "hook", icon: "🎣", label: "HOOKS" },
+  ];
+
+  for (const { type, icon, label } of typeOrder) {
+    const entities = byType[type];
+    if (!entities || entities.length === 0) continue;
+
+    lines.push(`${BOLD}${label}${RESET} (${entities.length}):`);
+    for (const entity of entities) {
+      const kindStr = entity.kind ? `: ${entity.kind}` : "";
+      lines.push(`  ${icon} ${GREEN}${entity.name}${RESET}${kindStr}`);
+      lines.push(`     ${DIM}"${entity.reason}"${RESET}`);
+
+      // Show connections
+      for (const conn of entity.connectsTo) {
+        const marker = conn.isNew ? `${MAGENTA}[new]${RESET}` : conn.isExisting ? `${YELLOW}[existing]${RESET}` : "";
+        lines.push(`     └─ ${conn.rel}: ${conn.name} ${marker}`);
+      }
+    }
+    lines.push("");
+  }
+
+  // Context section
+  if (plan.context.activeEvents.length > 0) {
+    lines.push(`${DIM}Active events: ${plan.context.activeEvents.slice(0, 3).join(", ")}${RESET}`);
+  }
+  if (plan.context.existingEntities.length > 0) {
+    lines.push(`${DIM}Existing entities: ${plan.context.existingEntities.slice(0, 5).join(", ")}${plan.context.existingEntities.length > 5 ? "..." : ""}${RESET}`);
+  }
+
+  // Summary
+  const totalEntities = plan.entities.length;
+  lines.push("");
+  lines.push(`${BOLD}Total: ${totalEntities} entities to create${RESET}`);
+  lines.push("");
+
+  return lines.join("\n");
 }

@@ -1,7 +1,17 @@
 import { ToolRegistry, ToolContext } from "./index";
 import { completeJson } from "../../llm/providers";
 import { z } from "zod";
-import { ReactionGenerationResultSchema, ReactionCandidateSchema } from "../schema";
+import {
+  ReactionGenerationResultSchema,
+  ReactionCandidateSchema,
+  RumorTruthLevelEnum,
+  RumorSpreadLevelEnum,
+  RumorSourceTypeEnum,
+  HookTypeEnum,
+  HookUrgencyEnum,
+  HookDifficultyEnum,
+  HookRewardTypeEnum,
+} from "../schema";
 import { formatSettingsForGeneration } from "../campaign-settings";
 
 // Schemas for generated content
@@ -56,6 +66,33 @@ const LoreGenResultSchema = z.object({
   aspect: z.string(),
   content: z.string(),
   relatedTopics: z.array(z.string()).optional(),
+});
+
+const RumorGenResultSchema = z.object({
+  rumor: GeneratedEntitySchema.extend({
+    type: z.literal("rumor"),
+  }),
+  payload: z.object({
+    truthLevel: RumorTruthLevelEnum,
+    spreadLevel: RumorSpreadLevelEnum,
+    sourceType: RumorSourceTypeEnum,
+    actualTruth: z.string().optional(),
+  }),
+});
+
+const HookGenResultSchema = z.object({
+  hook: GeneratedEntitySchema.extend({
+    type: z.literal("hook"),
+  }),
+  payload: z.object({
+    hookType: HookTypeEnum,
+    urgency: HookUrgencyEnum,
+    difficulty: HookDifficultyEnum,
+    rewardType: HookRewardTypeEnum,
+    rewardDetails: z.string().optional(),
+    complications: z.array(z.string()).optional(),
+    failureConsequences: z.string().optional(),
+  }),
 });
 
 // JSON schema for location generation
@@ -786,6 +823,353 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY vali
         scope,
         severity,
         daysAgo,
+      };
+    }
+  );
+
+  // generate_rumor - Generate a rumor with truth/spread levels and persist to canon
+  registry.register(
+    "generate_rumor",
+    {
+      name: "generate_rumor",
+      description:
+        "Generate a rumor circulating in a location. Rumors have truth levels (how accurate), spread levels (how widely known), and may link to events or NPCs. Automatically persists to canon.",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: {
+            type: "string",
+            description: "What the rumor is about (e.g., 'the missing merchant', 'strange lights in the forest')",
+          },
+          truthLevel: {
+            type: "string",
+            description: "How accurate: false, distorted, mostly-true, true",
+            enum: ["false", "distorted", "mostly-true", "true"],
+          },
+          spreadLevel: {
+            type: "string",
+            description: "How widely known: whisper (few know), local (burg), regional (state), widespread (world)",
+            enum: ["whisper", "local", "regional", "widespread"],
+          },
+          sourceType: {
+            type: "string",
+            description: "Origin: gossip, observation, leak, planted, unknown",
+            enum: ["gossip", "observation", "leak", "planted", "unknown"],
+          },
+          burgId: { type: "number", description: "Burg where rumor is circulating" },
+          linkedEventId: { type: "string", description: "Event ID this rumor relates to (if any)" },
+          linkedNpcId: { type: "string", description: "NPC ID who spreads or knows about this rumor (if any)" },
+          hints: { type: "string", description: "Additional creative hints" },
+          reason: { type: "string", description: "Reason/prompt for generation (for provenance)" },
+          source: { type: "string", description: "Source application (e.g., 'azbrowse', 'azchat')" },
+        },
+        required: ["topic", "burgId"],
+      },
+    },
+    async (args: Record<string, any>, ctx: ToolContext) => {
+      const topic = String(args.topic);
+      const burgId = Number(args.burgId);
+      const truthLevel = args.truthLevel || "distorted";
+      const spreadLevel = args.spreadLevel || "local";
+      const sourceType = args.sourceType || "gossip";
+
+      if (!Number.isFinite(burgId)) {
+        return { error: "burgId must be a number" };
+      }
+
+      const burg = ctx.world.getBurg(burgId);
+      if (!burg) {
+        return { error: `Burg ${burgId} not found` };
+      }
+
+      // Get linked entities for context
+      let linkedEventContext = "";
+      if (args.linkedEventId) {
+        const event = ctx.canon.getEntity(String(args.linkedEventId));
+        if (event && event.type === "event") {
+          linkedEventContext = `Related to event: ${event.name} - ${event.summary || "no summary"}`;
+        }
+      }
+
+      let linkedNpcContext = "";
+      if (args.linkedNpcId) {
+        const npc = ctx.canon.getEntity(String(args.linkedNpcId));
+        if (npc && npc.type === "npc") {
+          linkedNpcContext = `Spread by/about NPC: ${npc.name} - ${npc.summary || "no summary"}`;
+        }
+      }
+
+      const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+      const genLlm = getGenLlm(ctx);
+
+      const systemPrompt = `You are a tabletop GM assistant. Generate a rumor for a fantasy city.
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
+A rumor is something people are saying - it may be true, distorted, or completely false.
+The "actualTruth" field is GM-only information about what's really going on.
+
+Output ONLY valid JSON with:
+- rumor: { key, type: "rumor", name (the rumor as people say it), summary (1-2 sentences of what people claim), details_md (fuller version with variations), tags }
+- payload: { truthLevel, spreadLevel, sourceType, actualTruth (GM-only: what's really true) }`;
+
+      const userPrompt = {
+        topic,
+        truthLevel,
+        spreadLevel,
+        sourceType,
+        burg: { id: burg.id, name: burg.name },
+        linkedEventContext: linkedEventContext || null,
+        linkedNpcContext: linkedNpcContext || null,
+        hints: args.hints || null,
+        instructions:
+          "Create a compelling rumor. The name should be what people say (e.g., 'They say the baron poisoned his wife'). " +
+          "Summary is what most people have heard. Details_md includes variations and where you might hear it. " +
+          "actualTruth reveals the GM-only reality behind the rumor.",
+      };
+
+      const result = await completeJson(genLlm, {
+        system: systemPrompt,
+        messages: [{ role: "user", content: JSON.stringify(userPrompt) }],
+        maxTokens: 1500,
+        temperature: 0.8,
+      });
+
+      const parsed = RumorGenResultSchema.safeParse(result);
+      if (!parsed.success) {
+        return { error: "Failed to parse generation result" };
+      }
+
+      const rumor = parsed.data.rumor;
+      const payload = parsed.data.payload;
+
+      const rumorEntity = ctx.canon.addEntity({
+        type: "rumor",
+        name: rumor.name,
+        summary: rumor.summary || null,
+        details_md: rumor.details_md || null,
+        tags: rumor.tags || [sourceType, spreadLevel],
+        anchors: { burgId, linkedEventId: args.linkedEventId, linkedNpcId: args.linkedNpcId },
+        payload: {
+          ...payload,
+          truthLevel,
+          spreadLevel,
+          sourceType,
+        },
+        provenance: {
+          generated_by: args.source || "generate_rumor",
+          provider: genLlm.provider,
+          model: genLlm.model,
+          reason: args.reason || null,
+          approved_at: args.reason ? new Date().toISOString() : undefined,
+        },
+      });
+
+      // Create relations to linked entities
+      if (args.linkedEventId) {
+        ctx.canon.addRelation({
+          from_id: rumorEntity.id,
+          to_id: String(args.linkedEventId),
+          rel_type: "about",
+        });
+      }
+      if (args.linkedNpcId) {
+        ctx.canon.addRelation({
+          from_id: rumorEntity.id,
+          to_id: String(args.linkedNpcId),
+          rel_type: "spread_by",
+        });
+      }
+
+      return {
+        success: true,
+        rumorId: rumorEntity.id,
+        rumorName: rumorEntity.name,
+        rumorSummary: rumorEntity.summary,
+        truthLevel,
+        spreadLevel,
+        sourceType,
+      };
+    }
+  );
+
+  // generate_hook - Generate an adventure/quest hook and persist to canon
+  registry.register(
+    "generate_hook",
+    {
+      name: "generate_hook",
+      description:
+        "Generate an adventure hook (quest, mission, job) for players. Hooks have type, urgency, difficulty, and rewards. Automatically persists to canon.",
+      parameters: {
+        type: "object",
+        properties: {
+          hookType: {
+            type: "string",
+            description: "Type: investigation, rescue, exploration, negotiation, combat, heist, escort, delivery, mystery, social",
+            enum: ["investigation", "rescue", "exploration", "negotiation", "combat", "heist", "escort", "delivery", "mystery", "social"],
+          },
+          urgency: {
+            type: "string",
+            description: "Time sensitivity: background (no rush), whenever, soon, urgent, critical",
+            enum: ["background", "whenever", "soon", "urgent", "critical"],
+          },
+          difficulty: {
+            type: "string",
+            description: "Estimated difficulty: trivial, easy, moderate, hard, deadly",
+            enum: ["trivial", "easy", "moderate", "hard", "deadly"],
+          },
+          rewardType: {
+            type: "string",
+            description: "Primary reward: gold, information, favor, item, reputation, mixed",
+            enum: ["gold", "information", "favor", "item", "reputation", "mixed"],
+          },
+          burgId: { type: "number", description: "Burg where hook is offered/relevant" },
+          linkedEventId: { type: "string", description: "Event ID this hook relates to (if any)" },
+          linkedNpcId: { type: "string", description: "NPC ID offering or involved in this hook (if any)" },
+          linkedFactionId: { type: "string", description: "Faction ID involved in this hook (if any)" },
+          hints: { type: "string", description: "Additional creative hints" },
+          reason: { type: "string", description: "Reason/prompt for generation (for provenance)" },
+          source: { type: "string", description: "Source application (e.g., 'azbrowse', 'azchat')" },
+        },
+        required: ["hookType", "burgId"],
+      },
+    },
+    async (args: Record<string, any>, ctx: ToolContext) => {
+      const hookType = String(args.hookType);
+      const burgId = Number(args.burgId);
+      const urgency = args.urgency || "whenever";
+      const difficulty = args.difficulty || "moderate";
+      const rewardType = args.rewardType || "mixed";
+
+      if (!Number.isFinite(burgId)) {
+        return { error: "burgId must be a number" };
+      }
+
+      const burg = ctx.world.getBurg(burgId);
+      if (!burg) {
+        return { error: `Burg ${burgId} not found` };
+      }
+
+      // Get linked entities for context
+      let linkedContext: string[] = [];
+      if (args.linkedEventId) {
+        const event = ctx.canon.getEntity(String(args.linkedEventId));
+        if (event && event.type === "event") {
+          linkedContext.push(`Related to event: ${event.name} - ${event.summary || "no summary"}`);
+        }
+      }
+      if (args.linkedNpcId) {
+        const npc = ctx.canon.getEntity(String(args.linkedNpcId));
+        if (npc && npc.type === "npc") {
+          linkedContext.push(`Quest giver/involved NPC: ${npc.name} - ${npc.summary || "no summary"}`);
+        }
+      }
+      if (args.linkedFactionId) {
+        const faction = ctx.canon.getEntity(String(args.linkedFactionId));
+        if (faction && faction.type === "faction") {
+          linkedContext.push(`Faction involved: ${faction.name} - ${faction.summary || "no summary"}`);
+        }
+      }
+
+      const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+      const genLlm = getGenLlm(ctx);
+
+      const systemPrompt = `You are a tabletop GM assistant. Generate an adventure hook for a fantasy TTRPG.
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
+A hook is a potential quest, job, or adventure that players might pursue.
+
+Output ONLY valid JSON with:
+- hook: { key, type: "hook", name (catchy title), summary (1-2 sentence pitch to players), details_md (full setup, what's really going on), tags }
+- payload: { hookType, urgency, difficulty, rewardType, rewardDetails, complications (2-3 potential twists), failureConsequences }`;
+
+      const userPrompt = {
+        hookType,
+        urgency,
+        difficulty,
+        rewardType,
+        burg: { id: burg.id, name: burg.name },
+        linkedContext: linkedContext.length > 0 ? linkedContext : null,
+        hints: args.hints || null,
+        instructions:
+          "Create an engaging adventure hook. Name should be intriguing (e.g., 'The Merchant's Missing Daughter'). " +
+          "Summary is the player-facing pitch. Details_md contains GM info about what's really happening. " +
+          "Complications should be 2-3 potential twists that could make things interesting. " +
+          "failureConsequences describes what happens if players ignore or fail the hook.",
+      };
+
+      const result = await completeJson(genLlm, {
+        system: systemPrompt,
+        messages: [{ role: "user", content: JSON.stringify(userPrompt) }],
+        maxTokens: 2000,
+        temperature: 0.8,
+      });
+
+      const parsed = HookGenResultSchema.safeParse(result);
+      if (!parsed.success) {
+        return { error: "Failed to parse generation result" };
+      }
+
+      const hook = parsed.data.hook;
+      const payload = parsed.data.payload;
+
+      const hookEntity = ctx.canon.addEntity({
+        type: "hook",
+        name: hook.name,
+        summary: hook.summary || null,
+        details_md: hook.details_md || null,
+        tags: hook.tags || [hookType, urgency],
+        anchors: {
+          burgId,
+          linkedEventId: args.linkedEventId,
+          linkedNpcId: args.linkedNpcId,
+          linkedFactionId: args.linkedFactionId,
+        },
+        payload: {
+          ...payload,
+          hookType,
+          urgency,
+          difficulty,
+          rewardType,
+        },
+        provenance: {
+          generated_by: args.source || "generate_hook",
+          provider: genLlm.provider,
+          model: genLlm.model,
+          reason: args.reason || null,
+          approved_at: args.reason ? new Date().toISOString() : undefined,
+        },
+      });
+
+      // Create relations to linked entities
+      if (args.linkedEventId) {
+        ctx.canon.addRelation({
+          from_id: hookEntity.id,
+          to_id: String(args.linkedEventId),
+          rel_type: "caused_by",
+        });
+      }
+      if (args.linkedNpcId) {
+        ctx.canon.addRelation({
+          from_id: hookEntity.id,
+          to_id: String(args.linkedNpcId),
+          rel_type: "offered_by",
+        });
+      }
+      if (args.linkedFactionId) {
+        ctx.canon.addRelation({
+          from_id: hookEntity.id,
+          to_id: String(args.linkedFactionId),
+          rel_type: "involves",
+        });
+      }
+
+      return {
+        success: true,
+        hookId: hookEntity.id,
+        hookName: hookEntity.name,
+        hookSummary: hookEntity.summary,
+        hookType,
+        urgency,
+        difficulty,
+        rewardType,
       };
     }
   );
