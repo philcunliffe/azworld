@@ -55,8 +55,26 @@ function buildLinksFromRelations(
       case "faction":
         kind = "faction";
         break;
+      case "culture":
+        kind = "culture";
+        break;
+      case "religion":
+        kind = "religion";
+        break;
+      case "event":
+        kind = "event";
+        break;
+      case "rumor":
+        kind = "rumor";
+        break;
+      case "hook":
+        kind = "hook";
+        break;
+      case "deity":
+        kind = "deity";
+        break;
       default:
-        kind = "event"; // fallback for other types
+        kind = "location";
     }
 
     // Build relation label (direction matters)
@@ -138,10 +156,18 @@ export function buildDetailContent(
       return buildNpcDetail(canon, ref.npcId);
     case "faction":
       return buildFactionDetail(world, canon, ref.factionId);
+    case "event":
+      return buildEventDetail(world, canon, ref.eventId);
+    case "rumor":
+      return buildRumorDetail(canon, ref.rumorId);
+    case "hook":
+      return buildHookDetail(canon, ref.hookId);
     case "culture":
       return buildCultureDetail(world, canon, ref.cultureId);
     case "religion":
       return buildReligionDetail(world, canon, ref.religionId);
+    case "deity":
+      return buildDeityDetail(world, canon, ref.deityId);
     default:
       return undefined;
   }
@@ -902,6 +928,248 @@ function buildNpcDetail(canon: CanonStore, npcId: string): DetailContent {
   };
 }
 
+function buildEventDetail(world: AzgaarWorld, canon: CanonStore, eventId: string): DetailContent {
+  const event = canon.getEntity(eventId);
+  if (!event || event.type !== "event") {
+    return {
+      title: `Event`,
+      kind: "event",
+      entityId: eventId,
+      sections: [{ key: "event:notfound", content: ["Event not found"] }],
+    };
+  }
+
+  const payload = event.payload || {};
+  const sections: DetailContent["sections"] = [];
+
+  sections.push({
+    key: `event:${eventId}:details`,
+    label: "Details",
+    content: [
+      `ID:       ${event.id}`,
+      `Scope:    ${payload.scope || "unknown"}`,
+      `Severity: ${payload.severity || "unknown"}`,
+      `Scale:    ${payload.scale || "unknown"}`,
+      `Secrecy:  ${payload.secrecy || "public"}`,
+      `When:     ${payload.daysAgo ?? 0} days ago${payload.ongoing ? " (ongoing)" : ""}`,
+    ],
+    collapsible: true,
+    defaultExpanded: true,
+  });
+
+  const anchors = event.anchors || {};
+  const contextLines: string[] = [];
+  if (anchors.stateId !== undefined) {
+    const state = world.getState(anchors.stateId);
+    if (state) contextLines.push(`State: ${state.name}`);
+  }
+  if (anchors.burgId !== undefined) {
+    const burg = world.getBurg(anchors.burgId);
+    if (burg) contextLines.push(`Burg:  ${burg.name}`);
+  }
+  if (contextLines.length > 0) {
+    sections.push({
+      key: `event:${eventId}:context`,
+      label: "Context",
+      content: contextLines,
+      collapsible: true,
+    });
+  }
+
+  if (event.summary) {
+    sections.push({
+      key: `event:${eventId}:summary`,
+      label: "Summary",
+      content: [event.summary],
+      color: FG_YELLOW,
+      collapsible: true,
+      defaultExpanded: true,
+    });
+  }
+
+  if (event.details_md?.trim()) {
+    sections.push({
+      key: `event:${eventId}:description`,
+      label: "Description",
+      content: event.details_md.split("\n"),
+      color: FG_GRAY,
+      collapsible: true,
+    });
+  }
+
+  const audience = payload.audience as Record<string, any> | undefined;
+  if (audience && Object.keys(audience).length > 0) {
+    const audienceLines: string[] = [];
+    if (audience.public) audienceLines.push("Publicly known");
+    if (Array.isArray(audience.knownFactionIds) && audience.knownFactionIds.length) audienceLines.push(`Known factions: ${audience.knownFactionIds.join(", ")}`);
+    if (Array.isArray(audience.knownNpcIds) && audience.knownNpcIds.length) audienceLines.push(`Known NPCs: ${audience.knownNpcIds.join(", ")}`);
+    if (Array.isArray(audience.knownBurgIds) && audience.knownBurgIds.length) audienceLines.push(`Known burgs: ${audience.knownBurgIds.join(", ")}`);
+    if (Array.isArray(audience.knownStateIds) && audience.knownStateIds.length) audienceLines.push(`Known states: ${audience.knownStateIds.join(", ")}`);
+    if (Array.isArray(audience.suspectedByFactionIds) && audience.suspectedByFactionIds.length) audienceLines.push(`Suspected by factions: ${audience.suspectedByFactionIds.join(", ")}`);
+    sections.push({
+      key: `event:${eventId}:audience`,
+      label: "Audience",
+      content: audienceLines,
+      collapsible: true,
+    });
+  }
+
+  const links = buildLinksFromRelations(canon, eventId);
+  if (links.length > 0) {
+    sections.push({
+      key: `event:${eventId}:links`,
+      label: `Links (${links.length})`,
+      content: [],
+      collapsible: true,
+      links,
+    });
+  }
+
+  return {
+    title: event.name,
+    kind: "event",
+    entityId: eventId,
+    sections,
+  };
+}
+
+function buildRumorDetail(canon: CanonStore, rumorId: string): DetailContent {
+  const rumor = canon.getEntity(rumorId);
+  if (!rumor || rumor.type !== "rumor") {
+    return {
+      title: `Rumor`,
+      kind: "rumor",
+      entityId: rumorId,
+      sections: [{ key: "rumor:notfound", content: ["Rumor not found"] }],
+    };
+  }
+
+  const payload = rumor.payload || {};
+  const sections: DetailContent["sections"] = [
+    {
+      key: `rumor:${rumorId}:details`,
+      label: "Details",
+      content: [
+        `ID:          ${rumor.id}`,
+        `Truth Level: ${payload.truthLevel || "unknown"}`,
+        `Spread:      ${payload.spreadLevel || "unknown"}`,
+        `Source:      ${payload.sourceType || "unknown"}`,
+        `Secrecy:     ${payload.secrecy || "unknown"}`,
+        `Age:         ${payload.ageDays ?? 0} days`,
+      ],
+      collapsible: true,
+      defaultExpanded: true,
+    },
+  ];
+
+  if (rumor.summary) {
+    sections.push({
+      key: `rumor:${rumorId}:summary`,
+      label: "Summary",
+      content: [rumor.summary],
+      color: FG_YELLOW,
+      collapsible: true,
+      defaultExpanded: true,
+    });
+  }
+
+  if (rumor.details_md?.trim()) {
+    sections.push({
+      key: `rumor:${rumorId}:description`,
+      label: "Description",
+      content: rumor.details_md.split("\n"),
+      color: FG_GRAY,
+      collapsible: true,
+    });
+  }
+
+  const links = buildLinksFromRelations(canon, rumorId);
+  if (links.length > 0) {
+    sections.push({
+      key: `rumor:${rumorId}:links`,
+      label: `Links (${links.length})`,
+      content: [],
+      collapsible: true,
+      links,
+    });
+  }
+
+  return {
+    title: rumor.name,
+    kind: "rumor",
+    entityId: rumorId,
+    sections,
+  };
+}
+
+function buildHookDetail(canon: CanonStore, hookId: string): DetailContent {
+  const hook = canon.getEntity(hookId);
+  if (!hook || hook.type !== "hook") {
+    return {
+      title: `Hook`,
+      kind: "hook",
+      entityId: hookId,
+      sections: [{ key: "hook:notfound", content: ["Hook not found"] }],
+    };
+  }
+
+  const payload = hook.payload || {};
+  const sections: DetailContent["sections"] = [
+    {
+      key: `hook:${hookId}:details`,
+      label: "Details",
+      content: [
+        `ID:         ${hook.id}`,
+        `Type:       ${payload.hookType || "unknown"}`,
+        `Urgency:    ${payload.urgency || "unknown"}`,
+        `Difficulty: ${payload.difficulty || "unknown"}`,
+        `Reward:     ${payload.rewardType || "unknown"}`,
+      ],
+      collapsible: true,
+      defaultExpanded: true,
+    },
+  ];
+
+  if (hook.summary) {
+    sections.push({
+      key: `hook:${hookId}:summary`,
+      label: "Summary",
+      content: [hook.summary],
+      color: FG_GREEN,
+      collapsible: true,
+      defaultExpanded: true,
+    });
+  }
+
+  if (hook.details_md?.trim()) {
+    sections.push({
+      key: `hook:${hookId}:description`,
+      label: "Description",
+      content: hook.details_md.split("\n"),
+      color: FG_GRAY,
+      collapsible: true,
+    });
+  }
+
+  const links = buildLinksFromRelations(canon, hookId);
+  if (links.length > 0) {
+    sections.push({
+      key: `hook:${hookId}:links`,
+      label: `Links (${links.length})`,
+      content: [],
+      collapsible: true,
+      links,
+    });
+  }
+
+  return {
+    title: hook.name,
+    kind: "hook",
+    entityId: hookId,
+    sections,
+  };
+}
+
 function buildFactionDetail(
   world: AzgaarWorld,
   canon: CanonStore,
@@ -996,6 +1264,39 @@ function buildFactionDetail(
       content: industries.map((i: string) => `• ${i}`),
       color: FG_GREEN,
       collapsible: true,
+    });
+  }
+
+  const goals = payload.goals as string[] | undefined;
+  if (goals?.length) {
+    sections.push({
+      key: `faction:${factionId}:goals`,
+      label: "Goals",
+      content: goals.map((goal: string) => `• ${goal}`),
+      collapsible: true,
+      defaultExpanded: true,
+    });
+  }
+
+  const goalProgress = payload.goalProgress as Array<Record<string, any>> | undefined;
+  if (goalProgress?.length) {
+    const lines = goalProgress.map((progress) => {
+      const parts = [
+        progress.goal || progress.id || "Unnamed goal",
+        progress.status ? `[${progress.status}]` : null,
+        progress.progress !== undefined ? `${progress.progress}%` : null,
+        progress.stage ? `stage: ${progress.stage}` : null,
+        progress.nextMilestone ? `next: ${progress.nextMilestone}` : null,
+        progress.secrecy ? `secrecy: ${progress.secrecy}` : null,
+      ].filter(Boolean);
+      return `• ${parts.join(" | ")}`;
+    });
+    sections.push({
+      key: `faction:${factionId}:goal-progress`,
+      label: "Goal Progress",
+      content: lines,
+      collapsible: true,
+      defaultExpanded: true,
     });
   }
 
@@ -1491,10 +1792,259 @@ function buildReligionDetail(world: AzgaarWorld, canon: CanonStore, religionId: 
     });
   }
 
+  // Pantheon section - deities belonging to this religion
+  const deities = canon.listEntities({ type: "deity", limit: 100 })
+    .filter(e => e.anchors?.azgaarReligionId === religionId ||
+      (religionEntity && e.anchors?.religionEntityId === religionEntity.id));
+  if (deities.length > 0) {
+    // Sort by rank
+    const rankOrder: Record<string, number> = { supreme: 0, greater: 1, lesser: 2, demigod: 3, spirit: 4 };
+    deities.sort((a, b) => {
+      const ra = rankOrder[a.payload?.rank as string] ?? 5;
+      const rb = rankOrder[b.payload?.rank as string] ?? 5;
+      if (ra !== rb) return ra - rb;
+      return a.name.localeCompare(b.name);
+    });
+
+    const deityLinks: DetailLink[] = deities.map(d => ({
+      id: d.id,
+      name: d.name,
+      kind: "deity" as EntityKind,
+      relationType: d.payload?.rank || "deity",
+    }));
+    const deityContent = deities.map(d => {
+      const domains = (d.payload?.domains as string[] | undefined)?.join(", ");
+      return `${d.payload?.rank || "deity"} — ${domains || "unknown domains"}`;
+    });
+    sections.push({
+      key: `religion:${religionId}:pantheon`,
+      label: `Pantheon (${deities.length})`,
+      content: deityContent,
+      color: FG_CYAN,
+      collapsible: true,
+      defaultExpanded: true,
+      links: deityLinks,
+    });
+  }
+
   return {
     title: religionEntity?.name || context.name,
     kind: "religion",
     entityId: `religion:${religionId}`,
+    sections,
+  };
+}
+
+function buildDeityDetail(world: AzgaarWorld, canon: CanonStore, deityId: string): DetailContent {
+  const deity = canon.getEntity(deityId);
+  if (!deity || deity.type !== "deity") {
+    return {
+      title: `Deity ${deityId}`,
+      kind: "deity",
+      entityId: deityId,
+      sections: [{ key: "deity:notfound", content: ["Deity not found"] }],
+    };
+  }
+
+  const payload = deity.payload || {};
+  const anchors = deity.anchors || {};
+  const sections: DetailContent["sections"] = [];
+
+  // Summary
+  if (deity.summary) {
+    sections.push({
+      key: `deity:${deityId}:summary`,
+      label: "Summary",
+      content: [deity.summary],
+      color: FG_GREEN,
+      collapsible: true,
+      defaultExpanded: true,
+    });
+  }
+
+  // Core info
+  const coreLines: string[] = [];
+  if (payload.rank) coreLines.push(`Rank:      ${payload.rank}`);
+  if (payload.alignment) coreLines.push(`Alignment: ${payload.alignment}`);
+  const domains = payload.domains as string[] | undefined;
+  if (domains?.length) coreLines.push(`Domains:   ${domains.join(", ")}`);
+  if (payload.sacredAnimal) coreLines.push(`Sacred Animal:   ${payload.sacredAnimal}`);
+  if (payload.sacredElement) coreLines.push(`Sacred Element:  ${payload.sacredElement}`);
+  if (coreLines.length > 0) {
+    sections.push({
+      key: `deity:${deityId}:core`,
+      label: "Divine Attributes",
+      content: coreLines,
+      collapsible: true,
+      defaultExpanded: true,
+    });
+  }
+
+  // Titles
+  const titles = payload.titles as string[] | undefined;
+  if (titles?.length) {
+    sections.push({
+      key: `deity:${deityId}:titles`,
+      label: "Titles & Epithets",
+      content: titles.map((t: string) => `• ${t}`),
+      color: FG_YELLOW,
+      collapsible: true,
+      defaultExpanded: true,
+    });
+  }
+
+  // Symbols
+  const symbols = payload.symbols as string[] | undefined;
+  if (symbols?.length) {
+    sections.push({
+      key: `deity:${deityId}:symbols`,
+      label: "Sacred Symbols",
+      content: symbols.map((s: string) => `• ${s}`),
+      collapsible: true,
+    });
+  }
+
+  // Appearance
+  if (payload.appearance) {
+    sections.push({
+      key: `deity:${deityId}:appearance`,
+      label: "Appearance",
+      content: [String(payload.appearance)],
+      collapsible: true,
+    });
+  }
+
+  // Mythology
+  if (payload.mythology) {
+    sections.push({
+      key: `deity:${deityId}:mythology`,
+      label: "Mythology",
+      content: String(payload.mythology).split("\n"),
+      collapsible: true,
+      defaultExpanded: true,
+    });
+  }
+
+  // Worship Style
+  if (payload.worshipStyle) {
+    sections.push({
+      key: `deity:${deityId}:worship`,
+      label: "Worship",
+      content: [String(payload.worshipStyle)],
+      collapsible: true,
+    });
+  }
+
+  // Festivals
+  const festivals = payload.festivals as string[] | undefined;
+  if (festivals?.length) {
+    sections.push({
+      key: `deity:${deityId}:festivals`,
+      label: "Festivals",
+      content: festivals.map((f: string) => `• ${f}`),
+      collapsible: true,
+    });
+  }
+
+  // Full description
+  if (deity.details_md?.trim()) {
+    sections.push({
+      key: `deity:${deityId}:description`,
+      label: "Description",
+      content: deity.details_md.split("\n"),
+      color: FG_GRAY,
+      collapsible: true,
+    });
+  }
+
+  // Parent religion link
+  const religionLinks: DetailLink[] = [];
+  if (anchors.azgaarReligionId !== undefined) {
+    const rel = world.getReligion(anchors.azgaarReligionId);
+    if (rel) {
+      religionLinks.push({
+        id: String(anchors.azgaarReligionId),
+        name: rel.name,
+        kind: "religion" as EntityKind,
+        relationType: "religion",
+      });
+    }
+  }
+  if (religionLinks.length > 0) {
+    sections.push({
+      key: `deity:${deityId}:religion`,
+      label: "Religion",
+      content: [],
+      collapsible: true,
+      defaultExpanded: true,
+      links: religionLinks,
+    });
+  }
+
+  // Relations to other entities
+  const allRels = canon.listRelations({ entity_id: deityId });
+  if (allRels.length > 0) {
+    const relLinks: DetailLink[] = [];
+    for (const r of allRels) {
+      const otherId = r.from_id === deityId ? r.to_id : r.from_id;
+      const other = canon.getEntity(otherId);
+      if (other) {
+        relLinks.push({
+          id: other.id,
+          name: other.name,
+          kind: other.type as EntityKind,
+          relationType: r.rel_type,
+        });
+      }
+    }
+    if (relLinks.length > 0) {
+      sections.push({
+        key: `deity:${deityId}:relations`,
+        label: `Connections (${relLinks.length})`,
+        content: [],
+        collapsible: true,
+        links: relLinks,
+      });
+    }
+  }
+
+  // Sibling deities in same pantheon
+  const siblings = canon.listEntities({ type: "deity", limit: 100 })
+    .filter(e => e.id !== deityId && (
+      (anchors.azgaarReligionId !== undefined && e.anchors?.azgaarReligionId === anchors.azgaarReligionId) ||
+      (anchors.religionEntityId && e.anchors?.religionEntityId === anchors.religionEntityId)
+    ));
+  if (siblings.length > 0) {
+    const siblingLinks: DetailLink[] = siblings.map(s => ({
+      id: s.id,
+      name: s.name,
+      kind: "deity" as EntityKind,
+      relationType: s.payload?.rank || "deity",
+    }));
+    sections.push({
+      key: `deity:${deityId}:siblings`,
+      label: `Pantheon Siblings (${siblings.length})`,
+      content: [],
+      collapsible: true,
+      links: siblingLinks,
+    });
+  }
+
+  // Tags
+  if (deity.tags?.length) {
+    sections.push({
+      key: `deity:${deityId}:tags`,
+      label: "Tags",
+      content: [deity.tags.join(", ")],
+      color: FG_GRAY,
+      collapsible: true,
+    });
+  }
+
+  return {
+    title: deity.name,
+    kind: "deity",
+    entityId: deityId,
     sections,
   };
 }

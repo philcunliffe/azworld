@@ -35,15 +35,15 @@ export const ENTITY_FIELD_CONFIGS: Record<string, { core: string[]; payload: str
   },
   faction: {
     core: ["name", "summary", "details_md", "tags"],
-    payload: ["kind", "goals", "methods", "influence"],
+    payload: ["kind", "goals", "goalProgress", "methods", "influence"],
   },
   event: {
     core: ["name", "summary", "details_md", "tags"],
-    payload: ["scope", "severity", "daysAgo"],
+    payload: ["scope", "severity", "scale", "secrecy", "audience", "daysAgo"],
   },
   rumor: {
     core: ["name", "summary", "details_md", "tags"],
-    payload: ["truthLevel", "spreadLevel", "sourceType", "actualTruth"],
+    payload: ["truthLevel", "spreadLevel", "sourceType", "secrecy", "ageDays", "actualTruth"],
   },
   hook: {
     core: ["name", "summary", "details_md", "tags"],
@@ -53,6 +53,14 @@ export const ENTITY_FIELD_CONFIGS: Record<string, { core: string[]; payload: str
     core: ["summary", "details_md"],
     // Combined fields for both state and burg descriptions
     payload: ["atmosphere", "politicalClimate", "notableFeatures", "history", "currentAffairs", "notableLandmarks", "dailyLife", "localCustoms", "reputation"],
+  },
+  deity: {
+    core: ["name", "summary", "details_md", "tags"],
+    payload: ["rank", "domains", "alignment", "symbols", "titles", "sacredAnimal", "sacredElement", "festivals", "appearance", "mythology", "worshipStyle"],
+  },
+  marker: {
+    core: ["name", "summary", "details_md", "tags"],
+    payload: ["kind", "icon", "condition", "dangerLevel", "discoverable", "physicalDescription", "atmosphere", "features", "inhabitants", "loot", "history"],
   },
 };
 
@@ -258,6 +266,8 @@ async function executePlanningTool(
         name: e.name,
         scope: e.payload?.scope,
         severity: e.payload?.severity,
+        scale: e.payload?.scale,
+        secrecy: e.payload?.secrecy,
         daysAgo: e.payload?.daysAgo,
         summary: e.summary,
       }));
@@ -615,10 +625,10 @@ For NPCs, payload MUST include ALL of these structured fields:
 IMPORTANT for NPCs: Put ALL descriptive content in the payload fields above. The "details_md" field should be empty or minimal - do NOT duplicate background/personality/appearance there.
 
 For locations, payload should include: kind, briefDescription (3-5 sentences for quick reference), physicalDescription (detailed sensory description - sights, sounds, smells, layout, lighting, notable features), atmosphere, features
-For factions, payload should include: kind, goals, methods, influence
-For rumors, payload should include: truthLevel (false/distorted/mostly-true/true), spreadLevel (whisper/local/regional/widespread), sourceType (gossip/observation/leak/planted/unknown), actualTruth (GM-only information)
+For factions, payload should include: kind, goals, goalProgress (optional long-term progress objects), methods, influence
+For rumors, payload should include: truthLevel (false/distorted/mostly-true/true), spreadLevel (whisper/local/regional/widespread), sourceType (gossip/observation/leak/planted/unknown), secrecy (secret/restricted/rumored/public), ageDays, actualTruth (GM-only information)
 For hooks, payload should include: hookType (investigation/rescue/exploration/negotiation/combat/heist/escort/delivery/mystery/social), urgency (background/whenever/soon/urgent/critical), difficulty (trivial/easy/moderate/hard/deadly), rewardType (gold/information/favor/item/reputation/mixed), rewardDetails, complications (array), failureConsequences
-For events, payload should include: scope (local/city/regional), severity (minor/moderate/major/critical), daysAgo (how many days ago it happened, 0 for ongoing)`;
+For events, payload should include: scope (neighborhood/burg/state/region/world), severity (minor/moderate/major/catastrophic), scale (covert/incident/operation/crisis/historic), secrecy (secret/restricted/rumored/public), audience (who knows), daysAgo (how many days ago it happened, 0 for ongoing)`;
 
     const userPrompt = JSON.stringify({
       type: entityPlan.type,

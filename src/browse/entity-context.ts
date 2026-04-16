@@ -51,6 +51,8 @@ export function buildEntityContext(
       return buildRumorContext(canon, ref.rumorId, world);
     case "hook":
       return buildHookContext(canon, ref.hookId, world);
+    case "deity":
+      return buildDeityContext(canon, ref.deityId, world);
     default:
       return undefined;
   }
@@ -653,6 +655,35 @@ function buildFactionContext(
     lines.push(String(payload.culturalInfluence));
   }
 
+  const goals = Array.isArray(payload.goals) ? payload.goals : [];
+  if (goals.length) {
+    lines.push("");
+    lines.push("GOALS:");
+    for (const goal of goals) {
+      lines.push(`  - ${String(goal)}`);
+    }
+  }
+
+  const goalProgress = Array.isArray(payload.goalProgress) ? payload.goalProgress : [];
+  if (goalProgress.length) {
+    lines.push("");
+    lines.push("GOAL PROGRESS:");
+    for (const progress of goalProgress) {
+      const parts = [
+        progress.goal || progress.id || "Unnamed goal",
+        progress.status ? `status=${progress.status}` : null,
+        progress.progress !== undefined ? `progress=${progress.progress}%` : null,
+        progress.stage ? `stage=${progress.stage}` : null,
+        progress.nextMilestone ? `next=${progress.nextMilestone}` : null,
+        progress.secrecy ? `secrecy=${progress.secrecy}` : null,
+      ].filter(Boolean);
+      lines.push(`  - ${parts.join(" | ")}`);
+      if (Array.isArray(progress.blockers) && progress.blockers.length) {
+        lines.push(`    blockers: ${progress.blockers.join(", ")}`);
+      }
+    }
+  }
+
   if (faction.details_md?.trim()) {
     lines.push("");
     lines.push("DESCRIPTION:");
@@ -967,6 +998,135 @@ function buildReligionContext(
   };
 }
 
+function buildDeityContext(
+  canon: CanonStore,
+  deityId: string,
+  world: AzgaarWorld
+): EntityContext | undefined {
+  const deity = canon.getEntity(deityId);
+  if (!deity || deity.type !== "deity") return undefined;
+
+  const payload = deity.payload || {};
+  const anchors = deity.anchors || {};
+
+  // Resolve parent religion
+  let religionName = "Unknown Religion";
+  if (anchors.azgaarReligionId !== undefined) {
+    const rel = world.getReligion(anchors.azgaarReligionId);
+    if (rel) religionName = rel.name;
+  }
+  // Check for canon religion entity name
+  if (anchors.religionEntityId) {
+    const relEntity = canon.getEntity(anchors.religionEntityId);
+    if (relEntity) religionName = relEntity.name;
+  }
+
+  const lines: string[] = [
+    `Deity: ${deity.name}`,
+    `Religion: ${religionName}`,
+  ];
+
+  if (payload.rank) lines.push(`Rank: ${payload.rank}`);
+  if (payload.alignment) lines.push(`Alignment: ${payload.alignment}`);
+
+  const domains = payload.domains as string[] | undefined;
+  if (domains?.length) {
+    lines.push(`Domains: ${domains.join(", ")}`);
+  }
+
+  const titles = payload.titles as string[] | undefined;
+  if (titles?.length) {
+    lines.push("");
+    lines.push("TITLES:");
+    for (const t of titles) lines.push(`  - ${t}`);
+  }
+
+  const symbols = payload.symbols as string[] | undefined;
+  if (symbols?.length) {
+    lines.push("");
+    lines.push("SYMBOLS:");
+    for (const s of symbols) lines.push(`  - ${s}`);
+  }
+
+  if (payload.sacredAnimal) lines.push(`Sacred Animal: ${payload.sacredAnimal}`);
+  if (payload.sacredElement) lines.push(`Sacred Element: ${payload.sacredElement}`);
+
+  if (payload.appearance) {
+    lines.push("");
+    lines.push("APPEARANCE:");
+    lines.push(String(payload.appearance));
+  }
+
+  if (payload.mythology) {
+    lines.push("");
+    lines.push("MYTHOLOGY:");
+    lines.push(String(payload.mythology));
+  }
+
+  if (payload.worshipStyle) {
+    lines.push("");
+    lines.push("WORSHIP:");
+    lines.push(String(payload.worshipStyle));
+  }
+
+  const festivals = payload.festivals as string[] | undefined;
+  if (festivals?.length) {
+    lines.push("");
+    lines.push("FESTIVALS:");
+    for (const f of festivals) lines.push(`  - ${f}`);
+  }
+
+  if (deity.summary) {
+    lines.push("");
+    lines.push("SUMMARY:");
+    lines.push(deity.summary);
+  }
+
+  if (deity.details_md?.trim()) {
+    lines.push("");
+    lines.push("DESCRIPTION:");
+    lines.push(deity.details_md);
+  }
+
+  // Find sibling deities in same pantheon
+  const siblings = canon.listEntities({ type: "deity", limit: 100 })
+    .filter(e => e.id !== deityId && (
+      (anchors.azgaarReligionId !== undefined && e.anchors?.azgaarReligionId === anchors.azgaarReligionId) ||
+      (anchors.religionEntityId && e.anchors?.religionEntityId === anchors.religionEntityId)
+    ));
+
+  if (siblings.length > 0) {
+    lines.push("");
+    lines.push(`PANTHEON SIBLINGS (${siblings.length}):`);
+    for (const s of siblings) {
+      lines.push(`  - ${s.name}${s.payload?.rank ? ` (${s.payload.rank})` : ""}${s.payload?.domains?.length ? ` — ${(s.payload.domains as string[]).join(", ")}` : ""}`);
+    }
+  }
+
+  // Find relations
+  const allRelations = canon.listRelations({ entity_id: deityId });
+
+  const relatedEntities: EntityContext["relatedEntities"] = [];
+  relatedEntities.push({ kind: "religion", name: religionName, relation: "belongs_to" });
+
+  for (const r of allRelations.slice(0, 10)) {
+    const otherId = r.from_id === deityId ? r.to_id : r.from_id;
+    const other = canon.getEntity(otherId);
+    if (other) {
+      relatedEntities.push({ kind: other.type, name: other.name, relation: r.rel_type });
+      lines.push(`  ${r.rel_type}: ${other.name} (${other.type})`);
+    }
+  }
+
+  return {
+    kind: "deity",
+    name: deity.name,
+    summary: deity.summary || `${payload.rank || "Deity"} of ${domains?.join(", ") || "unknown domain"}.`,
+    details: lines.join("\n"),
+    relatedEntities,
+  };
+}
+
 function buildEventContext(
   canon: CanonStore,
   eventId: string,
@@ -988,6 +1148,8 @@ function buildEventContext(
 
   if (payload.scope) lines.push(`Scope: ${payload.scope}`);
   if (payload.severity) lines.push(`Severity: ${payload.severity}`);
+  if (payload.scale) lines.push(`Scale: ${payload.scale}`);
+  if (payload.secrecy) lines.push(`Secrecy: ${payload.secrecy}`);
   if (payload.daysAgo !== undefined) {
     lines.push(`When: ${payload.daysAgo === 0 ? "Today/Now" : `${payload.daysAgo} days ago`}`);
   }
@@ -1022,6 +1184,18 @@ function buildEventContext(
       if (c.effect) line += `: ${c.effect}`;
       lines.push(line);
     }
+  }
+
+  const audience = payload.audience as Record<string, any> | undefined;
+  if (audience && Object.keys(audience).length > 0) {
+    lines.push("");
+    lines.push("INITIAL AUDIENCE:");
+    if (audience.public) lines.push("  - Public knowledge");
+    if (Array.isArray(audience.knownFactionIds) && audience.knownFactionIds.length) lines.push(`  - Known factions: ${audience.knownFactionIds.join(", ")}`);
+    if (Array.isArray(audience.knownNpcIds) && audience.knownNpcIds.length) lines.push(`  - Known NPCs: ${audience.knownNpcIds.join(", ")}`);
+    if (Array.isArray(audience.knownBurgIds) && audience.knownBurgIds.length) lines.push(`  - Known burgs: ${audience.knownBurgIds.join(", ")}`);
+    if (Array.isArray(audience.knownStateIds) && audience.knownStateIds.length) lines.push(`  - Known states: ${audience.knownStateIds.join(", ")}`);
+    if (Array.isArray(audience.suspectedByFactionIds) && audience.suspectedByFactionIds.length) lines.push(`  - Suspected by factions: ${audience.suspectedByFactionIds.join(", ")}`);
   }
 
   // Get awareness info
@@ -1083,6 +1257,8 @@ function buildRumorContext(
   if (payload.truthLevel) lines.push(`Truth Level: ${payload.truthLevel}`);
   if (payload.spreadLevel) lines.push(`Spread: ${payload.spreadLevel}`);
   if (payload.sourceType) lines.push(`Source: ${payload.sourceType}`);
+  if (payload.secrecy) lines.push(`Secrecy: ${payload.secrecy}`);
+  if (payload.ageDays !== undefined) lines.push(`Age: ${payload.ageDays} days`);
   if (rumor.tags?.length) lines.push(`Tags: ${rumor.tags.join(", ")}`);
   if (burg) lines.push(`Circulating in: ${burg.name}`);
 

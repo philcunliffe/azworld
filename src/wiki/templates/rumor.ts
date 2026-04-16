@@ -20,6 +20,8 @@ export function rumorTemplate(ctx: TemplateContext): string {
       truthLevel: payload.truthLevel || null,
       spreadLevel: payload.spreadLevel || null,
       sourceType: payload.sourceType || null,
+      secrecy: payload.secrecy || null,
+      ageDays: payload.ageDays ?? null,
       updated_at: entity.updated_at,
     })
   );
@@ -40,6 +42,7 @@ export function rumorTemplate(ctx: TemplateContext): string {
   }
   if (payload.spreadLevel) statusParts.push(payload.spreadLevel);
   if (payload.sourceType) statusParts.push(payload.sourceType);
+  if (payload.secrecy) statusParts.push(payload.secrecy);
   if (entity.tags?.length) statusParts.push(...entity.tags);
   if (statusParts.length) {
     lines.push(`*${statusParts.join(" · ")}*`, "");
@@ -65,6 +68,12 @@ export function rumorTemplate(ctx: TemplateContext): string {
     }
     if (payload.sourceType) {
       lines.push(`- **Origin:** ${payload.sourceType}`);
+    }
+    if (payload.secrecy) {
+      lines.push(`- **Secrecy:** ${payload.secrecy}`);
+    }
+    if (payload.ageDays !== undefined) {
+      lines.push(`- **Age:** ${payload.ageDays} day(s)`);
     }
     lines.push("");
   }

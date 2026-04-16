@@ -85,6 +85,10 @@ export { locationTemplate } from "./location";
 export { eventTemplate } from "./event";
 export { rumorTemplate } from "./rumor";
 export { hookTemplate } from "./hook";
+export { deityTemplate } from "./deity";
+export { eraTemplate } from "./era";
+export { phenomenaTemplate } from "./phenomena";
+export { relationTypeTemplate } from "./relation-type";
 
 /**
  * Get the appropriate template for an entity type
@@ -103,6 +107,14 @@ export function getTemplate(type: string): EntityTemplate {
       return require("./rumor").rumorTemplate;
     case "hook":
       return require("./hook").hookTemplate;
+    case "deity":
+      return require("./deity").deityTemplate;
+    case "era":
+      return require("./era").eraTemplate;
+    case "phenomena":
+      return require("./phenomena").phenomenaTemplate;
+    case "relation_type":
+      return require("./relation-type").relationTypeTemplate;
     default:
       return defaultTemplate;
   }

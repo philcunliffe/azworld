@@ -216,7 +216,7 @@ export type WorldGenResult = {
 // --- Types for World Generation Planning ---
 
 export type WorldEntityPlan = {
-  category: "state" | "religion" | "culture";
+  category: "state" | "religion" | "pantheon" | "culture";
   sourceId: number;           // Azgaar entity ID
   sourceName: string;         // e.g., "Kingdom of Eldara"
   entitiesToGenerate: Array<{
@@ -486,6 +486,151 @@ Output ONLY valid JSON:
       const elapsedMs = Date.now() - startTime;
       ctx.onEntityComplete?.(religion.name, i, religions.length, 0, elapsedMs);
       result.errors.push(`Religion ${religion.name}: ${e?.message || String(e)}`);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Generate deity entities for each religion based on its form.
+ * Runs after religion generation so it can reference generated religion entities.
+ */
+export async function generatePantheonContent(ctx: WorldGenContext): Promise<WorldGenResult> {
+  const religionEntities = getGeneratedReligionEntities(ctx.canon);
+  const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+  const result: WorldGenResult = { created: 0, errors: [] };
+
+  if (religionEntities.length === 0) {
+    ctx.onProgress?.("No religion entities found - skipping pantheon generation");
+    return result;
+  }
+
+  ctx.onProgress?.(`Generating pantheons for ${religionEntities.length} religions...`);
+
+  // Form-to-deity count mapping
+  const FORM_DEITY_COUNTS: Record<string, { min: number; max: number; guidance: string }> = {
+    "Monotheism": { min: 1, max: 1, guidance: "Generate exactly ONE all-encompassing deity. This deity may have multiple aspects or manifestations, but is a single divine being." },
+    "Dualism": { min: 2, max: 2, guidance: "Generate exactly TWO opposing deities representing complementary/opposing forces (light/dark, creation/destruction, order/chaos)." },
+    "Polytheism": { min: 5, max: 12, guidance: "Generate a pantheon with a hierarchy: 1 supreme deity, 2-3 greater deities, and the rest as lesser deities. Each should have distinct domains." },
+    "Shamanism": { min: 3, max: 8, guidance: "Generate nature spirits rather than traditional gods. Focus on elemental forces, animal spirits, and ancestral spirits. Use rank 'spirit' for all." },
+    "Folk": { min: 2, max: 6, guidance: "Generate local/ancestral deities tied to everyday life - harvest, hearth, craft, luck. These are approachable, familiar figures, not distant cosmic beings." },
+  };
+
+  for (let i = 0; i < religionEntities.length; i++) {
+    const relEntity = religionEntities[i];
+    const azgaarReligionId = relEntity.azgaarReligionId;
+    if (azgaarReligionId === undefined) continue;
+
+    const religionContext = ctx.world.getReligionContext(azgaarReligionId);
+    if (!religionContext) continue;
+
+    // Skip if deities already exist
+    const existingDeities = ctx.canon.listEntities({ type: "deity", limit: 100 })
+      .filter(e => e.anchors?.azgaarReligionId === azgaarReligionId);
+    if (existingDeities.length > 0) continue;
+
+    const form = religionContext.form || "Polytheism";
+    const formConfig = FORM_DEITY_COUNTS[form] || FORM_DEITY_COUNTS["Polytheism"];
+
+    const startTime = Date.now();
+    ctx.onEntityStart?.(relEntity.name, i, religionEntities.length);
+
+    try {
+      const religionInfo = [
+        `Religion: ${relEntity.name}`,
+        `Type: ${religionContext.type || "unknown"}`,
+        `Form: ${form}`,
+        religionContext.deity ? `Known deity: ${religionContext.deity}` : "",
+        religionContext.originCulture ? `Origin culture: ${religionContext.originCulture.name}` : "",
+        relEntity.summary ? `Summary: ${relEntity.summary}` : "",
+        relEntity.beliefs?.length ? `Core beliefs: ${relEntity.beliefs.join("; ")}` : "",
+      ].filter(Boolean).join("\n");
+
+      const systemPrompt = `You are a fantasy worldbuilding assistant creating a pantheon for a religion.
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
+${formConfig.guidance}
+
+Generate between ${formConfig.min} and ${formConfig.max} deities. Each deity needs:
+- key: unique identifier string (e.g., "storm_god", "harvest_mother")
+- name: the deity's proper name
+- summary: 1-2 sentence description
+- details_md: 2-3 paragraph rich description covering their role, personality, and significance
+- tags: relevant tags (e.g., "war", "nature", "trickster")
+- payload with: rank (supreme/greater/lesser/demigod/spirit), domains (array of 2-4 domain strings), alignment, symbols (2-3 sacred symbols), titles (2-3 epithets/titles)
+- Optional payload: sacredAnimal, sacredElement, festivals (1-2 named festivals), appearance, mythology (key myth), worshipStyle
+
+Also generate relations between deities (parent_of, sibling_of, consort_of, rival_of, aspect_of) using their keys.
+
+The deities should feel like they belong to the SAME religion and form a coherent mythology.
+Output ONLY valid JSON with "deities" array and optional "relations" array.`;
+
+      const { data, usage } = await completeJsonWithUsage(ctx.llm, {
+        system: systemPrompt,
+        messages: [{ role: "user", content: JSON.stringify({ religion: religionInfo }) }],
+        maxTokens: 4000,
+        temperature: 0.8,
+      });
+
+      if (usage && ctx.onTokens) {
+        ctx.onTokens(usage);
+      }
+
+      const deities = Array.isArray(data?.deities) ? data.deities : [];
+      const relations = Array.isArray(data?.relations) ? data.relations : [];
+      const keyToId = new Map<string, string>();
+
+      for (const deity of deities) {
+        const entity = ctx.canon.addEntity({
+          type: "deity",
+          name: deity.name || "Unknown Deity",
+          summary: deity.summary,
+          details_md: deity.details_md,
+          tags: deity.tags || [],
+          anchors: {
+            azgaarReligionId,
+            religionEntityId: relEntity.id,
+          },
+          payload: deity.payload || {},
+          provenance: {
+            generated_by: "world-init-pantheon",
+            provider: ctx.llm.provider,
+            model: ctx.llm.model,
+            source: "pantheon",
+            sourceReligionId: azgaarReligionId,
+          },
+        });
+        keyToId.set(deity.key, entity.id);
+        result.created += 1;
+
+        // belongs_to relation
+        ctx.canon.addRelation({
+          from_id: entity.id,
+          to_id: relEntity.id,
+          rel_type: "belongs_to",
+        });
+      }
+
+      // Inter-deity relations
+      for (const rel of relations) {
+        const fromId = keyToId.get(rel.from);
+        const toId = keyToId.get(rel.to);
+        if (fromId && toId) {
+          ctx.canon.addRelation({
+            from_id: fromId,
+            to_id: toId,
+            rel_type: rel.rel_type,
+            notes: rel.notes,
+          });
+        }
+      }
+
+      const elapsedMs = Date.now() - startTime;
+      ctx.onEntityComplete?.(relEntity.name, i, religionEntities.length, usage?.totalTokens || 0, elapsedMs);
+    } catch (e: any) {
+      const elapsedMs = Date.now() - startTime;
+      ctx.onEntityComplete?.(relEntity.name, i, religionEntities.length, 0, elapsedMs);
+      result.errors.push(`Pantheon for ${relEntity.name}: ${e?.message || String(e)}`);
     }
   }
 
@@ -795,7 +940,7 @@ export function formatWorldGenPlan(plan: WorldGenPlan, useColors?: boolean): str
   lines.push("");
 
   // Count entities by category
-  const counts = { state: 0, religion: 0, culture: 0, total: 0 };
+  const counts: Record<string, number> = { state: 0, religion: 0, pantheon: 0, culture: 0, total: 0 };
   for (const entity of plan.entities) {
     counts[entity.category] += entity.entitiesToGenerate.length;
     counts.total += entity.entitiesToGenerate.length;
@@ -1540,8 +1685,9 @@ Output ONLY valid JSON:
 // --- Phased Execution ---
 
 /**
- * Execute world generation in 3 sequential phases:
+ * Execute world generation in up to 4 sequential phases:
  * Phase 1: Religions (uses vibe/story context)
+ * Phase 1b: Pantheons (generates deities for each religion)
  * Phase 2: Cultures (queries generated religions from DB)
  * Phase 3: States + Rulers (queries generated religions and cultures from DB)
  *
@@ -1558,7 +1704,7 @@ export async function executePhasedWorldGeneration(
   // Phase 1: Religions (uses vibe/story only)
   if (flags.religions) {
     onPhaseStart?.(1, "Religions");
-    ctx.onProgress?.("Phase 1/3: Generating religions...");
+    ctx.onProgress?.("Phase 1/4: Generating religions...");
     const result = await generateReligionContent(ctx);
     totalResult.created += result.created;
     totalResult.errors.push(...result.errors);
@@ -1566,10 +1712,21 @@ export async function executePhasedWorldGeneration(
     debugLog(`[Phased] Phase 1 complete: ${result.created} religions created`);
   }
 
+  // Phase 1b: Pantheons (generates deities for each religion)
+  if (flags.pantheons) {
+    onPhaseStart?.(1, "Pantheons");
+    ctx.onProgress?.("Phase 1b/4: Generating pantheons (deities for each religion)...");
+    const result = await generatePantheonContent(ctx);
+    totalResult.created += result.created;
+    totalResult.errors.push(...result.errors);
+    onPhaseComplete?.(1, result);
+    debugLog(`[Phased] Phase 1b complete: ${result.created} deities created`);
+  }
+
   // Phase 2: Cultures (queries generated religions from DB)
   if (flags.cultures) {
     onPhaseStart?.(2, "Cultures");
-    ctx.onProgress?.("Phase 2/3: Generating cultures (with religion context)...");
+    ctx.onProgress?.("Phase 2/4: Generating cultures (with religion context)...");
     const result = await generateCultureContentWithReligions(ctx);
     totalResult.created += result.created;
     totalResult.errors.push(...result.errors);
@@ -1580,7 +1737,7 @@ export async function executePhasedWorldGeneration(
   // Phase 3: States + Rulers (queries generated religions and cultures from DB)
   if (flags.states) {
     onPhaseStart?.(3, "States");
-    ctx.onProgress?.("Phase 3/3: Generating states (with religion & culture context)...");
+    ctx.onProgress?.("Phase 3/4: Generating states (with religion & culture context)...");
     const result = await generateStateContentWithContext(ctx);
     totalResult.created += result.created;
     totalResult.errors.push(...result.errors);
@@ -1635,7 +1792,7 @@ function getCulturesForStates(world: AzgaarWorld, stateIds: number[]): Set<numbe
 }
 
 export type PhasePlan = {
-  phase: "religions" | "cultures" | "states";
+  phase: "religions" | "pantheons" | "cultures" | "states";
   description: string;
   campaignTheme: string;
   entities: WorldEntityPlan[];
@@ -1737,6 +1894,64 @@ IMPORTANT:
         reason: g.reason || "",
       })),
     })),
+  };
+}
+
+/**
+ * Plan pantheon generation - creates deity entities for each religion
+ *
+ * Uses generated religion entities from DB for context. Deity count
+ * is determined by religion form (Monotheism=1, Polytheism=5-12, etc.)
+ */
+export async function planPantheonGeneration(ctx: WorldGenContext): Promise<PhasePlan> {
+  const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+  const religionEntities = getGeneratedReligionEntities(ctx.canon);
+
+  // Filter to religions that don't already have deities
+  const religionsNeedingPantheon = religionEntities.filter(re => {
+    if (re.azgaarReligionId === undefined) return false;
+    const existing = ctx.canon.listEntities({ type: "deity", limit: 100 })
+      .filter(e => e.anchors?.azgaarReligionId === re.azgaarReligionId);
+    return existing.length === 0;
+  });
+
+  ctx.onPlanProgress?.(`Planning pantheons for ${religionsNeedingPantheon.length} religions...`);
+
+  const FORM_COUNTS: Record<string, string> = {
+    "Monotheism": "1 deity",
+    "Dualism": "2 opposing deities",
+    "Polytheism": "5-12 deities",
+    "Shamanism": "3-8 spirits",
+    "Folk": "2-6 local deities",
+  };
+
+  // Build entities list from religion data
+  const entities: WorldEntityPlan[] = religionsNeedingPantheon.map(re => {
+    const rc = re.azgaarReligionId !== undefined
+      ? ctx.world.getReligionContext(re.azgaarReligionId)
+      : undefined;
+    const form = rc?.form || "Polytheism";
+    const countDesc = FORM_COUNTS[form] || "5-12 deities";
+
+    return {
+      category: "pantheon",
+      sourceId: re.azgaarReligionId || 0,
+      sourceName: re.name,
+      thematicNotes: `${form} — ${countDesc}`,
+      entitiesToGenerate: [{
+        type: "deity" as EntityType,
+        name: `Pantheon of ${re.name}`,
+        role: "deity-pantheon",
+        reason: `Generate ${countDesc} for this ${form} religion`,
+      }],
+    };
+  });
+
+  return {
+    phase: "pantheons",
+    description: `Generate deity pantheons for ${religionsNeedingPantheon.length} religions`,
+    campaignTheme: campaignContext || "",
+    entities,
   };
 }
 
@@ -2099,6 +2314,11 @@ export async function executePhasePlan(
   ctx: WorldGenContext,
   plan: PhasePlan
 ): Promise<WorldGenResult> {
+  // Pantheon phase uses batch generation (multiple deities per religion in one LLM call)
+  if (plan.phase === "pantheons") {
+    return generatePantheonContent(ctx);
+  }
+
   const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
   const result: WorldGenResult = { created: 0, errors: [] };
 

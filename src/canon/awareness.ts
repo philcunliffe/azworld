@@ -18,6 +18,8 @@ export function propagateAwareness(opts: PropagationOptions): void {
 
   const scope = (payload.scope as string) || "burg";
   const severity = (payload.severity as string) || "moderate";
+  const secrecy = (payload.secrecy as string) || "public";
+  const audience = (payload.audience as Record<string, any> | undefined) || {};
   const daysAgo = typeof payload.daysAgo === "number" ? payload.daysAgo : 0;
   const daysSinceEvent = daysAgo;
 
@@ -32,6 +34,15 @@ export function propagateAwareness(opts: PropagationOptions): void {
     major: 1.5,
     catastrophic: 2.0,
   }[severity] || 1.0;
+
+  const secrecyMultiplier = {
+    secret: 0.2,
+    restricted: 0.5,
+    rumored: 0.85,
+    public: 1.2,
+  }[secrecy] || 1.0;
+
+  const publicKnowledge = secrecy === "public" || audience.public === true;
 
   // Source location has intimate knowledge immediately
   if (eventBurgId) {
@@ -49,6 +60,12 @@ export function propagateAwareness(opts: PropagationOptions): void {
       eventId: event.id,
       level: scope === "state" || scope === "region" || scope === "world" ? "intimate" : "confirmed",
     });
+  }
+
+  seedAudienceAwareness(event, canon, audience);
+
+  if (!publicKnowledge) {
+    return;
   }
 
   // Propagate to other burgs based on scope and time
@@ -74,38 +91,38 @@ export function propagateAwareness(opts: PropagationOptions): void {
     // Determine awareness level based on scope and propagation rules
     if (scope === "world") {
       // World events: confirmed everywhere after a few days
-      if (daysSinceEvent >= 3 / severityMultiplier) {
+      if (daysSinceEvent >= 3 / (severityMultiplier * secrecyMultiplier)) {
         level = "confirmed";
       } else if (daysSinceEvent >= 1) {
         level = "rumor";
       }
     } else if (scope === "region") {
       // Region events: confirmed in same state, rumor elsewhere
-      if (isSameState && daysSinceEvent >= 2 / severityMultiplier) {
+      if (isSameState && daysSinceEvent >= 2 / (severityMultiplier * secrecyMultiplier)) {
         level = "confirmed";
-      } else if (daysSinceEvent >= 5 / severityMultiplier) {
+      } else if (daysSinceEvent >= 5 / (severityMultiplier * secrecyMultiplier)) {
         level = "rumor";
       }
     } else if (scope === "state") {
       // State events: confirmed in same state after time, rumor in neighboring
       if (isSameState) {
-        if (daysSinceEvent >= 1 / severityMultiplier) {
+        if (daysSinceEvent >= 1 / (severityMultiplier * secrecyMultiplier)) {
           level = isCapital || isPort ? "confirmed" : "rumor";
         }
-        if (daysSinceEvent >= 3 / severityMultiplier) {
+        if (daysSinceEvent >= 3 / (severityMultiplier * secrecyMultiplier)) {
           level = "confirmed";
         }
-      } else if (daysSinceEvent >= 7 / severityMultiplier) {
+      } else if (daysSinceEvent >= 7 / (severityMultiplier * secrecyMultiplier)) {
         level = isPort ? "rumor" : "unknown";
       }
     } else if (scope === "burg") {
       // Burg events: local stays local unless severe
       if (isSameState) {
         // Same state hears rumors quickly
-        if (daysSinceEvent >= 3 / severityMultiplier && distance < 200) {
+        if (daysSinceEvent >= 3 / (severityMultiplier * secrecyMultiplier) && distance < 200) {
           level = "rumor";
         }
-        if (daysSinceEvent >= 7 / severityMultiplier) {
+        if (daysSinceEvent >= 7 / (severityMultiplier * secrecyMultiplier)) {
           level = isCapital ? "rumor" : "unknown";
         }
       }
@@ -163,6 +180,8 @@ export function initializeEventAwareness(opts: {
   // Source has intimate knowledge
   const eventBurgId = event.anchors?.burgId;
   const eventStateId = event.anchors?.stateId;
+  const secrecy = (event.payload?.secrecy as string) || "public";
+  const audience = (event.payload?.audience as Record<string, any> | undefined) || {};
 
   if (eventBurgId) {
     canon.setAwareness({
@@ -178,9 +197,11 @@ export function initializeEventAwareness(opts: {
       actorType: "state",
       actorId: String(eventStateId),
       eventId: event.id,
-      level: "confirmed",
+      level: secrecy === "secret" ? "rumor" : "confirmed",
     });
   }
+
+  seedAudienceAwareness(event, canon, audience);
 }
 
 /**
@@ -218,4 +239,38 @@ export function getNpcAwareness(opts: {
   });
 
   return burgAwareness.length ? burgAwareness[0].level : "unknown";
+}
+
+function seedAudienceAwareness(
+  event: CanonEntity,
+  canon: CanonStore,
+  audience: Record<string, any>
+): void {
+  const eventId = event.id;
+  const intimateFactionIds = toStringArray(audience.knownFactionIds);
+  const intimateNpcIds = toStringArray(audience.knownNpcIds);
+  const intimateBurgIds = toStringArray(audience.knownBurgIds);
+  const intimateStateIds = toStringArray(audience.knownStateIds);
+  const rumoredFactionIds = toStringArray(audience.suspectedByFactionIds);
+
+  for (const id of intimateFactionIds) {
+    canon.setAwareness({ actorType: "faction", actorId: id, eventId, level: "intimate" });
+  }
+  for (const id of intimateNpcIds) {
+    canon.setAwareness({ actorType: "npc", actorId: id, eventId, level: "intimate" });
+  }
+  for (const id of intimateBurgIds) {
+    canon.setAwareness({ actorType: "burg", actorId: id, eventId, level: "intimate" });
+  }
+  for (const id of intimateStateIds) {
+    canon.setAwareness({ actorType: "state", actorId: id, eventId, level: "intimate" });
+  }
+  for (const id of rumoredFactionIds) {
+    canon.setAwareness({ actorType: "faction", actorId: id, eventId, level: "rumor" });
+  }
+}
+
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item));
 }

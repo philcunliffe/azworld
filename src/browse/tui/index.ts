@@ -8,7 +8,8 @@ import type { TuiState, TuiAction, TuiCallbacks, TreeNode, EntityKind, ApprovalC
 import type { EntityRef, BrowseState } from "../state";
 import type { AzgaarWorld } from "../../world/azgaar";
 import type { CanonStore } from "../../canon/canon";
-import type { GenPlan, ModPlan, FieldRegenPlan } from "../gen-agent";
+import type { GenPlan, ModPlan, FieldRegenPlan, RumorPlan, HookPlan } from "../gen-agent";
+import type { SimulationPlan } from "../sim-agent";
 
 import { createInitialTuiState, tuiReducer, dispatchAll, getSelectedNode } from "./state";
 import { calculateLayout, isTerminalTooSmall, getMinSizeMessage, type LayoutDimensions } from "./layout";
@@ -39,13 +40,25 @@ import {
   clearScreen,
   padRight,
 } from "./renderer";
-import { executeCommand, executePendingGeneration, executePendingModification, planFieldRegen, executePendingFieldRegeneration, executePendingDescriptionGeneration, type CommandContext } from "../commands";
+import {
+  executeCommand,
+  executePendingGeneration,
+  executePendingModification,
+  executePendingSimulation,
+  planFieldRegen,
+  executePendingFieldRegeneration,
+  executePendingDescriptionGeneration,
+  executePendingRumorGeneration,
+  executePendingHookGeneration,
+  type CommandContext,
+} from "../commands";
 import type { DescriptionPlan } from "../gen-agent";
 import { currentRef, navigateTo, setStack, stackToPath } from "../state";
 import { debugLog } from "../../chat/debug-log";
 import { saveCampaignSettings, type GenerationFlags } from "../../chat/campaign-settings";
 import {
   planReligionGeneration,
+  planPantheonGeneration,
   planCultureGeneration,
   planStateGeneration,
   executePhasePlan,
@@ -90,9 +103,12 @@ export class TuiController {
   private stdin: typeof process.stdin;
   private wasRawMode = false;
   private pendingPlan: GenPlan | null = null;  // Generation plan awaiting user approval
+  private pendingRumorPlan: RumorPlan | null = null;  // Rumor plan awaiting user approval
+  private pendingHookPlan: HookPlan | null = null;  // Hook plan awaiting user approval
   private pendingModPlan: ModPlan | null = null;  // Modification plan awaiting user approval
   private pendingFieldRegenPlan: FieldRegenPlan | null = null;  // Field regeneration plan awaiting user approval
   private pendingDescriptionPlan: DescriptionPlan | null = null;  // Description plan awaiting approval
+  private pendingSimulationPlan: SimulationPlan | null = null;  // Simulation plan awaiting approval
   private pendingPhasePlan: PhasePlan | null = null;  // Phase-specific plan awaiting approval
   private pendingPhaseCtx: WorldGenContext | null = null;  // Context for phase generation
   private pendingPhaseFlags: GenerationFlags | null = null;  // Flags for which phases to run
@@ -299,6 +315,10 @@ export class TuiController {
       this.executeApprovedModification();
     }
 
+    if (result.callback === "execute_approved_simulation") {
+      await this.executeApprovedSimulation();
+    }
+
     if (result.callback === "execute_approved_world_generation") {
       await this.executeApprovedWorldGeneration();
     }
@@ -479,13 +499,14 @@ export class TuiController {
     }
 
     // Check if this is a gen command (but not simplegen) - show planning modal immediately
-    const isGenCommand = /^gen\s+(location|npc|faction)/i.test(trimmed);
+    const isGenCommand = /^gen\s+(location|npc|faction|rumor|hook)/i.test(trimmed);
     // Check if this is a burg gen command (gen followed by anything that's not a known subcommand)
     // This matches: gen "theme", gen something, etc. when on a burg
     const isBurgGenCommand = /^gen\s+/i.test(trimmed) &&
       !/^gen\s+(location|npc|faction|rumor|hook|description)\b/i.test(trimmed);
     // Check if this is a mod command - show planning modal immediately
     const isModCommand = /^mod\s+/i.test(trimmed);
+    const isSimulationCommand = /^(advance|wait|pass)\s+/i.test(trimmed);
 
     if (isGenCommand || isBurgGenCommand) {
       // Reset token counts for new generation command
@@ -497,6 +518,10 @@ export class TuiController {
       // Reset token counts for new modification command
       this.dispatch({ type: "RESET_TOKEN_COUNTS" });
       this.dispatch({ type: "SHOW_PLANNING_MODAL", title: "Creating Modification Plan" });
+      this.render();
+    } else if (isSimulationCommand) {
+      this.dispatch({ type: "RESET_TOKEN_COUNTS" });
+      this.dispatch({ type: "SHOW_PLANNING_MODAL", title: "Creating Simulation Plan" });
       this.render();
     }
 
@@ -522,7 +547,7 @@ export class TuiController {
           }
         },
         // Track planner tokens during planning phase
-        onTokens: (isGenCommand || isBurgGenCommand || isModCommand) ? (usage) => {
+        onTokens: (isGenCommand || isBurgGenCommand || isModCommand || isSimulationCommand) ? (usage) => {
           this.dispatch({ type: "ADD_PLANNER_TOKENS", usage });
           this.render();
         } : this.options.commandContext.onTokens,
@@ -538,7 +563,7 @@ export class TuiController {
 
       if (result.error) {
         // Show error in modal (only if we're still in modal mode, i.e., user didn't cancel)
-        if ((isGenCommand || isBurgGenCommand || isModCommand) && this.state.mode !== "modal") {
+        if ((isGenCommand || isBurgGenCommand || isModCommand || isSimulationCommand) && this.state.mode !== "modal") {
           // User cancelled during planning, don't show error modal
         } else {
           this.dispatch({ type: "SHOW_MODAL", title: "Error" });
@@ -582,6 +607,17 @@ export class TuiController {
           ],
           planText: planText || "(Plan text missing - see debug log)",
         });
+      } else if (result.pendingSimulation) {
+        this.pendingSimulationPlan = result.pendingSimulation.plan;
+        this.dispatch({
+          type: "SHOW_APPROVAL_MODAL",
+          title: "Simulation Plan",
+          choices: [
+            { label: "Apply Changes", value: "simulate", hint: "Advance time and apply the approved world changes" },
+            { label: "Cancel", value: "cancel", hint: "Abort without changing canon" },
+          ],
+          planText: result.pendingSimulation.formattedPlan || "(Plan text missing)",
+        });
       } else if (result.runOnboarding) {
         // Open onboarding wizard
         this.dispatch({ type: "OPEN_ONBOARDING" });
@@ -610,6 +646,30 @@ export class TuiController {
           ],
           planText: planText || "(Plan text missing)",
         });
+      } else if (result.pendingRumorGeneration) {
+        this.pendingRumorPlan = result.pendingRumorGeneration.plan;
+        const planText = result.pendingRumorGeneration.formattedPlan;
+        this.dispatch({
+          type: "SHOW_APPROVAL_MODAL",
+          title: "Rumor Generation Plan",
+          choices: [
+            { label: "Generate", value: "generate", hint: "Generate the rumor" },
+            { label: "Cancel", value: "cancel", hint: "Abort without generating" },
+          ],
+          planText: planText || "(Plan text missing)",
+        });
+      } else if (result.pendingHookGeneration) {
+        this.pendingHookPlan = result.pendingHookGeneration.plan;
+        const planText = result.pendingHookGeneration.formattedPlan;
+        this.dispatch({
+          type: "SHOW_APPROVAL_MODAL",
+          title: "Hook Generation Plan",
+          choices: [
+            { label: "Generate", value: "generate", hint: "Generate the hook" },
+            { label: "Cancel", value: "cancel", hint: "Abort without generating" },
+          ],
+          planText: planText || "(Plan text missing)",
+        });
       } else if (result.pendingBurgGeneration) {
         // Show approval modal for comprehensive burg generation
         // This uses the same GenPlan flow as regular generation
@@ -633,6 +693,12 @@ export class TuiController {
         // Exit talk mode
         this.exitTalkMode();
         return;
+      } else if (result.messageModal) {
+        this.dispatch({
+          type: "SHOW_MESSAGE_MODAL",
+          title: result.messageModal.title,
+          message: result.messageModal.content,
+        });
       }
 
       // Sync tree state after command - rebuild first, then sync selection
@@ -651,19 +717,6 @@ export class TuiController {
    * Execute pending generation after user approval
    */
   private async executeApprovedGeneration(): Promise<void> {
-    if (!this.pendingPlan) return;
-
-    // Copy edited entities back to the plan
-    if (this.state.modal?.pendingEntities) {
-      this.pendingPlan = {
-        ...this.pendingPlan,
-        entities: this.state.modal.pendingEntities as any,
-      };
-    }
-
-    const plan = this.pendingPlan;
-    this.pendingPlan = null;
-
     // Switch modal to progress mode
     this.dispatch({ type: "SHOW_MODAL", title: "Generating..." });
 
@@ -682,6 +735,8 @@ export class TuiController {
               npc: "npc",
               faction: "faction",
               event: "event",
+              rumor: "rumor",
+              hook: "hook",
             };
             const kind = kindMap[entity.type] || "location";
             this.addGeneratedEntity(entity.id, entity.name, kind);
@@ -694,7 +749,30 @@ export class TuiController {
         },
       };
 
-      const result = await executePendingGeneration(plan, tuiContext);
+      let result;
+      if (this.pendingRumorPlan) {
+        const plan = this.pendingRumorPlan;
+        this.pendingRumorPlan = null;
+        result = await executePendingRumorGeneration(plan, tuiContext);
+      } else if (this.pendingHookPlan) {
+        const plan = this.pendingHookPlan;
+        this.pendingHookPlan = null;
+        result = await executePendingHookGeneration(plan, tuiContext);
+      } else {
+        if (!this.pendingPlan) return;
+
+        // Copy edited entities back to the plan
+        if (this.state.modal?.pendingEntities) {
+          this.pendingPlan = {
+            ...this.pendingPlan,
+            entities: this.state.modal.pendingEntities as any,
+          };
+        }
+
+        const plan = this.pendingPlan;
+        this.pendingPlan = null;
+        result = await executePendingGeneration(plan, tuiContext);
+      }
 
       if (result.error) {
         this.dispatch({ type: "MODAL_ERROR", error: result.error });
@@ -729,6 +807,42 @@ export class TuiController {
         // Rebuild tree to reflect any name changes
         this.rebuildTree();
       }
+    } catch (e: any) {
+      this.dispatch({ type: "SHOW_MODAL", title: "Error" });
+      this.dispatch({ type: "MODAL_ERROR", error: e?.message || String(e) });
+    }
+  }
+
+  /**
+   * Execute pending simulation after user approval
+   */
+  private async executeApprovedSimulation(): Promise<void> {
+    if (!this.pendingSimulationPlan) return;
+
+    const plan = this.pendingSimulationPlan;
+    this.pendingSimulationPlan = null;
+
+    this.dispatch({ type: "SHOW_PLANNING_MODAL", title: "Applying Simulation" });
+    this.dispatch({ type: "UPDATE_MODAL_PROGRESS", progress: "Advancing world time and applying approved changes..." });
+    this.render();
+
+    try {
+      const result = await executePendingSimulation(plan, this.options.commandContext);
+
+      if (result.error) {
+        this.dispatch({ type: "SHOW_MODAL", title: "Error" });
+        this.dispatch({ type: "MODAL_ERROR", error: result.error });
+        return;
+      }
+
+      await this.rebuildTree();
+      this.syncTreeSelectionToBrowseState();
+
+      this.dispatch({
+        type: "SHOW_MESSAGE_MODAL",
+        title: result.messageModal?.title || "Simulation Applied",
+        message: result.messageModal?.content || result.output || "Simulation applied.",
+      });
     } catch (e: any) {
       this.dispatch({ type: "SHOW_MODAL", title: "Error" });
       this.dispatch({ type: "MODAL_ERROR", error: e?.message || String(e) });
@@ -818,7 +932,7 @@ export class TuiController {
 
     // User selected "Save & Generate" (index 0) - start phase-by-phase generation
     const { contentTypes, scope, selectedStateIds } = generate;
-    const hasGeneration = contentTypes.religions || contentTypes.cultures || contentTypes.states;
+    const hasGeneration = contentTypes.religions || contentTypes.pantheons || contentTypes.cultures || contentTypes.states;
     if (!hasGeneration) {
       return;
     }
@@ -826,6 +940,7 @@ export class TuiController {
     // Convert new generate structure to GenerationFlags format
     const legacyFlags: GenerationFlags = {
       religions: contentTypes.religions,
+      pantheons: contentTypes.pantheons,
       cultures: contentTypes.cultures,
       states: contentTypes.states,
     };
@@ -859,10 +974,12 @@ export class TuiController {
 
     const flags = this.pendingPhaseFlags;
 
-    // Determine next phase: religions -> cultures -> states
-    let nextPhase: "religions" | "cultures" | "states" | null = null;
+    // Determine next phase: religions -> pantheons -> cultures -> states
+    let nextPhase: "religions" | "pantheons" | "cultures" | "states" | null = null;
     if (flags.religions) {
       nextPhase = "religions";
+    } else if (flags.pantheons) {
+      nextPhase = "pantheons";
     } else if (flags.cultures) {
       nextPhase = "cultures";
     } else if (flags.states) {
@@ -883,7 +1000,7 @@ export class TuiController {
   /**
    * Plan a specific phase and show approval modal
    */
-  private async planPhase(phase: "religions" | "cultures" | "states"): Promise<void> {
+  private async planPhase(phase: "religions" | "pantheons" | "cultures" | "states"): Promise<void> {
     const phaseTitle = phase.charAt(0).toUpperCase() + phase.slice(1);
     this.dispatch({ type: "SHOW_PLANNING_MODAL", title: `Planning ${phaseTitle}` });
     this.render();
@@ -912,6 +1029,8 @@ export class TuiController {
       debugLog(`[TUI] Planning ${phase}...`);
       if (phase === "religions") {
         plan = await planReligionGeneration(planCtx);
+      } else if (phase === "pantheons") {
+        plan = await planPantheonGeneration(planCtx);
       } else if (phase === "cultures") {
         plan = await planCultureGeneration(planCtx);
       } else {
@@ -998,6 +1117,8 @@ export class TuiController {
     const currentPhase = plan.phase;
     if (currentPhase === "religions") {
       this.pendingPhaseFlags = { ...flags, religions: false };
+    } else if (currentPhase === "pantheons") {
+      this.pendingPhaseFlags = { ...flags, pantheons: false };
     } else if (currentPhase === "cultures") {
       this.pendingPhaseFlags = { ...flags, cultures: false };
     } else if (currentPhase === "states") {
@@ -1030,7 +1151,7 @@ export class TuiController {
 
       // Check if there are more phases
       const hasMorePhases = this.pendingPhaseFlags &&
-        (this.pendingPhaseFlags.religions || this.pendingPhaseFlags.cultures || this.pendingPhaseFlags.states);
+        (this.pendingPhaseFlags.religions || this.pendingPhaseFlags.pantheons || this.pendingPhaseFlags.cultures || this.pendingPhaseFlags.states);
 
       if (hasMorePhases) {
         // Close modal and start next phase
@@ -1212,7 +1333,7 @@ export class TuiController {
         nodes = buildFactionsList(canon, this.state.selectedNodeId);
         break;
       case "religions":
-        nodes = buildReligionsList(world, this.state.selectedNodeId);
+        nodes = buildReligionsList(world, this.state.selectedNodeId, canon, this.state.expandedNodes);
         break;
       case "cultures":
         nodes = buildCulturesList(world, this.state.selectedNodeId);

@@ -180,11 +180,12 @@ export function renderOnboardingModal(
     allContentLines.push("");
     allContentLines.push(`${BOLD}Generation:${RESET}`);
     const ct = onboarding.generate.contentTypes;
-    const hasAnyContent = ct.religions || ct.cultures || ct.states;
+    const hasAnyContent = ct.religions || ct.pantheons || ct.cultures || ct.states;
     if (!hasAnyContent) {
       allContentLines.push(`  ${DIM}(No content selected)${RESET}`);
     } else {
       if (ct.religions) allContentLines.push(`  ${FG_GREEN}[x]${RESET} Religions`);
+      if (ct.pantheons) allContentLines.push(`  ${FG_GREEN}[x]${RESET} Pantheons`);
       if (ct.cultures) allContentLines.push(`  ${FG_GREEN}[x]${RESET} Cultures`);
       if (ct.states) allContentLines.push(`  ${FG_GREEN}[x]${RESET} States + Leaders`);
     }
@@ -224,6 +225,7 @@ export function renderOnboardingModal(
       const options = getStepOptions(onboarding.currentStep);
       const descriptions = [
         "Generate theological content for each religion",
+        "Generate deities for each religion based on form",
         "Generate detailed descriptions for each culture",
         "Generate governments and rulers for each state",
       ];

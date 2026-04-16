@@ -11,6 +11,9 @@ import {
   HookUrgencyEnum,
   HookDifficultyEnum,
   HookRewardTypeEnum,
+  DeityRankEnum,
+  EventScaleEnum,
+  SecrecyLevelEnum,
 } from "../schema";
 import { formatSettingsForGeneration } from "../campaign-settings";
 
@@ -59,6 +62,18 @@ const EventGenResultSchema = z.object({
     severity: z.string().optional(),
     effect: z.string().optional(),
   })).optional(),
+  payload: z.object({
+    scale: EventScaleEnum.optional(),
+    secrecy: SecrecyLevelEnum.optional(),
+    audience: z.object({
+      public: z.boolean().optional(),
+      knownFactionIds: z.array(z.string()).optional(),
+      knownNpcIds: z.array(z.string()).optional(),
+      knownBurgIds: z.array(z.union([z.number(), z.string()])).optional(),
+      knownStateIds: z.array(z.union([z.number(), z.string()])).optional(),
+      suspectedByFactionIds: z.array(z.string()).optional(),
+    }).optional(),
+  }).optional(),
 });
 
 const LoreGenResultSchema = z.object({
@@ -76,6 +91,8 @@ const RumorGenResultSchema = z.object({
     truthLevel: RumorTruthLevelEnum,
     spreadLevel: RumorSpreadLevelEnum,
     sourceType: RumorSourceTypeEnum,
+    secrecy: SecrecyLevelEnum.optional(),
+    ageDays: z.number().optional(),
     actualTruth: z.string().optional(),
   }),
 });
@@ -178,7 +195,9 @@ function formatEventContext(events: any[]): string {
     const scope = e.scope || "burg";
     const daysAgo = e.daysAgo ?? "?";
     const severity = e.severity || "unknown";
-    lines.push(`- ${e.name} (${scope}-level, ${daysAgo} days ago, ${severity}): ${e.summary || "No details"}`);
+    const scale = e.scale ? `, ${e.scale}` : "";
+    const secrecy = e.secrecy ? `, ${e.secrecy}` : "";
+    lines.push(`- ${e.name} (${scope}-level, ${daysAgo} days ago, ${severity}${scale}${secrecy}): ${e.summary || "No details"}`);
   }
   lines.push("", "Generated content should reflect these conditions naturally.");
   return lines.join("\n");
@@ -206,7 +225,6 @@ export function registerGenerateTools(registry: ToolRegistry): void {
           },
           burgId: { type: "number", description: "Burg where the location is" },
           hints: { type: "string", description: "Additional creative hints (e.g., 'criminal ties', 'upscale', 'miners guild')" },
-          activeEvents: { type: "string", description: "JSON array of active events to incorporate" },
           existingEntities: { type: "string", description: "JSON array of existing entity names to avoid duplicating" },
           reason: { type: "string", description: "Reason/prompt for why this entity is being generated (for provenance)" },
           source: { type: "string", description: "Source application generating this entity (e.g., 'azbrowse', 'azchat')" },
@@ -231,16 +249,16 @@ export function registerGenerateTools(registry: ToolRegistry): void {
       console.log(`[generate_location] Found burg: ${burg.name}`);
 
       const state = typeof burg.state === "number" ? ctx.world.getState(burg.state) : undefined;
+      const stateId = typeof burg.state === "number" ? burg.state : undefined;
 
-      // Parse active events
-      let activeEvents: any[] = [];
-      if (args.activeEvents) {
-        try {
-          activeEvents = JSON.parse(String(args.activeEvents));
-        } catch {
-          activeEvents = [];
-        }
-      }
+      // Query active events affecting this location
+      const activeEvents = ctx.canon.getActiveEvents({
+        burgId,
+        stateId,
+        includeParentScopes: true,
+        recencyDays: 90,
+      });
+      console.log(`[generate_location] Found ${activeEvents.length} active events`);
 
       // Parse existing entities
       let existingNames: string[] = [];
@@ -252,7 +270,15 @@ export function registerGenerateTools(registry: ToolRegistry): void {
         }
       }
 
-      const eventContext = formatEventContext(activeEvents);
+      const eventContext = formatEventContext(activeEvents.map((e) => ({
+        name: e.name,
+        summary: e.summary,
+        scope: e.payload?.scope,
+        daysAgo: e.payload?.daysAgo,
+        severity: e.payload?.severity,
+        scale: e.payload?.scale,
+        secrecy: e.payload?.secrecy,
+      })));
       const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
 
       const systemPrompt = `You are a tabletop GM assistant. Generate a ${kind} location for a fantasy city.
@@ -430,7 +456,6 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Constraints:
           locationId: { type: "string", description: "Location entity ID where NPCs will be" },
           roles: { type: "string", description: "Suggested roles (e.g., 'barkeep, guard, merchant')" },
           factionIds: { type: "string", description: "JSON array of faction IDs to potentially link NPCs to" },
-          activeEvents: { type: "string", description: "JSON array of active events to incorporate" },
           reason: { type: "string", description: "Reason/prompt for why these NPCs are being generated (for provenance)" },
           source: { type: "string", description: "Source application generating these NPCs (e.g., 'azbrowse', 'azchat')" },
         },
@@ -451,14 +476,15 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Constraints:
         return { error: `Burg ${burgId} not found` };
       }
 
-      let activeEvents: any[] = [];
-      if (args.activeEvents) {
-        try {
-          activeEvents = JSON.parse(String(args.activeEvents));
-        } catch {
-          activeEvents = [];
-        }
-      }
+      const stateId = typeof burg.state === "number" ? burg.state : undefined;
+
+      // Query active events affecting this location
+      const activeEvents = ctx.canon.getActiveEvents({
+        burgId,
+        stateId,
+        includeParentScopes: true,
+        recencyDays: 90,
+      });
 
       // Parse faction IDs if provided
       let availableFactions: Array<{ id: string; name: string; kind: string }> = [];
@@ -490,7 +516,15 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Constraints:
         }));
       }
 
-      const eventContext = formatEventContext(activeEvents);
+      const eventContext = formatEventContext(activeEvents.map((e) => ({
+        name: e.name,
+        summary: e.summary,
+        scope: e.payload?.scope,
+        daysAgo: e.payload?.daysAgo,
+        severity: e.payload?.severity,
+        scale: e.payload?.scale,
+        secrecy: e.payload?.secrecy,
+      })));
       const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
       const genLlm = getGenLlm(ctx);
 
@@ -630,7 +664,6 @@ If linking to factions, use "factionId" in payload and add a "factionRole" (memb
           },
           burgId: { type: "number", description: "Burg where faction is based" },
           hints: { type: "string", description: "Additional hints about the faction" },
-          activeEvents: { type: "string", description: "JSON array of active events to incorporate" },
           reason: { type: "string", description: "Reason/prompt for why this faction is being generated (for provenance)" },
           source: { type: "string", description: "Source application generating this faction (e.g., 'azbrowse', 'azchat')" },
         },
@@ -650,21 +683,31 @@ If linking to factions, use "factionId" in payload and add a "factionRole" (memb
         return { error: `Burg ${burgId} not found` };
       }
 
-      let activeEvents: any[] = [];
-      if (args.activeEvents) {
-        try {
-          activeEvents = JSON.parse(String(args.activeEvents));
-        } catch {
-          activeEvents = [];
-        }
-      }
+      const stateId = typeof burg.state === "number" ? burg.state : undefined;
 
-      const eventContext = formatEventContext(activeEvents);
+      // Query active events affecting this location
+      const activeEvents = ctx.canon.getActiveEvents({
+        burgId,
+        stateId,
+        includeParentScopes: true,
+        recencyDays: 90,
+      });
+
+      const eventContext = formatEventContext(activeEvents.map((e) => ({
+        name: e.name,
+        summary: e.summary,
+        scope: e.payload?.scope,
+        daysAgo: e.payload?.daysAgo,
+        severity: e.payload?.severity,
+        scale: e.payload?.scale,
+        secrecy: e.payload?.secrecy,
+      })));
       const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
       const genLlm = getGenLlm(ctx);
 
       const systemPrompt = `You are a tabletop GM assistant. Generate a ${kind} faction.
-${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY valid JSON with a "faction" object.`;
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY valid JSON with a "faction" object.
+Faction payload should include goals and may include goalProgress objects for long-term schemes.`;
 
       const userPrompt = {
         kind,
@@ -738,6 +781,16 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY vali
           burgId: { type: "number", description: "Burg where event is centered (if applicable)" },
           stateId: { type: "number", description: "State where event is centered (if applicable)" },
           daysAgo: { type: "number", description: "How many days ago the event occurred (0 for ongoing)" },
+          historical: { type: "boolean", description: "Mark this as a historical event instead of a current/live event" },
+          eraId: { type: "string", description: "Anchor the event to an existing era entity ID" },
+          eraLabel: { type: "string", description: "Display label for a fuzzy era if no era ID is known yet" },
+          recencyBand: {
+            type: "string",
+            description: "Fuzzy historical distance: mythic, ancient, old, recent, living-memory",
+            enum: ["mythic", "ancient", "old", "recent", "living-memory"],
+          },
+          relativeOrder: { type: "number", description: "Order within a local timeline. Lower numbers happen earlier." },
+          sequenceHint: { type: "string", description: "Narrative ordering hint like 'before the current dynasty'" },
           hints: { type: "string", description: "Additional creative hints" },
           reason: { type: "string", description: "Reason/prompt for why this event is being generated (for provenance)" },
           source: { type: "string", description: "Source application generating this event (e.g., 'azbrowse', 'azchat')" },
@@ -752,6 +805,12 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY vali
       const daysAgo = typeof args.daysAgo === "number" ? args.daysAgo : 0;
       const burgId = args.burgId ? Number(args.burgId) : undefined;
       const stateId = args.stateId ? Number(args.stateId) : undefined;
+      const historical = args.historical === true;
+      const eraId = args.eraId ? String(args.eraId) : undefined;
+      const eraLabel = args.eraLabel ? String(args.eraLabel) : undefined;
+      const recencyBand = args.recencyBand ? String(args.recencyBand) : undefined;
+      const relativeOrder = typeof args.relativeOrder === "number" ? args.relativeOrder : undefined;
+      const sequenceHint = args.sequenceHint ? String(args.sequenceHint) : undefined;
 
       let context = "";
       if (burgId) {
@@ -766,13 +825,20 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY vali
       const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
       const genLlm = getGenLlm(ctx);
       const systemPrompt = `You are a tabletop GM assistant. Generate a ${kind} event.
-${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY valid JSON with an "event" object and "consequences" array.`;
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY valid JSON with an "event" object, optional "payload" object, and "consequences" array.
+Use payload.scale for operational size, payload.secrecy for who knows, and payload.audience for initially informed actors.`;
 
       const userPrompt = {
         kind,
         scope,
         severity,
-        daysAgo,
+        daysAgo: historical ? null : daysAgo,
+        historical,
+        eraId,
+        eraLabel,
+        recencyBand,
+        relativeOrder,
+        sequenceHint,
         context,
         hints: args.hints || null,
       };
@@ -796,14 +862,21 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY vali
         summary: event.summary || null,
         details_md: event.details_md || null,
         tags: event.tags || [kind, scope],
-        anchors: { burgId, stateId },
+        anchors: { burgId, stateId, eraId },
         payload: {
           ...event.payload,
+          ...parsed.data.payload,
           kind,
           scope,
           severity,
-          daysAgo,
-          ongoing: daysAgo === 0,
+          historical,
+          eraId,
+          eraLabel,
+          recencyBand,
+          relativeOrder,
+          sequenceHint,
+          daysAgo: historical ? undefined : daysAgo,
+          ongoing: historical ? false : daysAgo === 0,
           consequences: parsed.data.consequences || [],
         },
         provenance: {
@@ -822,7 +895,8 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY vali
         eventSummary: eventEntity.summary,
         scope,
         severity,
-        daysAgo,
+        daysAgo: historical ? null : daysAgo,
+        historical,
       };
     }
   );
@@ -909,7 +983,7 @@ The "actualTruth" field is GM-only information about what's really going on.
 
 Output ONLY valid JSON with:
 - rumor: { key, type: "rumor", name (the rumor as people say it), summary (1-2 sentences of what people claim), details_md (fuller version with variations), tags }
-- payload: { truthLevel, spreadLevel, sourceType, actualTruth (GM-only: what's really true) }`;
+- payload: { truthLevel, spreadLevel, sourceType, secrecy, ageDays, actualTruth (GM-only: what's really true) }`;
 
       const userPrompt = {
         topic,
@@ -953,6 +1027,7 @@ Output ONLY valid JSON with:
           truthLevel,
           spreadLevel,
           sourceType,
+          ageDays: payload.ageDays ?? 0,
         },
         provenance: {
           generated_by: args.source || "generate_rumor",
@@ -1376,6 +1451,399 @@ Each candidate should have:
           intensity: c.intensity,
           publiclyVisible: c.publiclyVisible,
         })),
+      };
+    }
+  );
+
+  // --- Pantheon generation schemas ---
+  const PantheonDeitySchema = z.object({
+    key: z.string(),
+    name: z.string(),
+    summary: z.string(),
+    details_md: z.string(),
+    tags: z.array(z.string()),
+    payload: z.object({
+      rank: DeityRankEnum,
+      domains: z.array(z.string()),
+      alignment: z.string(),
+      symbols: z.array(z.string()),
+      titles: z.array(z.string()),
+      sacredAnimal: z.string().optional(),
+      sacredElement: z.string().optional(),
+      festivals: z.array(z.string()).optional(),
+      appearance: z.string().optional(),
+      mythology: z.string().optional(),
+      worshipStyle: z.string().optional(),
+    }),
+  });
+
+  const PantheonGenResultSchema = z.object({
+    deities: z.array(PantheonDeitySchema),
+    relations: z.array(z.object({
+      from: z.string(),
+      to: z.string(),
+      rel_type: z.string(),
+      notes: z.string().optional(),
+    })).optional(),
+  });
+
+  // Form-to-deity count mapping
+  const FORM_DEITY_COUNTS: Record<string, { min: number; max: number; guidance: string }> = {
+    "Monotheism": { min: 1, max: 1, guidance: "Generate exactly ONE all-encompassing deity. This deity may have multiple aspects or manifestations, but is a single divine being." },
+    "Dualism": { min: 2, max: 2, guidance: "Generate exactly TWO opposing deities representing complementary/opposing forces (light/dark, creation/destruction, order/chaos)." },
+    "Polytheism": { min: 5, max: 12, guidance: "Generate a pantheon with a hierarchy: 1 supreme deity, 2-3 greater deities, and the rest as lesser deities. Each should have distinct domains." },
+    "Shamanism": { min: 3, max: 8, guidance: "Generate nature spirits rather than traditional gods. Focus on elemental forces, animal spirits, and ancestral spirits. Use rank 'spirit' for all." },
+    "Folk": { min: 2, max: 6, guidance: "Generate local/ancestral deities tied to everyday life - harvest, hearth, craft, luck. These are approachable, familiar figures, not distant cosmic beings." },
+  };
+
+  // generate_pantheon - Generate deities for a religion
+  registry.register(
+    "generate_pantheon",
+    {
+      name: "generate_pantheon",
+      description: "Generate a pantheon of deities for a religion. Creates deity entities based on the religion's form (monotheism, polytheism, etc.). Automatically persists to canon.",
+      parameters: {
+        type: "object",
+        properties: {
+          azgaarReligionId: {
+            type: "number",
+            description: "Azgaar religion ID to generate pantheon for",
+          },
+          hints: {
+            type: "string",
+            description: "Optional hints about the desired pantheon style, themes, or specific deities",
+          },
+          reason: {
+            type: "string",
+            description: "Reason for generating this pantheon (for provenance)",
+          },
+          source: {
+            type: "string",
+            description: "Source application (e.g., 'azbrowse', 'azchat')",
+          },
+        },
+        required: ["azgaarReligionId"],
+      },
+    },
+    async (args: Record<string, any>, ctx: ToolContext) => {
+      const azgaarReligionId = Number(args.azgaarReligionId);
+
+      if (!Number.isFinite(azgaarReligionId)) {
+        return { error: "azgaarReligionId must be a number" };
+      }
+
+      const religionCtx = ctx.world.getReligionContext(azgaarReligionId);
+      if (!religionCtx) {
+        return { error: `Religion ${azgaarReligionId} not found` };
+      }
+
+      // Check for existing deities
+      const existingDeities = ctx.canon.listEntities({ type: "deity", limit: 100 })
+        .filter(e => e.anchors?.azgaarReligionId === azgaarReligionId);
+      if (existingDeities.length > 0) {
+        return {
+          error: `Religion "${religionCtx.name}" already has ${existingDeities.length} deities. Delete existing deities first to regenerate.`,
+          existing: existingDeities.map(d => ({ id: d.id, name: d.name })),
+        };
+      }
+
+      // Find canon religion entity for context
+      const religionEntities = ctx.canon.listEntities({ type: "religion", limit: 100 })
+        .filter(e => e.anchors?.azgaarReligionId === azgaarReligionId);
+      const religionEntity = religionEntities[0];
+
+      // Determine deity count from religion form
+      const form = religionCtx.form || "Polytheism";
+      const formConfig = FORM_DEITY_COUNTS[form] || FORM_DEITY_COUNTS["Polytheism"];
+
+      const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+      const genLlm = getGenLlm(ctx);
+
+      // Build context about the religion
+      const religionInfo: string[] = [
+        `Religion: ${religionCtx.name}`,
+        `Type: ${religionCtx.type || "unknown"}`,
+        `Form: ${form}`,
+      ];
+      if (religionCtx.deity) religionInfo.push(`Known deity name: ${religionCtx.deity}`);
+      if (religionCtx.originCulture) religionInfo.push(`Origin culture: ${religionCtx.originCulture.name}`);
+
+      if (religionEntity) {
+        if (religionEntity.summary) religionInfo.push(`Summary: ${religionEntity.summary}`);
+        const beliefs = religionEntity.payload?.beliefs as string[] | undefined;
+        if (beliefs?.length) religionInfo.push(`Core beliefs: ${beliefs.join("; ")}`);
+        const practices = religionEntity.payload?.practices as string[] | undefined;
+        if (practices?.length) religionInfo.push(`Practices: ${practices.join("; ")}`);
+      }
+
+      const systemPrompt = `You are a fantasy worldbuilding assistant creating a pantheon for a religion.
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
+${formConfig.guidance}
+
+Generate between ${formConfig.min} and ${formConfig.max} deities. Each deity needs:
+- key: unique identifier string (e.g., "storm_god", "harvest_mother")
+- name: the deity's proper name
+- summary: 1-2 sentence description
+- details_md: 2-3 paragraph rich description covering their role, personality, and significance
+- tags: relevant tags (e.g., "war", "nature", "trickster")
+- payload with: rank (supreme/greater/lesser/demigod/spirit), domains (array of 2-4 domain strings), alignment, symbols (2-3 sacred symbols), titles (2-3 epithets/titles)
+- Optional payload: sacredAnimal, sacredElement, festivals (1-2 named festivals), appearance, mythology (key myth), worshipStyle
+
+Also generate relations between deities (parent_of, sibling_of, consort_of, rival_of, aspect_of) using their keys.
+
+The deities should feel like they belong to the SAME religion and form a coherent mythology.
+Output ONLY valid JSON matching the schema.`;
+
+      const userPrompt = {
+        religion: religionInfo.join("\n"),
+        hints: args.hints || null,
+      };
+
+      const result = await completeJson(genLlm, {
+        system: systemPrompt,
+        messages: [{ role: "user", content: JSON.stringify(userPrompt) }],
+        maxTokens: 4000,
+        temperature: 0.8,
+      });
+
+      const parsed = PantheonGenResultSchema.safeParse(result);
+      if (!parsed.success) {
+        return { error: "Failed to parse pantheon generation result", details: parsed.error.message };
+      }
+
+      // Persist deities
+      const keyToId = new Map<string, string>();
+      const createdDeities: Array<{ id: string; name: string; rank: string }> = [];
+
+      for (const deity of parsed.data.deities) {
+        const entity = ctx.canon.addEntity({
+          type: "deity",
+          name: deity.name,
+          summary: deity.summary,
+          details_md: deity.details_md,
+          tags: deity.tags,
+          anchors: {
+            azgaarReligionId,
+            ...(religionEntity ? { religionEntityId: religionEntity.id } : {}),
+          },
+          payload: deity.payload,
+          provenance: {
+            generated_by: args.source || "generate_pantheon",
+            provider: genLlm.provider,
+            model: genLlm.model,
+            reason: args.reason || null,
+          },
+        });
+        keyToId.set(deity.key, entity.id);
+        createdDeities.push({ id: entity.id, name: entity.name, rank: deity.payload.rank });
+
+        // Create belongs_to relation to religion entity
+        if (religionEntity) {
+          ctx.canon.addRelation({ from_id: entity.id, to_id: religionEntity.id, rel_type: "belongs_to" });
+        }
+      }
+
+      // Create inter-deity relations
+      let relationsCreated = 0;
+      if (parsed.data.relations) {
+        for (const rel of parsed.data.relations) {
+          const fromId = keyToId.get(rel.from);
+          const toId = keyToId.get(rel.to);
+          if (fromId && toId) {
+            ctx.canon.addRelation({
+              from_id: fromId,
+              to_id: toId,
+              rel_type: rel.rel_type,
+              notes: rel.notes,
+            });
+            relationsCreated++;
+          }
+        }
+      }
+
+      return {
+        success: true,
+        religionName: religionCtx.name,
+        form,
+        deitiesCreated: createdDeities.length,
+        relationsCreated,
+        deities: createdDeities,
+      };
+    }
+  );
+
+  // generate_marker - Generate a wilderness/map marker (ruin, tower, dungeon, etc.)
+  const MarkerGenResultSchema = z.object({
+    marker: z.object({
+      name: z.string(),
+      summary: z.string().optional(),
+      details_md: z.string().optional(),
+      tags: z.array(z.string()).optional(),
+      payload: z.record(z.any()).optional(),
+    }),
+    narration: z.string().optional(),
+  });
+
+  registry.register(
+    "generate_marker",
+    {
+      name: "generate_marker",
+      description: "Generate a wilderness marker - a point of interest outside of any city/burg. Ruins, wizard towers, dungeons, ancient shrines, monster lairs, abandoned mines, etc. Persists to canon with map coordinates.",
+      parameters: {
+        type: "object",
+        properties: {
+          kind: {
+            type: "string",
+            description: "Type: ruin, tower, dungeon, shrine, cave, camp, monument, grove, mine, bridge, battlefield, portal, lair, oasis, lighthouse, shipwreck, other",
+          },
+          nearBurgId: { type: "number", description: "Burg to place this marker near (picks a wilderness cell nearby)" },
+          stateId: { type: "number", description: "State to place this marker in (alternative to nearBurgId)" },
+          hints: { type: "string", description: "Creative hints (e.g., 'abandoned dwarven', 'cursed', 'hidden by illusion')" },
+          reason: { type: "string", description: "Reason for generation (provenance)" },
+          source: { type: "string", description: "Source application" },
+        },
+        required: ["kind"],
+      },
+    },
+    async (args: Record<string, any>, ctx: ToolContext) => {
+      const kind = String(args.kind || "ruin");
+      const nearBurgId = args.nearBurgId ? Number(args.nearBurgId) : undefined;
+      const stateId = args.stateId ? Number(args.stateId) : undefined;
+
+      // Find a wilderness cell to place the marker
+      let cellId: number | undefined;
+      let cellX: number | undefined;
+      let cellY: number | undefined;
+      let nearBurg: any;
+      let nearState: any;
+
+      if (nearBurgId) {
+        nearBurg = ctx.world.getBurg(nearBurgId);
+        if (!nearBurg) return { error: `Burg ${nearBurgId} not found` };
+        nearState = typeof nearBurg.state === "number" ? ctx.world.getState(nearBurg.state) : undefined;
+
+        // Find a wilderness cell near this burg (no burg assigned, has land)
+        const cells = ctx.world.pack?.cells;
+        if (cells) {
+          const bx = nearBurg.x ?? 0;
+          const by = nearBurg.y ?? 0;
+          const candidates: Array<{ id: number; dist: number; x: number; y: number }> = [];
+          const isObjKeyed = !Array.isArray(cells) && typeof cells === "object";
+          const count = isObjKeyed ? Object.keys(cells).length : (Array.isArray(cells) ? cells.length : 0);
+
+          for (let i = 0; i < count; i++) {
+            const cell = isObjKeyed ? cells[String(i)] : cells[i];
+            if (!cell || !cell.p) continue;
+            if (cell.burg > 0) continue;       // Skip cells with burgs
+            if (cell.h < 20) continue;          // Skip water
+            const dx = cell.p[0] - bx;
+            const dy = cell.p[1] - by;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist > 15 && dist < 80) {       // Not too close, not too far
+              candidates.push({ id: i, dist, x: cell.p[0], y: cell.p[1] });
+            }
+          }
+
+          if (candidates.length > 0) {
+            // Pick a random-ish candidate (use kind hash for determinism)
+            const hash = kind.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+            const pick = candidates[hash % candidates.length];
+            cellId = pick.id;
+            cellX = pick.x;
+            cellY = pick.y;
+          }
+        }
+      } else if (stateId) {
+        nearState = ctx.world.getState(stateId);
+      }
+
+      const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+      const genLlm = getGenLlm(ctx);
+
+      // Get geographic context for the cell
+      let geoContext = "";
+      if (cellId !== undefined) {
+        const cellData = ctx.world.getCell(cellId);
+        if (cellData) {
+          const biomeName = ctx.world.getBiomeName(cellData.biomeId ?? 0);
+          geoContext = `Terrain: ${biomeName}. Elevation: ${cellData.elevation ?? "unknown"}.`;
+          if (cellData.stateName) geoContext += ` In ${cellData.stateName}.`;
+          if (cellData.riverName) geoContext += ` Near the ${cellData.riverName} river.`;
+        }
+      }
+
+      const systemPrompt = `You are a tabletop GM assistant. Generate a ${kind} wilderness marker - a point of interest in the wilderness, far from any city.
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
+This should feel like a discovery - something adventurers might stumble upon while traveling.
+
+Output ONLY valid JSON with a "marker" object containing:
+- name: evocative name for this place
+- summary: 1-2 sentence description
+- details_md: detailed markdown description (atmosphere, history, what's here now)
+- tags: relevant tags
+- payload: object with kind, condition (intact/ruined/hidden/overgrown/active), dangerLevel (safe/cautious/dangerous/deadly), discoverable (boolean), physicalDescription, atmosphere, features (array), inhabitants (who/what is here), history (brief lore)
+
+Also include a "narration" field with a brief atmospheric description.`;
+
+      const userPrompt: any = {
+        kind,
+        hints: args.hints || null,
+        geography: geoContext || null,
+      };
+      if (nearBurg) userPrompt.nearBurg = { name: nearBurg.name, id: nearBurg.id ?? nearBurg.i };
+      if (nearState) userPrompt.inState = { name: nearState.name };
+
+      const result = await completeJson(genLlm, {
+        system: systemPrompt,
+        messages: [{ role: "user", content: JSON.stringify(userPrompt) }],
+        maxTokens: 2000,
+        temperature: 0.7,
+      });
+
+      const parsed = MarkerGenResultSchema.safeParse(result);
+      if (!parsed.success) {
+        return { error: "Failed to parse generation result" };
+      }
+
+      const marker = parsed.data.marker;
+      const anchors: Record<string, any> = {};
+      if (cellId !== undefined) anchors.cellId = cellId;
+      if (nearBurgId) anchors.nearBurgId = nearBurgId;
+      if (stateId) anchors.stateId = stateId;
+      else if (nearBurg && typeof nearBurg.state === "number") anchors.stateId = nearBurg.state;
+
+      const payload: Record<string, any> = {
+        kind,
+        ...(marker.payload || {}),
+      };
+      if (cellX !== undefined) payload.x = cellX;
+      if (cellY !== undefined) payload.y = cellY;
+      if (cellId !== undefined) payload.cellId = cellId;
+
+      const markerEntity = ctx.canon.addEntity({
+        type: "marker",
+        name: marker.name,
+        summary: marker.summary || null,
+        details_md: marker.details_md || null,
+        tags: marker.tags || [kind, "wilderness"],
+        anchors,
+        payload,
+        provenance: {
+          generated_by: args.source || "generate_marker",
+          provider: genLlm.provider,
+          model: genLlm.model,
+          reason: args.reason || null,
+        },
+      });
+
+      return {
+        success: true,
+        markerId: markerEntity.id,
+        markerName: markerEntity.name,
+        markerSummary: markerEntity.summary,
+        kind,
+        coordinates: cellX !== undefined ? { x: cellX, y: cellY, cellId } : null,
+        narration: parsed.data.narration,
       };
     }
   );

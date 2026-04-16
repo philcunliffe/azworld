@@ -414,6 +414,34 @@ export function renderModal(
         contentLines.push(`  ${color}${entity.kind}${RESET} ${entity.name}`);
       }
     }
+  } else if (modal.message) {
+    contentLines.push("");
+    const messageLines = modal.message.split("\n");
+    const maxLineWidth = innerWidth - 4;
+    for (const line of messageLines) {
+      if (line.length <= maxLineWidth) {
+        contentLines.push(line);
+        continue;
+      }
+
+      const words = line.split(" ");
+      let currentLine = "";
+      for (const word of words) {
+        if (!currentLine) {
+          currentLine = word;
+        } else if (currentLine.length + 1 + word.length <= maxLineWidth) {
+          currentLine += " " + word;
+        } else {
+          contentLines.push(currentLine);
+          currentLine = word;
+        }
+      }
+      if (currentLine) {
+        contentLines.push(currentLine);
+      }
+    }
+    contentLines.push("");
+    contentLines.push(`${DIM}Press Esc to close${RESET}`);
   } else {
     // Complete state
     contentLines.push("");

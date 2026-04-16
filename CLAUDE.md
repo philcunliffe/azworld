@@ -79,9 +79,48 @@ Configuration supports separate models for different tasks:
 
 ## Canon Entity Types
 
-`npc`, `faction`, `location`, `event`, `rumor`, `hook`, `meta`
+`npc`, `faction`, `location`, `event`, `rumor`, `hook`, `meta`, `culture`, `religion`, `deity`
 
 Each entity has: id, type, name, summary, details_md, tags[], anchors (link to world entities like burgId), payload, meta, provenance, timestamps.
+
+### Pantheon System
+
+Deities are structured divine entities belonging to religions. A religion's pantheon is the set of `deity` entities anchored to it via `azgaarReligionId`.
+
+**Deity Payload Fields:**
+- `rank`: "supreme" | "greater" | "lesser" | "demigod" | "spirit"
+- `domains`: string[] (e.g., ["war", "justice", "storms"])
+- `alignment`: string (e.g., "benevolent", "wrathful")
+- `symbols`, `titles`: string[]
+- Optional: `sacredAnimal`, `sacredElement`, `festivals[]`, `appearance`, `mythology`, `worshipStyle`
+
+**Form-to-Count:** Religion form determines deity count during generation:
+- Monotheism=1, Dualism=2, Polytheism=5-12, Shamanism=3-8, Folk=2-6
+
+**Inter-deity Relations:** `parent_of`, `sibling_of`, `consort_of`, `rival_of`, `aspect_of`
+**Cross-entity Relations:** `patron_of` (deity→faction/npc), `dedicated_to` (location→deity), `belongs_to` (deity→religion)
+
+### Event Scope Model
+
+Events support geographic scopes that enable context-aware generation:
+
+**Scope Hierarchy:** `neighborhood < burg < state < region < world`
+
+**Event Payload Fields:**
+- `scope`: Geographic impact level ("neighborhood" | "burg" | "state" | "region" | "world")
+- `severity`: Impact intensity ("minor" | "moderate" | "major" | "catastrophic")
+- `daysAgo`: When the event occurred (0 = ongoing/just happened)
+- `ongoing`: Boolean indicating if event is still happening
+
+**Scope-Aware Queries:**
+- Generation tools automatically query events affecting a location using `getActiveEvents()`
+- Query checks upward through scope hierarchy (e.g., burg-scope event affects that burg; state-scope affects all burgs in state; world-scope affects everything)
+- Default recency window: 90 days
+- Events are included in generation prompts via `formatEventContext()` to ensure generated content reflects current world state
+
+**Example:** A catastrophic earthquake (scope: state, severity: catastrophic, daysAgo: 3, ongoing: true) will automatically influence all location/NPC generation in that state for the next 90 days, creating consistent, context-aware worldbuilding.
+
+**Future Enhancements:** This model enables event propagation (events triggering other events) and awareness tracking (which actors know about which events).
 
 ## Campaign Settings
 

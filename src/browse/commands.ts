@@ -4,6 +4,7 @@
 
 import { AzgaarWorld } from "../world/azgaar";
 import { CanonStore, CanonEntity, EntityType } from "../canon/canon";
+import { parseSourceText } from "../canon/ingest";
 import {
   LLMClient,
   completeJson,
@@ -29,6 +30,7 @@ import {
   currentRef,
   currentBurgId,
   currentLocationId,
+  currentStateId,
   navigateTo,
   navigateUp,
   navigateBack,
@@ -82,8 +84,17 @@ import {
   planBurgGeneration,
   formatBurgPlanForApproval,
 } from "./gen-agent";
+import {
+  getWorldClock,
+  formatWorldClock,
+  planSimulation,
+  executeSimulationPlan,
+  formatSimulationPlanForApproval,
+  type SimulationPlan,
+} from "./sim-agent";
 import { selectPrompt } from "./select-prompt";
 import { buildEntityContext, buildAskSystemPrompt } from "./entity-context";
+import { formatDayCount, parseDurationToDays } from "../util/time";
 
 // Color codes
 const RESET = "\x1b[0m";
@@ -178,6 +189,14 @@ export type CommandResult = {
     plan: GenPlan;
     formattedPlan: string;
   };
+  pendingSimulation?: {
+    plan: SimulationPlan;
+    formattedPlan: string;
+  };
+  messageModal?: {
+    title: string;
+    content: string;
+  };
 };
 
 // Parse command line into command and args
@@ -216,6 +235,22 @@ export async function executeCommand(
   // pwd - print working path
   if (cmd === "pwd") {
     return { output: stackToPath(ctx.state, ctx.world, ctx.canon) };
+  }
+
+  // time / clock - show persistent world time
+  if (cmd === "time" || cmd === "clock") {
+    const clock = getWorldClock(ctx.canon);
+    const output = formatWorldClock(clock);
+    if (ctx.tuiMode) {
+      return {
+        output,
+        messageModal: {
+          title: "World Clock",
+          content: output,
+        },
+      };
+    }
+    return { output };
   }
 
   // back - return to previous location
@@ -388,6 +423,12 @@ export async function executeCommand(
     return searchEntities(argStr, ctx);
   }
 
+  // Ingest: ingest <file> [--apply] [--name <title>] [--scope <scope>] [--era-id <id>]
+  if (cmd === "ingest") {
+    if (!argStr) return { error: "Usage: ingest <file> [--apply] [--name <title>] [--scope <scope>] [--era-id <id>]" };
+    return runSourceIngestion(args, ctx);
+  }
+
   // Delete: rm [id]
   if (cmd === "rm") {
     return deleteEntity(argStr, ctx);
@@ -504,6 +545,11 @@ export async function executeCommand(
   // Modification: mod [id] <hints>
   if (cmd === "mod") {
     return modifyEntity(args, ctx);
+  }
+
+  // Simulation: advance <duration> [focus]
+  if (cmd === "advance" || cmd === "wait" || cmd === "pass") {
+    return runSimulationAdvance(args, ctx);
   }
 
   // Ask: ask <question>
@@ -711,6 +757,36 @@ async function navigateToAny(name: string, ctx: CommandContext): Promise<Command
     return {};
   }
 
+  // Try faction
+  const factions = ctx.canon.listEntities({ type: "faction", limit: 500 });
+  const faction = findByName(name, factions);
+  if (faction) {
+    navigateTo(ctx.state, { kind: "faction", factionId: faction.id });
+    return {};
+  }
+
+  // Try deity
+  const deities = ctx.canon.listEntities({ type: "deity", limit: 500 });
+  const deity = findByName(name, deities);
+  if (deity) {
+    navigateTo(ctx.state, { kind: "deity", deityId: deity.id });
+    return {};
+  }
+
+  // Try culture
+  const culture = ctx.world.getCulture(name);
+  if (culture) {
+    navigateTo(ctx.state, { kind: "culture", cultureId: culture.id });
+    return {};
+  }
+
+  // Try religion
+  const religion = ctx.world.getReligion(name);
+  if (religion) {
+    navigateTo(ctx.state, { kind: "religion", religionId: religion.id });
+    return {};
+  }
+
   return { error: `Not found: ${name}` };
 }
 
@@ -750,6 +826,187 @@ function searchEntities(term: string, ctx: CommandContext): CommandResult {
   });
 
   return { output: `Search results for "${term}":\n${lines.join("\n")}` };
+}
+
+async function runSourceIngestion(args: string[], ctx: CommandContext): Promise<CommandResult> {
+  const get = (name: string): string | undefined => {
+    const idx = args.indexOf(name);
+    if (idx >= 0) return args[idx + 1];
+    const pref = name + "=";
+    const hit = args.find((x) => x.startsWith(pref));
+    return hit ? hit.slice(pref.length) : undefined;
+  };
+
+  const positional = args.filter((arg, idx) => {
+    if (arg.startsWith("--")) return false;
+    if (idx > 0 && args[idx - 1]?.startsWith("--")) return false;
+    return true;
+  });
+  const file = positional[0];
+  if (!file) {
+    return { error: "Usage: ingest <file> [--apply] [--name <title>] [--scope <scope>] [--era-id <id>]" };
+  }
+
+  const text = await Bun.file(file).text();
+  const name = get("--name");
+  const scope = get("--scope") || inferIngestScope(ctx);
+  const apply = args.includes("--apply");
+  const eraId = get("--era-id");
+  const anchors = inferIngestAnchors(ctx, eraId);
+
+  const result = await parseSourceText(
+    { canon: ctx.canon, world: ctx.world, llm: ctx.generationLlm || ctx.llm },
+    { name, text, scope, anchors, apply }
+  );
+
+  const planText = formatIngestResult(result, ctx.useColors);
+
+  if (apply) {
+    return {
+      output: planText,
+      messageModal: ctx.tuiMode ? { title: "Ingestion Applied", content: planText } : undefined,
+    };
+  }
+
+  if (ctx.tuiMode) {
+    return {
+      output: planText,
+      messageModal: {
+        title: "Ingestion Plan",
+        content: planText,
+      },
+    };
+  }
+
+  console.log(planText);
+  const answer = await selectPrompt({
+    message: "What would you like to do?",
+    options: [
+      { label: "Apply", value: "apply", hint: "Create and patch canon from this plan" },
+      { label: "Keep Plan", value: "keep", hint: "Store only the source text and parse plan summary" },
+      { label: "Cancel", value: "cancel", hint: "Stop here and make no further changes" },
+    ],
+    useColors: ctx.useColors,
+    defaultIndex: 0,
+  });
+
+  if (answer === null || answer === "cancel") {
+    return { output: "(Cancelled)" };
+  }
+  if (answer === "keep") {
+    return { output: "Stored source text and parse plan. Re-run with --apply to persist entities and relations." };
+  }
+
+  const applied = await parseSourceText(
+    { canon: ctx.canon, world: ctx.world, llm: ctx.generationLlm || ctx.llm },
+    { name, text, scope, anchors, apply: true }
+  );
+  return { output: formatIngestResult(applied, ctx.useColors) };
+}
+
+function inferIngestScope(ctx: CommandContext): string {
+  const cur = currentRef(ctx.state);
+  switch (cur.kind) {
+    case "state":
+      return "state";
+    case "burg":
+    case "location":
+    case "npc":
+    case "faction":
+      return "burg";
+    case "event":
+    case "rumor":
+    case "hook":
+    case "deity":
+      return "entity";
+    default:
+      return "world";
+  }
+}
+
+function inferIngestAnchors(ctx: CommandContext, explicitEraId?: string): Record<string, any> {
+  const anchors: Record<string, any> = {};
+  const burgId = currentBurgId(ctx.state);
+  if (typeof burgId === "number") anchors.burgId = burgId;
+
+  let stateId = currentStateId(ctx.state);
+  if (stateId === undefined && typeof burgId === "number") {
+    const burg = ctx.world.getBurg(burgId);
+    if (burg && typeof burg.state === "number") stateId = burg.state;
+  }
+  if (typeof stateId === "number") anchors.stateId = stateId;
+  if (explicitEraId) anchors.eraId = explicitEraId;
+  return anchors;
+}
+
+function formatIngestResult(result: Awaited<ReturnType<typeof parseSourceText>>, useColors?: boolean): string {
+  const green = useColors ? GREEN : "";
+  const yellow = useColors ? YELLOW : "";
+  const dim = useColors ? DIM : "";
+  const reset = useColors ? RESET : "";
+
+  const lines: string[] = [];
+  lines.push(`${green}${result.applied ? "Ingestion applied" : "Ingestion planned"}${reset}`);
+  lines.push(`${dim}Source:${reset} ${result.sourceText.name} (${result.sourceText.id})`);
+  lines.push(`${dim}Summary:${reset} ${result.plan.summary}`);
+  lines.push("");
+
+  if (result.plan.creates.length) {
+    lines.push(`${yellow}Creates${reset}`);
+    for (const create of result.plan.creates.slice(0, 12)) {
+      lines.push(`  + ${create.name} (${create.type})`);
+    }
+    if (result.plan.creates.length > 12) lines.push(`  ... ${result.plan.creates.length - 12} more`);
+    lines.push("");
+  }
+
+  if (result.plan.updates.length) {
+    lines.push(`${yellow}Updates${reset}`);
+    for (const update of result.plan.updates.slice(0, 12)) {
+      lines.push(`  ~ ${update.entityId}`);
+    }
+    if (result.plan.updates.length > 12) lines.push(`  ... ${result.plan.updates.length - 12} more`);
+    lines.push("");
+  }
+
+  if (result.plan.relations.length) {
+    lines.push(`${yellow}Relations${reset}`);
+    for (const rel of result.plan.relations.slice(0, 12)) {
+      lines.push(`  -> ${rel.from} --[${rel.rel_type}]--> ${rel.to}`);
+    }
+    if (result.plan.relations.length > 12) lines.push(`  ... ${result.plan.relations.length - 12} more`);
+    lines.push("");
+  }
+
+  if (result.plan.relationTypeDefinitions.length) {
+    lines.push(`${yellow}New Relation Types${reset}`);
+    for (const relType of result.plan.relationTypeDefinitions) {
+      lines.push(`  + ${relType.name}: ${relType.summary}`);
+    }
+    lines.push("");
+  }
+
+  if (result.plan.unresolvedReferences.length) {
+    lines.push(`${yellow}Unresolved${reset}`);
+    for (const item of result.plan.unresolvedReferences.slice(0, 10)) {
+      lines.push(`  ? ${item}`);
+    }
+    lines.push("");
+  }
+
+  if (result.plan.cautions.length) {
+    lines.push(`${yellow}Cautions${reset}`);
+    for (const caution of result.plan.cautions.slice(0, 10)) {
+      lines.push(`  ! ${caution}`);
+    }
+    lines.push("");
+  }
+
+  if (result.applied) {
+    lines.push(`${dim}Applied:${reset} ${result.createdEntities?.length ?? 0} created, ${result.updatedEntities?.length ?? 0} updated, ${result.createdRelations?.length ?? 0} relations, ${result.definedRelationTypes?.length ?? 0} edge defs`);
+  }
+
+  return lines.join("\n").trimEnd();
 }
 
 // Delete entity
@@ -921,6 +1178,128 @@ export function executePendingModification(
     output: `${green}${result.summary}${reset}\n` +
       (result.appliedChanges.length > 0 ? result.appliedChanges.map(c => `  + ${c}`).join("\n") : "  (no changes)"),
   };
+}
+
+/**
+ * Execute a pending simulation after TUI/REPL approval
+ */
+export async function executePendingSimulation(
+  plan: SimulationPlan,
+  ctx: CommandContext
+): Promise<CommandResult> {
+  const simCtx = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
+  };
+
+  const result = await executeSimulationPlan(plan, simCtx);
+  if (!result.success) {
+    return { error: result.error || "Simulation failed" };
+  }
+
+  const lines = [result.summary];
+  if (result.updatedEntities.length > 0) {
+    lines.push("");
+    lines.push("Updated:");
+    for (const entity of result.updatedEntities.slice(0, 10)) {
+      lines.push(`  + ${entity.name} (${entity.type})`);
+    }
+  }
+  if (result.createdEntities.length > 0) {
+    lines.push("");
+    lines.push("Created:");
+    for (const entity of result.createdEntities.slice(0, 10)) {
+      lines.push(`  + ${entity.name} (${entity.type})`);
+    }
+  }
+
+  const content = lines.join("\n");
+  return {
+    output: content,
+    messageModal: {
+      title: "Simulation Applied",
+      content,
+    },
+  };
+}
+
+function extractAdvanceArgs(args: string[]): { days?: number; focus: string } {
+  for (let i = Math.min(args.length, 3); i >= 1; i--) {
+    const maybeDuration = args.slice(0, i).join(" ");
+    const days = parseDurationToDays(maybeDuration);
+    if (days !== undefined) {
+      return {
+        days,
+        focus: args.slice(i).join(" ").trim(),
+      };
+    }
+  }
+  return {
+    days: undefined,
+    focus: args.join(" ").trim(),
+  };
+}
+
+async function runSimulationAdvance(
+  args: string[],
+  ctx: CommandContext
+): Promise<CommandResult> {
+  const { days, focus } = extractAdvanceArgs(args);
+  if (!days || days <= 0) {
+    return { error: "Usage: advance <duration> [focus]. Examples: advance 7d, advance 2 weeks trade unrest" };
+  }
+
+  const simCtx = {
+    state: ctx.state,
+    world: ctx.world,
+    canon: ctx.canon,
+    llm: ctx.llm,
+    generationLlm: ctx.generationLlm,
+    campaignSettings: ctx.campaignSettings,
+    onToolCall: ctx.onToolCall,
+    onToolResult: ctx.onToolResult,
+    onTokens: ctx.onTokens,
+  };
+
+  try {
+    const plan = await planSimulation(days, focus, simCtx);
+    const formattedPlan = formatSimulationPlanForApproval(plan, ctx.useColors);
+
+    if (ctx.tuiMode) {
+      return {
+        pendingSimulation: {
+          plan,
+          formattedPlan,
+        },
+      };
+    }
+
+    console.log(formattedPlan);
+    const answer = await selectPrompt({
+      message: `Apply simulation for ${formatDayCount(days)}?`,
+      options: [
+        { label: "Apply", value: "apply", hint: "Advance time and apply these changes" },
+        { label: "Cancel", value: "cancel", hint: "Abort without changing canon" },
+      ],
+      useColors: ctx.useColors,
+      defaultIndex: 0,
+    });
+
+    if (answer === null || answer === "cancel") {
+      return { output: "(Cancelled)" };
+    }
+
+    return await executePendingSimulation(plan, ctx);
+  } catch (e: any) {
+    return { error: `Simulation planning failed: ${e?.message || String(e)}` };
+  }
 }
 
 /**
@@ -1458,6 +1837,8 @@ async function generateLocation(kind: string, hints: string, ctx: CommandContext
     name: e.name,
     scope: e.payload?.scope,
     severity: e.payload?.severity,
+    scale: e.payload?.scale,
+    secrecy: e.payload?.secrecy,
     daysAgo: e.payload?.daysAgo,
     summary: e.summary,
   }));
@@ -2209,6 +2590,7 @@ ${cyan}Information${reset}
   info <id>          Show details of specific entity
   rels [id]          Show relations for entity
   search <term>      Fuzzy search across world and canon
+  time               Show the persistent world clock
 
 ${cyan}Generation (LLM)${reset}
   gen <theme>                   Comprehensive burg generation (factions, locations, NPCs, hooks, rumors)
@@ -2217,6 +2599,7 @@ ${cyan}Generation (LLM)${reset}
   gen faction <kind> [hints]    Smart faction generation with context
   gen rumor <topic> [hints]     Generate rumor (truth/spread levels, linked entities)
   gen hook <concept> [hints]    Generate adventure hook (type, urgency, difficulty)
+  ingest <file> [--apply]       Parse prose into a structured canon plan using current context
   simplegen location <kind>     Quick generation (no planning step)
   simplegen npc [hints]         Quick NPC generation
   simplegen faction <kind>      Quick faction generation
@@ -2224,6 +2607,7 @@ ${cyan}Generation (LLM)${reset}
 ${cyan}Modification${reset}
   mod <hints>        Modify current entity with natural language
   mod <id> <hints>   Modify specific entity
+  advance <dur>      Plan time passage with LLM approval (e.g. advance 7d)
 
 ${cyan}Deletion${reset}
   rm                 Delete current entity (canon only)

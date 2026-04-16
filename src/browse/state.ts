@@ -18,7 +18,9 @@ export type EntityRef =
   | { kind: "religion"; religionId: number }
   | { kind: "event"; eventId: string }
   | { kind: "rumor"; rumorId: string }
-  | { kind: "hook"; hookId: string };
+  | { kind: "hook"; hookId: string }
+  | { kind: "deity"; deityId: string }
+  | { kind: "marker"; markerId: string };
 
 export type BrowseState = {
   stack: EntityRef[];           // Navigation path (current path, root is world)
@@ -220,6 +222,14 @@ export function refToName(ref: EntityRef, world: AzgaarWorld, canon: CanonStore)
       const h = canon.getEntity(ref.hookId);
       return h?.name || ref.hookId;
     }
+    case "deity": {
+      const d = canon.getEntity(ref.deityId);
+      return d?.name || ref.deityId;
+    }
+    case "marker": {
+      const m = canon.getEntity(ref.markerId);
+      return m?.name || ref.markerId;
+    }
   }
 }
 
@@ -284,6 +294,10 @@ export function getCurrentEntity(
     case "hook": {
       const h = canon.getEntity(cur.hookId);
       return h ? { kind: "hook", entity: h, id: cur.hookId } : undefined;
+    }
+    case "deity": {
+      const d = canon.getEntity(cur.deityId);
+      return d ? { kind: "deity", entity: d, id: cur.deityId } : undefined;
     }
   }
 }

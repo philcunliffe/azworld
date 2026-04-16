@@ -5,6 +5,7 @@ import { CampaignSettings, CampaignSettingsSchema } from "./schema";
 export type GenerationFlags = {
   states?: boolean;
   religions?: boolean;
+  pantheons?: boolean;
   cultures?: boolean;
 };
 
@@ -153,6 +154,16 @@ export async function runOnboarding(
   const genReligionsInput = (await ask("   Generate religions? [y/N]: ")).trim();
   const genReligions = parseYesNo(genReligionsInput);
 
+  // 8b. Generate Pantheons (only if religions selected)
+  let genPantheons = false;
+  if (genReligions) {
+    console.log("\n8b. GENERATE PANTHEONS");
+    console.log("   Creates deities for each religion based on its form.");
+    console.log("   Monotheism=1, Dualism=2, Polytheism=5-12, etc.");
+    const genPantheonsInput = (await ask("   Generate pantheons? [y/N]: ")).trim();
+    genPantheons = parseYesNo(genPantheonsInput);
+  }
+
   // 9. Generate Culture content
   console.log("\n9. GENERATE CULTURES");
   console.log("   Creates culture entities describing each culture's customs.");
@@ -163,6 +174,7 @@ export async function runOnboarding(
   const generate: GenerationFlags = {};
   if (genStates) generate.states = true;
   if (genReligions) generate.religions = true;
+  if (genPantheons) generate.pantheons = true;
   if (genCultures) generate.cultures = true;
 
   const hasGeneration = Object.keys(generate).length > 0;

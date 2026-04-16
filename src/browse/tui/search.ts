@@ -86,6 +86,14 @@ function canonTypeToEntityKind(type: string): EntityKind {
       return "faction";
     case "event":
       return "event";
+    case "rumor":
+      return "rumor";
+    case "hook":
+      return "hook";
+    case "deity":
+      return "deity";
+    case "marker":
+      return "marker";
     default:
       return "location";
   }
@@ -118,8 +126,36 @@ export function performSearch(
     });
   }
 
-  // Search canon entities (locations, NPCs, factions)
-  const canonTypes = ["location", "npc", "faction"] as const;
+  for (const culture of world.listCultures()) {
+    const score = scoreName(q, culture.name);
+    if (score > 0.1) {
+      results.push({
+        id: `culture:${culture.id}`,
+        name: culture.name,
+        kind: "culture",
+        score,
+        breadcrumb: "World > Cultures",
+        source: "world",
+      });
+    }
+  }
+
+  for (const religion of world.listReligions()) {
+    const score = scoreName(q, religion.name);
+    if (score > 0.1) {
+      results.push({
+        id: `religion:${religion.id}`,
+        name: religion.name,
+        kind: "religion",
+        score,
+        breadcrumb: "World > Religions",
+        source: "world",
+      });
+    }
+  }
+
+  // Search canon entities
+  const canonTypes = ["location", "npc", "faction", "deity", "event", "rumor", "hook", "marker"] as const;
   for (const type of canonTypes) {
     const entities = canon.listEntities({ type, text: q, limit: limit * 2 });
     for (const entity of entities) {

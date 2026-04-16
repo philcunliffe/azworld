@@ -284,6 +284,23 @@ export function listHooksOnly(canon: CanonStore, burgId?: number): ListResult {
 // Alias for backward compatibility
 export const listRumors = listRumorsAndHooks;
 
+function listEntityRelations(canon: CanonStore, entityId: string, context: string): ListResult {
+  const relations = canon.listRelations({ entity_id: entityId, limit: 100 });
+  return {
+    items: relations.map(rel => {
+      const otherId = rel.from_id === entityId ? rel.to_id : rel.from_id;
+      const other = canon.getEntity(otherId);
+      return {
+        name: other?.name || otherId,
+        kind: other?.type || rel.rel_type,
+        id: otherId,
+        extra: rel.from_id === entityId ? rel.rel_type : `← ${rel.rel_type}`,
+      };
+    }),
+    context,
+  };
+}
+
 // Context-aware listing based on current navigation state
 export function listContextual(
   state: BrowseState,
@@ -332,8 +349,52 @@ export function listContextual(
       return listNpcs(canon, world, { locationId: cur.locationId });
 
     case "npc":
-      // At NPC level, show relations or return to listing NPCs
-      return { items: [], context: "use 'rels' to show relations" };
+      return listEntityRelations(canon, cur.npcId, "npc relations");
+
+    case "faction":
+      return listEntityRelations(canon, cur.factionId, "faction relations");
+
+    case "event":
+      return listEntityRelations(canon, cur.eventId, "event relations");
+
+    case "rumor":
+      return listEntityRelations(canon, cur.rumorId, "rumor relations");
+
+    case "hook":
+      return listEntityRelations(canon, cur.hookId, "hook relations");
+
+    case "deity":
+      return listEntityRelations(canon, cur.deityId, "deity relations");
+
+    case "culture": {
+      const culture = world.getCulture(cur.cultureId);
+      if (!culture) return { items: [], context: "culture" };
+      const states = world.listStates().filter(s => s.culture === cur.cultureId);
+      return {
+        items: states.map(s => ({
+          name: s.name,
+          kind: s.formName || s.form,
+          id: s.id,
+        })),
+        context: `${culture.name} states`,
+      };
+    }
+
+    case "religion": {
+      const religion = world.getReligion(cur.religionId);
+      if (!religion) return { items: [], context: "religion" };
+      const deities = canon.listEntities({ type: "deity", limit: 100 })
+        .filter(e => e.anchors?.azgaarReligionId === cur.religionId);
+      return {
+        items: deities.map(d => ({
+          name: d.name,
+          kind: d.payload?.rank as string | undefined,
+          id: d.id,
+          extra: (d.payload?.domains as string[] | undefined)?.slice(0, 2).join(", "),
+        })),
+        context: `${religion.name} deities`,
+      };
+    }
 
     default:
       return { items: [], context: "unknown context" };

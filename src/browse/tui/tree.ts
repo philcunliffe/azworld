@@ -36,6 +36,10 @@ export function refToNodeId(ref: EntityRef): string {
       return `rumor:${ref.rumorId}`;
     case "hook":
       return `hook:${ref.hookId}`;
+    case "deity":
+      return `deity:${ref.deityId}`;
+    case "marker":
+      return `marker:${ref.markerId}`;
   }
 }
 
@@ -69,6 +73,10 @@ export function nodeIdToRef(nodeId: string): EntityRef {
       return { kind: "rumor", rumorId: id };
     case "hook":
       return { kind: "hook", hookId: id };
+    case "deity":
+      return { kind: "deity", deityId: id };
+    case "marker":
+      return { kind: "marker", markerId: id };
     default:
       return { kind: "world" };
   }
@@ -205,7 +213,7 @@ export function createFactionNode(faction: CanonEntity, depth: number): TreeNode
 export function createEventNode(event: CanonEntity, depth: number): TreeNode {
   return {
     id: `event:${event.id}`,
-    ref: { kind: "location", locationId: event.id }, // Use location kind for navigation
+    ref: { kind: "event", eventId: event.id },
     name: event.name,
     kind: "event",
     expanded: false,
@@ -388,11 +396,55 @@ export function createReligionNode(
     name: religion.name,
     kind: "religion",
     expanded: false,
-    hasChildren: false,  // Flat list, no children
+    hasChildren: true,  // Can expand to show deity children
     depth: 0,
     isSelected: selectedNodeId === `religion:${religion.id}`,
     extra: religion.type || religion.form,
   };
+}
+
+/**
+ * Create tree node from a deity canon entity
+ */
+export function createDeityNode(
+  deity: CanonEntity,
+  depth: number
+): TreeNode {
+  const domains = (deity.payload?.domains as string[] | undefined)?.join(", ");
+  const rank = deity.payload?.rank as string | undefined;
+  const extra = [rank, domains].filter(Boolean).join(" — ");
+  return {
+    id: `deity:${deity.id}`,
+    ref: { kind: "deity" as const, deityId: deity.id },
+    name: deity.name,
+    kind: "deity" as EntityKind,
+    expanded: false,
+    hasChildren: false,
+    depth,
+    isSelected: false,
+    extra: extra || undefined,
+  };
+}
+
+/**
+ * Get deity children for a religion node
+ */
+export function getReligionDeities(
+  religionId: number,
+  canon: CanonStore,
+  depth: number
+): TreeNode[] {
+  const deities = canon.listEntities({ type: "deity", limit: 100 })
+    .filter(e => e.anchors?.azgaarReligionId === religionId);
+  deities.sort((a, b) => {
+    // Sort by rank (supreme first), then name
+    const rankOrder: Record<string, number> = { supreme: 0, greater: 1, lesser: 2, demigod: 3, spirit: 4 };
+    const ra = rankOrder[a.payload?.rank as string] ?? 5;
+    const rb = rankOrder[b.payload?.rank as string] ?? 5;
+    if (ra !== rb) return ra - rb;
+    return a.name.localeCompare(b.name);
+  });
+  return deities.map(d => createDeityNode(d, depth));
 }
 
 /**
@@ -413,12 +465,34 @@ export function buildFactionsList(
  */
 export function buildReligionsList(
   world: AzgaarWorld,
-  selectedNodeId: string | null
+  selectedNodeId: string | null,
+  canon?: CanonStore,
+  expandedNodes?: Set<string>
 ): TreeNode[] {
   const religions = world.listReligions();
   religions.sort((a, b) => a.name.localeCompare(b.name));
 
-  return religions.map((r) => createReligionNode(r, selectedNodeId));
+  const nodes: TreeNode[] = [];
+  for (const r of religions) {
+    const node = createReligionNode(r, selectedNodeId);
+    const nodeId = `religion:${r.id}`;
+    node.expanded = expandedNodes?.has(nodeId) ?? false;
+    nodes.push(node);
+
+    // If expanded and canon available, add deity children
+    if (node.expanded && canon) {
+      const deityNodes = getReligionDeities(r.id, canon, 1);
+      for (const d of deityNodes) {
+        d.isSelected = selectedNodeId === d.id;
+        nodes.push(d);
+      }
+      // If no deities, mark as no children
+      if (deityNodes.length === 0) {
+        node.hasChildren = false;
+      }
+    }
+  }
+  return nodes;
 }
 
 /**
@@ -503,6 +577,92 @@ export function findPathToNode(
       }
 
       path.push(`npc:${ref.npcId}`);
+      break;
+    }
+
+    case "faction": {
+      const faction = canon.getEntity(ref.factionId);
+      const burgId = faction?.anchors?.burgId as number | undefined;
+      const stateId = faction?.anchors?.stateId as number | undefined;
+      if (burgId !== undefined) {
+        const burg = world.getBurg(burgId);
+        if (burg?.state !== undefined) {
+          path.push(`state:${burg.state}`);
+        }
+        path.push(`burg:${burgId}`);
+      } else if (stateId !== undefined) {
+        path.push(`state:${stateId}`);
+      }
+      path.push(`faction:${ref.factionId}`);
+      break;
+    }
+
+    case "culture":
+      path.push(`culture:${ref.cultureId}`);
+      break;
+
+    case "religion":
+      path.push(`religion:${ref.religionId}`);
+      break;
+
+    case "deity": {
+      const deity = canon.getEntity(ref.deityId);
+      const religionId = deity?.anchors?.azgaarReligionId as number | undefined;
+      if (religionId !== undefined) {
+        path.push(`religion:${religionId}`);
+      }
+      path.push(`deity:${ref.deityId}`);
+      break;
+    }
+
+    case "event": {
+      const event = canon.getEntity(ref.eventId);
+      const burgId = event?.anchors?.burgId as number | undefined;
+      const stateId = event?.anchors?.stateId as number | undefined;
+      if (burgId !== undefined) {
+        const burg = world.getBurg(burgId);
+        if (burg?.state !== undefined) {
+          path.push(`state:${burg.state}`);
+        }
+        path.push(`burg:${burgId}`);
+      } else if (stateId !== undefined) {
+        path.push(`state:${stateId}`);
+      }
+      path.push(`event:${ref.eventId}`);
+      break;
+    }
+
+    case "rumor": {
+      const rumor = canon.getEntity(ref.rumorId);
+      const burgId = rumor?.anchors?.burgId as number | undefined;
+      const stateId = rumor?.anchors?.stateId as number | undefined;
+      if (burgId !== undefined) {
+        const burg = world.getBurg(burgId);
+        if (burg?.state !== undefined) {
+          path.push(`state:${burg.state}`);
+        }
+        path.push(`burg:${burgId}`);
+      } else if (stateId !== undefined) {
+        path.push(`state:${stateId}`);
+      }
+      path.push(`rumor:${ref.rumorId}`);
+      break;
+    }
+
+    case "hook": {
+      const hook = canon.getEntity(ref.hookId);
+      const burgId = hook?.anchors?.burgId as number | undefined;
+      const stateId = hook?.anchors?.stateId as number | undefined;
+      if (burgId !== undefined) {
+        const burg = world.getBurg(burgId);
+        if (burg?.state !== undefined) {
+          path.push(`state:${burg.state}`);
+        }
+        path.push(`burg:${burgId}`);
+      } else if (stateId !== undefined) {
+        path.push(`state:${stateId}`);
+      }
+      path.push(`hook:${ref.hookId}`);
       break;
     }
   }

@@ -2,7 +2,46 @@ import { Database } from "bun:sqlite";
 import { mergePatch } from "../util/mergePatch";
 import { nowIso } from "../util/time";
 
-export type EntityType = "npc" | "faction" | "location" | "event" | "rumor" | "hook" | "meta" | "culture" | "religion";
+export type EntityType = "npc" | "faction" | "location" | "event" | "rumor" | "hook" | "meta" | "culture" | "religion" | "deity" | "era" | "phenomena" | "relation_type" | "source_text" | "marker";
+
+export const BUILTIN_RELATION_TYPES = [
+  "about",
+  "affects",
+  "affiliated_with",
+  "allied_with",
+  "aspect_of",
+  "belongs_to",
+  "caused_by",
+  "child_of",
+  "consort_of",
+  "controls",
+  "dedicated_to",
+  "founded",
+  "front_for",
+  "involves",
+  "leads",
+  "located_at",
+  "located_in",
+  "member_of",
+  "occurs_in",
+  "offered_by",
+  "operates",
+  "operates_from",
+  "owns",
+  "parent_of",
+  "patron_of",
+  "preceded_by",
+  "protected_by",
+  "related_to",
+  "rival_of",
+  "rules",
+  "secret_member",
+  "sealed_by",
+  "sibling_of",
+  "spread_by",
+  "succeeded_by",
+  "works_at",
+] as const;
 
 export type CanonEntity = {
   id: string;
@@ -46,7 +85,7 @@ PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS entities (
   id TEXT PRIMARY KEY,
-  type TEXT NOT NULL CHECK(type IN ('npc','faction','location','event','rumor','hook','meta','culture','religion')),
+  type TEXT NOT NULL CHECK(type IN ('npc','faction','location','event','rumor','hook','meta','culture','religion','deity','era','phenomena','relation_type','source_text','marker')),
   name TEXT NOT NULL,
   summary TEXT,
   details_md TEXT,
@@ -120,6 +159,7 @@ export class CanonStore {
 
   initDb(): void {
     this.db.exec(DDL);
+    this.ensureEntityTypeMigration();
   }
 
   close(): void {
@@ -378,6 +418,73 @@ export class CanonStore {
     });
 
     return matchingEvents;
+  }
+
+  getHistoricalEvents(opts: {
+    burgId?: number;
+    stateId?: number;
+    eraId?: string;
+    recencyBands?: string[];
+    includeParentScopes?: boolean;
+    limit?: number;
+  } = {}): CanonEntity[] {
+    const {
+      burgId,
+      stateId,
+      eraId,
+      recencyBands,
+      limit = 100,
+    } = opts;
+    const includeParentScopes = opts.includeParentScopes !== false;
+
+    const events = this.listEntities({ type: "event", limit: 5000 }).filter((event) => {
+      const payload = event.payload || {};
+      if (!payload.historical) return false;
+
+      if (eraId && event.anchors?.eraId !== eraId && payload.eraId !== eraId) {
+        return false;
+      }
+
+      if (Array.isArray(recencyBands) && recencyBands.length) {
+        const band = typeof payload.recencyBand === "string" ? payload.recencyBand : undefined;
+        if (!band || !recencyBands.includes(band)) return false;
+      }
+
+      const scope = (payload.scope as string) || "burg";
+      if (scope === "world") return true;
+      if (scope === "region") return includeParentScopes;
+      if (scope === "state") {
+        const eventStateId = event.anchors?.stateId;
+        return eventStateId === undefined ? includeParentScopes : eventStateId === stateId;
+      }
+      if (scope === "burg") {
+        return event.anchors?.burgId === burgId;
+      }
+      return true;
+    });
+
+    events.sort((a, b) => {
+      const aOrder = typeof a.payload?.relativeOrder === "number" ? a.payload.relativeOrder : Number.MAX_SAFE_INTEGER;
+      const bOrder = typeof b.payload?.relativeOrder === "number" ? b.payload.relativeOrder : Number.MAX_SAFE_INTEGER;
+      if (aOrder !== bOrder) return aOrder - bOrder;
+      return a.name.localeCompare(b.name);
+    });
+
+    return events.slice(0, limit);
+  }
+
+  listRelationTypeDefinitions(): CanonEntity[] {
+    return this.listEntities({ type: "relation_type", limit: 5000 }).sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  getRelationTypeDefinition(name: string): CanonEntity | undefined {
+    const normalized = name.trim().toLowerCase();
+    return this.listRelationTypeDefinitions().find((entity) => entity.name.trim().toLowerCase() === normalized);
+  }
+
+  isKnownRelationType(name: string): boolean {
+    const normalized = name.trim().toLowerCase();
+    return BUILTIN_RELATION_TYPES.includes(normalized as typeof BUILTIN_RELATION_TYPES[number]) || !!this.getRelationTypeDefinition(normalized);
   }
 
   /**
@@ -653,5 +760,46 @@ export class CanonStore {
       $notes: r.notes ?? null,
       $created_at: typeof r.created_at === "string" ? r.created_at : nowIso(),
     };
+  }
+
+  private ensureEntityTypeMigration(): void {
+    const row = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'entities'")
+      .get() as { sql?: string } | undefined;
+    const sql = row?.sql || "";
+    if (sql.includes("'era'") && sql.includes("'phenomena'") && sql.includes("'relation_type'") && sql.includes("'source_text'")) return;
+
+    this.db.exec("BEGIN");
+    try {
+      this.db.exec(`
+        CREATE TABLE entities_new (
+          id TEXT PRIMARY KEY,
+          type TEXT NOT NULL CHECK(type IN ('npc','faction','location','event','rumor','hook','meta','culture','religion','deity','era','phenomena','relation_type','source_text','marker')),
+          name TEXT NOT NULL,
+          summary TEXT,
+          details_md TEXT,
+          tags_json TEXT NOT NULL DEFAULT '[]',
+          anchors_json TEXT NOT NULL DEFAULT '{}',
+          payload_json TEXT NOT NULL DEFAULT '{}',
+          meta_json TEXT NOT NULL DEFAULT '{}',
+          provenance_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+      `);
+      this.db.exec(`
+        INSERT INTO entities_new (id, type, name, summary, details_md, tags_json, anchors_json, payload_json, meta_json, provenance_json, created_at, updated_at)
+        SELECT id, type, name, summary, details_md, tags_json, anchors_json, payload_json, meta_json, provenance_json, created_at, updated_at
+        FROM entities;
+      `);
+      this.db.exec("DROP TABLE entities;");
+      this.db.exec("ALTER TABLE entities_new RENAME TO entities;");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 }

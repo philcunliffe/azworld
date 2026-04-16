@@ -1,9 +1,12 @@
 import { AzgaarWorld } from "../world/azgaar";
 import { CanonStore, EntityType } from "../canon/canon";
+import { parseSourceText } from "../canon/ingest";
 import { exportWiki } from "../wiki/wiki";
 import { extractGlobals, readJsonArgAsync } from "../util/args";
 import { jsonDumps } from "../util/json";
 import { ok, err } from "../util/envelope";
+import { createLLMClient } from "../llm/providers";
+import { loadConfig, getEffectiveGenerationModel, getEffectiveGenerationProvider, getEffectiveModel, getEffectiveProvider } from "../llm/config";
 
 function print(globals: { json?: boolean; pretty?: boolean }, value: any) {
   const pretty = !!globals.pretty;
@@ -30,7 +33,8 @@ function usage(): string {
     "  cell <cellId>",
     "  search <term> [--kinds states,burgs,cultures,religions,rivers] [--limit N]",
     "  canon init",
-    "  canon add <npc|faction|location|event|rumor|hook|meta|culture|religion> --name <name> [--summary ...] [--details-md ...] [--tags a,b] [--payload-json <jsonOr@file>] [--burg <id>]",
+    "  canon add <npc|faction|location|event|rumor|hook|meta|culture|religion|era|phenomena|relation_type|source_text> --name <name> [--summary ...] [--details-md ...] [--tags a,b] [--payload-json <jsonOr@file>] [--burg <id>] [--state <id>]",
+    "  canon ingest --file <notes.md> [--name <title>] [--apply] [--scope <scope>] [--burg <id>] [--state <id>] [--era-id <id>]",
     "  canon show <id>",
     "  canon list [--type ...] [--burg <id>] [--tag <tag>] [--text <substr>] [--limit N]",
     "  canon patch <id> --patch-json <jsonOr@file>",
@@ -44,6 +48,7 @@ function usage(): string {
 async function main() {
   const argv = process.argv.slice(2);
   const { globals, rest } = extractGlobals(argv);
+  const config = await loadConfig();
 
   const worldPath = globals.world || "./data/world.json";
   const canonPath = globals.canon || "./data/canon.db";
@@ -184,9 +189,11 @@ async function main() {
         const tags = (get("--tags") ?? "").split(",").map((s) => s.trim()).filter(Boolean);
         const payload = (await readJsonArgAsync(get("--payload-json"))) as any;
         const burgId = get("--burg") ? Number(get("--burg")) : undefined;
+        const stateId = get("--state") ? Number(get("--state")) : undefined;
 
         const anchors: any = {};
         if (typeof burgId === "number" && !Number.isNaN(burgId)) anchors.burgId = burgId;
+        if (typeof stateId === "number" && !Number.isNaN(stateId)) anchors.stateId = stateId;
 
         const ent = canon.addEntity({ type, name, summary, details_md, tags, anchors, payload: payload ?? {} });
         print(globals, wrap(ent));
@@ -217,9 +224,11 @@ async function main() {
         const text = get("--text") ?? undefined;
         const limit = get("--limit") ? Number(get("--limit")) : (globals.limit ?? 50);
         const burgId = get("--burg") ? Number(get("--burg")) : undefined;
+        const stateId = get("--state") ? Number(get("--state")) : undefined;
 
         const anchors: any = {};
         if (typeof burgId === "number" && !Number.isNaN(burgId)) anchors.burgId = burgId;
+        if (typeof stateId === "number" && !Number.isNaN(stateId)) anchors.stateId = stateId;
 
         const ents = canon.listEntities({ type, tag, text, limit, anchors: Object.keys(anchors).length ? anchors : undefined });
         print(globals, wrap(ents));
@@ -284,6 +293,67 @@ async function main() {
         const json = JSON.parse(txt);
         const res = canon.importSnapshot(json, mode);
         print(globals, wrap({ imported_from: input, ...res }));
+        return;
+      }
+
+      if (action === "ingest") {
+        const flags = args;
+        const get = (name: string): string | undefined => {
+          const idx = flags.indexOf(name);
+          if (idx >= 0) return flags[idx + 1];
+          const pref = name + "=";
+          const hit = flags.find((x) => x.startsWith(pref));
+          return hit ? hit.slice(pref.length) : undefined;
+        };
+
+        const file = get("--file");
+        if (!file) throw new Error("--file is required");
+        const text = await Bun.file(file).text();
+        const name = get("--name");
+        const scope = get("--scope") ?? "world";
+        const apply = flags.includes("--apply");
+        const burgId = get("--burg") ? Number(get("--burg")) : undefined;
+        const stateId = get("--state") ? Number(get("--state")) : undefined;
+        const eraId = get("--era-id") ?? undefined;
+
+        const anchors: Record<string, any> = {};
+        if (typeof burgId === "number" && !Number.isNaN(burgId)) anchors.burgId = burgId;
+        if (typeof stateId === "number" && !Number.isNaN(stateId)) anchors.stateId = stateId;
+        if (eraId) anchors.eraId = eraId;
+
+        const provider = getEffectiveGenerationProvider(config) || getEffectiveProvider(config);
+        const model = getEffectiveGenerationProvider(config)
+          ? getEffectiveGenerationModel(config, provider)
+          : getEffectiveModel(config, provider);
+        const llm = createLLMClient({ provider, model });
+
+        const result = await parseSourceText(
+          { canon, world, llm },
+          { name, text, scope, anchors, apply }
+        );
+
+        print(globals, wrap({
+          sourceText: {
+            id: result.sourceText.id,
+            name: result.sourceText.name,
+            parseStatus: result.sourceText.payload?.parseStatus,
+          },
+          applied: result.applied,
+          summary: result.plan.summary,
+          creates: result.plan.creates,
+          updates: result.plan.updates,
+          relations: result.plan.relations,
+          relationTypeDefinitions: result.plan.relationTypeDefinitions,
+          unresolvedReferences: result.plan.unresolvedReferences,
+          cautions: result.plan.cautions,
+          usage: result.usage,
+          appliedCounts: result.applied ? {
+            createdEntities: result.createdEntities?.length ?? 0,
+            updatedEntities: result.updatedEntities?.length ?? 0,
+            createdRelations: result.createdRelations?.length ?? 0,
+            definedRelationTypes: result.definedRelationTypes?.length ?? 0,
+          } : undefined,
+        }));
         return;
       }
 

@@ -1,7 +1,7 @@
 import { ToolRegistry, ToolContext } from "./index";
 import { EntityType, CanonEntity } from "../../canon/canon";
 
-const VALID_ENTITY_TYPES = ["npc", "faction", "location", "event", "rumor", "hook", "meta", "culture", "religion"] as const;
+const VALID_ENTITY_TYPES = ["npc", "faction", "location", "event", "rumor", "hook", "meta", "culture", "religion", "deity", "era", "phenomena", "relation_type", "source_text", "marker"] as const;
 
 export function registerCanonTools(registry: ToolRegistry): void {
   // canon_query - Search entities by type, tags, anchor, kind
@@ -16,7 +16,7 @@ export function registerCanonTools(registry: ToolRegistry): void {
         properties: {
           type: {
             type: "string",
-            description: "Entity type filter: npc, faction, location, event, rumor, hook, meta",
+            description: "Entity type filter: npc, faction, location, event, rumor, hook, meta, deity, era, phenomena, relation_type, source_text",
             enum: [...VALID_ENTITY_TYPES],
           },
           tag: { type: "string", description: "Filter by a specific tag (e.g., 'tavern', 'criminal')" },
@@ -101,7 +101,7 @@ export function registerCanonTools(registry: ToolRegistry): void {
           entityId: { type: "string", description: "Entity ID to update (omit for new entity)" },
           type: {
             type: "string",
-            description: "Entity type: npc, faction, location, event, rumor, hook, meta",
+            description: "Entity type: npc, faction, location, event, rumor, hook, meta, deity, era, phenomena, relation_type, source_text",
             enum: [...VALID_ENTITY_TYPES],
           },
           name: { type: "string", description: "Entity name" },
@@ -208,6 +208,14 @@ export function registerCanonTools(registry: ToolRegistry): void {
 
       if (!fromEntity) return { error: `Source entity ${fromId} not found` };
       if (!toEntity) return { error: `Target entity ${toId} not found` };
+      if (!ctx.canon.isKnownRelationType(relationType)) {
+        const known = ctx.canon.listRelationTypeDefinitions().map((entity) => entity.name).slice(0, 20);
+        return {
+          error: `Unknown relation type: ${relationType}`,
+          hint: "Define it first with canon_define_relation_type or use an existing built-in relation.",
+          knownCustomRelationTypes: known,
+        };
+      }
 
       // Check for duplicate
       const existingRels = ctx.canon.listRelations({ entity_id: fromId, limit: 500 });
@@ -225,6 +233,109 @@ export function registerCanonTools(registry: ToolRegistry): void {
       });
 
       return { created: true, relation };
+    }
+  );
+
+  registry.register(
+    "canon_list_relation_types",
+    {
+      name: "canon_list_relation_types",
+      description: "List built-in and custom relation types the world canon recognizes.",
+      parameters: {
+        type: "object",
+        properties: {},
+      },
+    },
+    async (_args: Record<string, any>, ctx: ToolContext) => {
+      const custom = ctx.canon.listRelationTypeDefinitions().map((entity) => ({
+        id: entity.id,
+        name: entity.name,
+        summary: entity.summary || null,
+        inverseName: entity.payload?.inverseName || null,
+        domainTypes: entity.payload?.domainTypes || [],
+        rangeTypes: entity.payload?.rangeTypes || [],
+      }));
+      return {
+        builtIn: [
+          "about", "affiliated_with", "allied_with", "belongs_to", "caused_by", "controls",
+          "dedicated_to", "founded", "involves", "leads", "located_at", "located_in",
+          "member_of", "occurs_in", "operates_from", "owns", "parent_of", "patron_of",
+          "preceded_by", "protected_by", "related_to", "rival_of", "rules", "sealed_by",
+          "sibling_of", "spread_by", "succeeded_by", "works_at",
+        ],
+        custom,
+      };
+    }
+  );
+
+  registry.register(
+    "canon_define_relation_type",
+    {
+      name: "canon_define_relation_type",
+      description: "Create or update a custom relation type definition so models can use a world-specific edge consistently.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Canonical relation type name, e.g. burns or draws_power_from" },
+          summary: { type: "string", description: "Short explanation of what this edge means" },
+          inverseName: { type: "string", description: "Optional inverse label for the reverse direction" },
+          domainTypes: { type: "string", description: "JSON array of allowed source entity types" },
+          rangeTypes: { type: "string", description: "JSON array of allowed target entity types" },
+          symmetric: { type: "boolean", description: "Whether A rel B implies B rel A" },
+          transitive: { type: "boolean", description: "Whether the relation is transitive" },
+          usageNotes: { type: "string", description: "Additional modeling notes for the LLM" },
+          examples: { type: "string", description: "JSON array of example usages" },
+        },
+        required: ["name", "summary"],
+      },
+    },
+    async (args: Record<string, any>, ctx: ToolContext) => {
+      const name = String(args.name || "").trim().toLowerCase();
+      if (!name) return { error: "name is required" };
+
+      let domainTypes: string[] = [];
+      let rangeTypes: string[] = [];
+      let examples: string[] = [];
+      try {
+        if (args.domainTypes) domainTypes = JSON.parse(String(args.domainTypes));
+        if (args.rangeTypes) rangeTypes = JSON.parse(String(args.rangeTypes));
+        if (args.examples) examples = JSON.parse(String(args.examples));
+      } catch {
+        return { error: "domainTypes, rangeTypes, and examples must be valid JSON arrays when provided" };
+      }
+
+      const payload = {
+        inverseName: args.inverseName ? String(args.inverseName) : undefined,
+        domainTypes: domainTypes.filter((value) => VALID_ENTITY_TYPES.includes(value as typeof VALID_ENTITY_TYPES[number])),
+        rangeTypes: rangeTypes.filter((value) => VALID_ENTITY_TYPES.includes(value as typeof VALID_ENTITY_TYPES[number])),
+        symmetric: args.symmetric === true ? true : undefined,
+        transitive: args.transitive === true ? true : undefined,
+        usageNotes: args.usageNotes ? String(args.usageNotes) : undefined,
+        examples,
+      };
+
+      const existing = ctx.canon.getRelationTypeDefinition(name);
+      if (existing) {
+        const updated = ctx.canon.patchEntity(existing.id, {
+          summary: String(args.summary),
+          payload,
+        });
+        return { updated: true, relationType: updated };
+      }
+
+      const relationType = ctx.canon.addEntity({
+        type: "relation_type",
+        name,
+        summary: String(args.summary),
+        payload,
+        provenance: {
+          generated_by: "azchat-director",
+          provider: ctx.llm.provider,
+          model: ctx.llm.model,
+        },
+      });
+
+      return { created: true, relationType };
     }
   );
 

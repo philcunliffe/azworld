@@ -60,6 +60,22 @@ export function factionTemplate(ctx: TemplateContext): string {
     lines.push("");
   }
 
+  if (Array.isArray(payload.goalProgress) && payload.goalProgress.length) {
+    lines.push("## Goal Progress", "");
+    for (const progress of payload.goalProgress) {
+      const parts = [
+        progress.goal || progress.id || "Unnamed goal",
+        progress.status ? `status: ${progress.status}` : null,
+        progress.progress !== undefined ? `progress: ${progress.progress}%` : null,
+        progress.stage ? `stage: ${progress.stage}` : null,
+        progress.nextMilestone ? `next: ${progress.nextMilestone}` : null,
+        progress.secrecy ? `secrecy: ${progress.secrecy}` : null,
+      ].filter(Boolean);
+      lines.push(`- ${parts.join(" | ")}`);
+    }
+    lines.push("");
+  }
+
   // Members (NPCs with member_of relation to this faction)
   const members = relations.incoming.filter((r) => r.rel_type === "member_of");
   if (members.length) {

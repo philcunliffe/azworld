@@ -42,6 +42,8 @@ export const EntityKindEnum = z.enum([
   "hook",
   "culture",
   "religion",
+  "deity",
+  "marker",
 ]);
 
 export type EntityKind = z.infer<typeof EntityKindEnum>;
@@ -185,6 +187,7 @@ export const OnboardingStateSchema = z.object({
   generate: z.object({
     contentTypes: z.object({
       religions: z.boolean(),
+      pantheons: z.boolean(),
       cultures: z.boolean(),
       states: z.boolean(),
     }),
@@ -205,6 +208,7 @@ export type OnboardingState = z.infer<typeof OnboardingStateSchema>;
 export const ModalStateSchema = z.object({
   visible: z.boolean(),
   title: z.string(),
+  message: z.string().optional(),
   progress: z.string().optional(),          // Current progress message
   isComplete: z.boolean(),
   createdEntities: z.array(z.object({
@@ -360,6 +364,7 @@ export type TuiAction =
 
   // Modal
   | { type: "SHOW_MODAL"; title: string }
+  | { type: "SHOW_MESSAGE_MODAL"; title: string; message: string }
   | { type: "UPDATE_MODAL_PROGRESS"; progress: string }
   | { type: "ADD_MODAL_ENTITY"; entity: { id: string; name: string; kind: EntityKind } }
   | { type: "COMPLETE_MODAL" }
@@ -465,6 +470,6 @@ export type TuiCallbacks = {
 // Keypress result from keybinding handler
 export type KeypressResult = {
   actions: TuiAction[];
-  callback?: "execute_command" | "navigate_to_entity" | "sync_browse_state" | "quit" | "execute_approved_generation" | "execute_approved_modification" | "execute_approved_world_generation" | "execute_approved_description_generation" | "toggle_current_section" | "navigate_to_search_result" | "execute_onboarding" | "navigate_to_detail_link" | "detail_move_down" | "detail_move_up" | "rebuild_tree_for_tab" | "confirm_field_selection" | "execute_field_regeneration" | "open_plan_in_editor" | "enter_talk_mode" | "exit_talk_mode" | "send_talk_message" | null;
+  callback?: "execute_command" | "navigate_to_entity" | "sync_browse_state" | "quit" | "execute_approved_generation" | "execute_approved_modification" | "execute_approved_simulation" | "execute_approved_world_generation" | "execute_approved_description_generation" | "toggle_current_section" | "navigate_to_search_result" | "execute_onboarding" | "navigate_to_detail_link" | "detail_move_down" | "detail_move_up" | "rebuild_tree_for_tab" | "confirm_field_selection" | "execute_field_regeneration" | "open_plan_in_editor" | "enter_talk_mode" | "exit_talk_mode" | "send_talk_message" | null;
   entityRef?: EntityRef;
 };

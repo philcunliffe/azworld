@@ -800,4 +800,261 @@ export class AzgaarWorld {
     results.sort((a, b) => b.score - a.score || a.item.name.localeCompare(b.item.name));
     return results.slice(0, limit).map((r) => ({ score: r.score, ...r.item }));
   }
+
+  /**
+   * Get map region data centered on a burg for client-side SVG rendering.
+   * Returns cells (with polygon vertices), nearby burgs, rivers, and state colors.
+   */
+  getMapRegion(burgId: number, radius = 150): {
+    center: { x: number; y: number };
+    bounds: { x: number; y: number; w: number; h: number };
+    mapSize: { width: number; height: number };
+    cells: Array<{ id: number; polygon: [number, number][]; state: number; biome: number; elevation: number; feature: number }>;
+    burgs: Array<{ id: number; name: string; x: number; y: number; capital: boolean; port: boolean; population: number; state: number }>;
+    rivers: Array<{ id: number; name: string; points: [number, number][] }>;
+    states: Array<{ id: number; name: string; color: string }>;
+    biomeColors: Record<number, string>;
+  } | undefined {
+    this.buildIndexes();
+    const burg = this.burgsById.get(burgId);
+    if (!burg || burg.removed) return undefined;
+
+    const cx = burg.x ?? 0;
+    const cy = burg.y ?? 0;
+    const mapWidth = this.root.info?.width ?? 1000;
+    const mapHeight = this.root.info?.height ?? 500;
+
+    // Bounds of the region
+    const x = Math.max(0, cx - radius);
+    const y = Math.max(0, cy - radius);
+    const w = Math.min(radius * 2, mapWidth - x);
+    const h = Math.min(radius * 2, mapHeight - y);
+
+    const cells = this.pack.cells;
+    const vertices = this.pack.vertices;
+    if (!cells || !vertices) return undefined;
+
+    // Determine if cells are object-keyed or array format
+    const isObjKeyed = !Array.isArray(cells) && typeof cells === "object";
+
+    // Helper to get a cell
+    const getCell = (id: number): any => {
+      if (isObjKeyed) return cells[String(id)];
+      if (Array.isArray(cells) && cells[id]) return cells[id];
+      return undefined;
+    };
+
+    // Helper to get vertex coordinates
+    const getVertexPos = (vid: number): [number, number] | undefined => {
+      const v = Array.isArray(vertices) ? vertices[vid] : vertices[String(vid)];
+      if (!v) return undefined;
+      if (Array.isArray(v.p)) return v.p as [number, number];
+      if (typeof v === "object" && v.p) return v.p;
+      return undefined;
+    };
+
+    // Collect cells in the region
+    const regionCells: Array<{ id: number; polygon: [number, number][]; state: number; biome: number; elevation: number; feature: number }> = [];
+    const cellCount = isObjKeyed ? Object.keys(cells).length : (Array.isArray(cells) ? cells.length : 0);
+
+    for (let i = 0; i < cellCount; i++) {
+      const cell = getCell(i);
+      if (!cell) continue;
+
+      // Check if cell center is in region (with some margin for cells at the edge)
+      const cp = cell.p;
+      if (!Array.isArray(cp)) continue;
+      const margin = 30;
+      if (cp[0] < x - margin || cp[0] > x + w + margin || cp[1] < y - margin || cp[1] > y + h + margin) continue;
+
+      // Build polygon from vertices
+      const vIds = cell.v;
+      if (!Array.isArray(vIds)) continue;
+      const polygon: [number, number][] = [];
+      let valid = true;
+      for (const vid of vIds) {
+        const pos = getVertexPos(vid);
+        if (!pos) { valid = false; break; }
+        polygon.push(pos);
+      }
+      if (!valid || polygon.length < 3) continue;
+
+      regionCells.push({
+        id: i,
+        polygon,
+        state: cell.state ?? 0,
+        biome: cell.biome ?? 0,
+        elevation: cell.h ?? 0,
+        feature: cell.f ?? 0,
+      });
+    }
+
+    // Collect burgs in region
+    const regionBurgs: Array<{ id: number; name: string; x: number; y: number; capital: boolean; port: boolean; population: number; state: number }> = [];
+    for (const [id, b] of this.burgsById.entries()) {
+      if (id === 0 || !b || b.removed) continue;
+      const bx = b.x ?? 0;
+      const by = b.y ?? 0;
+      if (bx >= x && bx <= x + w && by >= y && by <= y + h) {
+        regionBurgs.push({
+          id,
+          name: b.name ?? "",
+          x: bx,
+          y: by,
+          capital: !!b.capital,
+          port: !!b.port,
+          population: b.population ?? b.pop ?? 0,
+          state: typeof b.state === "number" ? b.state : 0,
+        });
+      }
+    }
+
+    // Collect rivers that pass through the region
+    const regionRivers: Array<{ id: number; name: string; points: [number, number][] }> = [];
+    const rivers = this.pack.rivers;
+    if (Array.isArray(rivers)) {
+      for (const river of rivers) {
+        if (!river || !river.cells || !Array.isArray(river.cells)) continue;
+        // Get river cell center points that fall in region
+        const points: [number, number][] = [];
+        for (const cellId of river.cells) {
+          const cell = getCell(cellId);
+          if (cell?.p) {
+            const rp = cell.p;
+            if (rp[0] >= x - 20 && rp[0] <= x + w + 20 && rp[1] >= y - 20 && rp[1] <= y + h + 20) {
+              points.push(rp);
+            }
+          }
+        }
+        if (points.length > 1) {
+          regionRivers.push({ id: river.i, name: river.name ?? "", points });
+        }
+      }
+    }
+
+    // Collect state info (colors)
+    const stateSet = new Set(regionCells.map(c => c.state));
+    const regionStates: Array<{ id: number; name: string; color: string }> = [];
+    for (const sid of stateSet) {
+      const s = this.statesById.get(sid);
+      regionStates.push({ id: sid, name: s?.name ?? "", color: s?.color ?? "#ccc" });
+    }
+
+    // Biome colors
+    const biomeColors: Record<number, string> = {
+      0: "#466eab",  // Marine / ocean
+      1: "#d8e8c8",  // Hot desert
+      2: "#c8d87c",  // Cold desert
+      3: "#b6d958",  // Savanna
+      4: "#29bc56",  // Grassland
+      5: "#7dcb35",  // Tropical seasonal forest
+      6: "#409c43",  // Temperate deciduous forest
+      7: "#4b7e2f",  // Tropical rainforest
+      8: "#4a8c52",  // Temperate rainforest
+      9: "#6b9e4b",  // Taiga
+      10: "#d5e7a0", // Tundra
+      11: "#96784b", // Glacier
+      12: "#c5c596", // Wetland
+    };
+
+    return {
+      center: { x: cx, y: cy },
+      bounds: { x, y, w, h },
+      mapSize: { width: mapWidth, height: mapHeight },
+      cells: regionCells,
+      burgs: regionBurgs,
+      rivers: regionRivers,
+      states: regionStates,
+      biomeColors,
+    };
+  }
+
+  /**
+   * Get full world map data for client-side SVG rendering.
+   */
+  getFullMap(): {
+    bounds: { x: number; y: number; w: number; h: number };
+    cells: Array<{ id: number; polygon: [number, number][]; state: number; biome: number; elevation: number; feature: number }>;
+    burgs: Array<{ id: number; name: string; x: number; y: number; capital: boolean; port: boolean; population: number; state: number }>;
+    rivers: Array<{ id: number; name: string; points: [number, number][] }>;
+    routes: Array<{ id: number; group: string; points: [number, number][] }>;
+    states: Array<{ id: number; name: string; color: string }>;
+  } {
+    this.buildIndexes();
+    const mapWidth = this.root.info?.width ?? 1000;
+    const mapHeight = this.root.info?.height ?? 500;
+    const cells = this.pack.cells;
+    const vertices = this.pack.vertices;
+    const isObjKeyed = !Array.isArray(cells) && typeof cells === "object";
+
+    const getCell = (id: number): any => {
+      if (isObjKeyed) return cells[String(id)];
+      if (Array.isArray(cells) && cells[id]) return cells[id];
+      return undefined;
+    };
+
+    const getVertexPos = (vid: number): [number, number] | undefined => {
+      const v = Array.isArray(vertices) ? vertices[vid] : vertices?.[String(vid)];
+      if (!v) return undefined;
+      if (Array.isArray(v.p)) return v.p as [number, number];
+      return undefined;
+    };
+
+    // All cells
+    const allCells: Array<{ id: number; polygon: [number, number][]; state: number; biome: number; elevation: number; feature: number }> = [];
+    const cellCount = isObjKeyed ? Object.keys(cells).length : (Array.isArray(cells) ? cells.length : 0);
+    for (let i = 0; i < cellCount; i++) {
+      const cell = getCell(i);
+      if (!cell?.p || !Array.isArray(cell.v)) continue;
+      const polygon: [number, number][] = [];
+      let valid = true;
+      for (const vid of cell.v) {
+        const pos = getVertexPos(vid);
+        if (!pos) { valid = false; break; }
+        polygon.push(pos);
+      }
+      if (!valid || polygon.length < 3) continue;
+      allCells.push({ id: i, polygon, state: cell.state ?? 0, biome: cell.biome ?? 0, elevation: cell.h ?? 0, feature: cell.f ?? 0 });
+    }
+
+    // All burgs
+    const allBurgs: Array<{ id: number; name: string; x: number; y: number; capital: boolean; port: boolean; population: number; state: number }> = [];
+    for (const [id, b] of this.burgsById.entries()) {
+      if (id === 0 || !b || b.removed) continue;
+      allBurgs.push({ id, name: b.name ?? "", x: b.x ?? 0, y: b.y ?? 0, capital: !!b.capital, port: !!b.port, population: b.population ?? b.pop ?? 0, state: typeof b.state === "number" ? b.state : 0 });
+    }
+
+    // All rivers
+    const allRivers: Array<{ id: number; name: string; points: [number, number][] }> = [];
+    if (Array.isArray(this.pack.rivers)) {
+      for (const river of this.pack.rivers) {
+        if (!river?.cells || !Array.isArray(river.cells)) continue;
+        const points: [number, number][] = [];
+        for (const cellId of river.cells) {
+          const cell = getCell(cellId);
+          if (cell?.p) points.push(cell.p);
+        }
+        if (points.length > 1) allRivers.push({ id: river.i, name: river.name ?? "", points });
+      }
+    }
+
+    // All states
+    const allStates: Array<{ id: number; name: string; color: string }> = [];
+    for (const [id, s] of this.statesById.entries()) {
+      if (id === 0 || !s || s.removed) continue;
+      allStates.push({ id, name: s.name ?? "", color: s.color ?? "#ccc" });
+    }
+
+    // All routes (roads, trails, sea routes)
+    const allRoutes: Array<{ id: number; group: string; points: [number, number][] }> = [];
+    if (Array.isArray(this.pack.routes)) {
+      for (const route of this.pack.routes) {
+        if (!route?.points || !Array.isArray(route.points)) continue;
+        const points: [number, number][] = route.points.map((p: any) => [p[0], p[1]]);
+        if (points.length > 1) allRoutes.push({ id: route.i, group: route.group ?? "trails", points });
+      }
+    }
+
+    return { bounds: { x: 0, y: 0, w: mapWidth, h: mapHeight }, cells: allCells, burgs: allBurgs, rivers: allRivers, routes: allRoutes, states: allStates };
+  }
 }

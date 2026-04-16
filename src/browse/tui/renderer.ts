@@ -78,6 +78,8 @@ export const ENTITY_COLORS: Record<EntityKind, string> = {
   hook: FG_ORANGE,   // Hooks are action-oriented quest seeds
   culture: FG_ORANGE,
   religion: FG_CYAN,
+  deity: FG_YELLOW,
+  marker: FG_RED,
 };
 
 /**

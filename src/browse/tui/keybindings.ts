@@ -496,6 +496,8 @@ function handleModalMode(key: string, state: TuiState): KeypressResult {
           return { actions, callback: "execute_approved_generation" };
         } else if (choice.value === "apply") {
           return { actions, callback: "execute_approved_modification" };
+        } else if (choice.value === "simulate") {
+          return { actions, callback: "execute_approved_simulation" };
         } else if (choice.value === "generate") {
           // Check modal title to distinguish between world gen and description gen
           if (state.modal.title?.includes("Description")) {

@@ -14,16 +14,28 @@ export type SceneContext = {
   factions: CanonEntity[];
 };
 
+export type ChatBlock =
+  | { type: "text"; text: string }
+  | { type: "tool_call"; name: string; args?: any; status: "running" | "done" }
+  | { type: "plan"; planId: string; entities: any[]; summary: string; status: "pending" | "approved" | "rejected" | "executing" };
+
+export type GeneralChatMessage = {
+  role: "user" | "assistant";
+  content: string;
+  blocks?: ChatBlock[];
+};
+
 export type ChatState = {
   currentBurgId?: number;
   currentLocationId?: string;
   currentNpcId?: string;
   directorHistory: { role: "user" | "assistant"; content: string }[];
   npcHistories: Record<string, { role: "user" | "assistant"; content: string }[]>;
+  generalHistory: GeneralChatMessage[];
 };
 
 export function newChatState(): ChatState {
-  return { directorHistory: [], npcHistories: {} };
+  return { directorHistory: [], npcHistories: {}, generalHistory: [] };
 }
 
 /**

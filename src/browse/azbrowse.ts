@@ -70,7 +70,12 @@ function createCompleter(
     if (!navCommands.includes(cmd)) {
       // Complete command names
       if (parts.length === 1) {
-        const commands = ["loc", "cd", "state", "npc", "ls", "info", "search", "gen", "mod", "rm", "help", "exit", "talk", "back", "init", "tokens", "model", "genmodel"];
+        const commands = [
+          "loc", "cd", "state", "npc", "ls", "info", "rels", "search",
+          "gen", "ingest", "simplegen", "mod", "rm", "unlink",
+          "ask", "scene", "help", "exit", "talk", "back", "pwd",
+          "init", "tokens", "model", "genmodel", "talkmodel",
+        ];
         const matches = commands.filter(c => c.startsWith(cmd));
         return [matches, cmd];
       }
@@ -213,6 +218,7 @@ REPL Commands (type 'help' once running):
   loc <name>        Navigate to burg or location
   ls                List contents at current level
   gen location      Generate new location with NPCs
+  ingest <file>     Parse source prose into a canon plan
   /talk <npc>       Enter NPC roleplay mode
   /init             Configure campaign settings (vibe, quest, tone)
 

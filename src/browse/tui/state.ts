@@ -74,6 +74,7 @@ function createInitialModal(title: string): ModalState {
   return {
     visible: true,
     title,
+    message: undefined,
     isComplete: false,
     createdEntities: [],
     selectedIndex: 0,
@@ -91,6 +92,7 @@ function createInitialOnboardingState(): OnboardingState {
     generate: {
       contentTypes: {
         religions: false,
+        pantheons: false,
         cultures: false,
         states: false,
       },
@@ -171,15 +173,22 @@ export function getHelpContent(): string[] {
     "  :loc NAME  Navigate to location",
     "  :state ID  Navigate to state",
     "  :npc NAME  Navigate to NPC",
+    "  :cd PATH   Navigate by path",
+    "  :pwd       Show current path",
     "  :ls        List children of current entity",
     "  :info      Show entity info",
+    "  :rels      Show relations for current entity",
     "  :search Q  Search for entities",
+    "  :time      Show current world day",
     "",
     "GENERATION",
     "  :gen location HINTS    Plan location generation",
     "  :gen npc HINTS         Plan NPC generation",
     "  :gen faction HINTS     Plan faction generation",
+    "  :gen rumor HINTS       Plan rumor generation",
+    "  :gen hook HINTS        Plan hook generation",
     "  :mod INSTRUCTIONS      Modify current entity",
+    "  :advance 7d [focus]    Plan and approve world simulation",
     "",
     "TALK MODE",
     "  :talk NAME             Enter talk mode with NPC",
@@ -189,6 +198,7 @@ export function getHelpContent(): string[] {
     "  :init                  Open campaign settings wizard",
     "  :tokens                Toggle token count display",
     "  :model                 Show all models (chat, gen, talk)",
+    "  :genmodel              Show/set generation model",
     "  :talkmodel             Show/set talk model",
     "",
     "MODAL NAVIGATION",
@@ -215,7 +225,7 @@ function getStepOptions(step: OnboardingStep): string[] {
     case "rating":
       return ["pg", "teen", "mature", "explicit"];
     case "contentTypes":
-      return ["Religions", "Cultures", "States + Leaders"];
+      return ["Religions", "Pantheons (deities)", "Cultures", "States + Leaders"];
     case "scopeSelection":
       return ["Entire World", "Select States"];
     // stateSelection options are dynamic - provided via stateList
@@ -584,6 +594,17 @@ export function tuiReducer(state: TuiState, action: TuiAction): TuiState {
         ...state,
         mode: "modal",
         modal: createInitialModal(action.title),
+      };
+
+    case "SHOW_MESSAGE_MODAL":
+      return {
+        ...state,
+        mode: "modal",
+        modal: {
+          ...createInitialModal(action.title),
+          isComplete: true,
+          message: action.message,
+        },
       };
 
     case "UPDATE_MODAL_PROGRESS":
@@ -958,8 +979,9 @@ export function tuiReducer(state: TuiState, action: TuiAction): TuiState {
           ...newGenerate,
           contentTypes: {
             religions: checked.has(0),
-            cultures: checked.has(1),
-            states: checked.has(2),
+            pantheons: checked.has(1),
+            cultures: checked.has(2),
+            states: checked.has(3),
           },
         };
       } else if (step === "scopeSelection") {
@@ -1007,8 +1029,9 @@ export function tuiReducer(state: TuiState, action: TuiAction): TuiState {
       if (nextStep === "contentTypes") {
         // Restore from generate.contentTypes
         if (newGenerate.contentTypes.religions) newCheckedIndices.add(0);
-        if (newGenerate.contentTypes.cultures) newCheckedIndices.add(1);
-        if (newGenerate.contentTypes.states) newCheckedIndices.add(2);
+        if (newGenerate.contentTypes.pantheons) newCheckedIndices.add(1);
+        if (newGenerate.contentTypes.cultures) newCheckedIndices.add(2);
+        if (newGenerate.contentTypes.states) newCheckedIndices.add(3);
       } else if (nextStep === "stateSelection") {
         // Restore from generate.selectedStateIds
         for (const stateId of newGenerate.selectedStateIds) {
