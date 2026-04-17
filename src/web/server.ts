@@ -10,6 +10,7 @@ import { newBrowseState, currentRef, navigateTo, setStack, stackToPath, type Bro
 import { performSearch } from "../browse/tui/search";
 import { buildTree, buildFactionsList, buildReligionsList, buildCulturesList, expandPathToNode, refToNodeId, nodeIdToRef } from "../browse/tui/tree";
 import { syncNavigationFromChatState, type DescriptionPlan, type FieldRegenPlan, type GenPlan, type HookPlan, type ModPlan, type RumorPlan } from "../browse/gen-agent";
+import { buildEntityContext, buildAskSystemPrompt } from "../browse/entity-context";
 import { getCampaignSettings, saveCampaignSettings, type GenerationFlags } from "../chat/campaign-settings";
 import { directScene, type SceneContext, type ChatBlock } from "../chat/director";
 import { npcTurn, resolveNpcByName } from "../chat/npc";
@@ -916,6 +917,25 @@ class WebSession {
     };
   }
 
+  async runAsk(question: string): Promise<{ reply: string; ref: EntityRef; entityTitle: string }> {
+    const ref = currentRef(this.browseState);
+    const entityContext = buildEntityContext(ref, this.world, this.canon);
+    if (!entityContext) {
+      throw new Error("No entity selected. Navigate to an entity first.");
+    }
+    const systemPrompt = buildAskSystemPrompt(entityContext, this.campaignSettings);
+    const result = await this.llm.complete({
+      system: systemPrompt,
+      messages: [{ role: "user", content: question }],
+      maxTokens: 1000,
+      temperature: 0.7,
+    });
+    addTokens(this.tokens, result.usage);
+    const reply = result.text;
+    this.pushTimeline("chat", "Ask", reply, "ok");
+    return { reply, ref, entityTitle: entityContext.name };
+  }
+
   async approveGeneralPlan(planId: string): Promise<any> {
     const planData = this.generalChatPlans.get(planId);
     if (!planData) {
@@ -1387,6 +1407,14 @@ async function main(): Promise<void> {
         if (url.pathname === "/api/chat/general" && request.method === "POST") {
           const body = await readJson<{ message: string }>(request);
           const result = await session.runGeneralChat(body.message);
+          return json({ result, snapshot: session.snapshot() });
+        }
+
+        if (url.pathname === "/api/ask" && request.method === "POST") {
+          const body = await readJson<{ question: string }>(request);
+          const question = normalizeText(body?.question);
+          if (!question) return badRequest("Question required.");
+          const result = await session.runAsk(question);
           return json({ result, snapshot: session.snapshot() });
         }
 
