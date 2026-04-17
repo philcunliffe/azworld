@@ -397,7 +397,10 @@ function renderStateDetail(detail, state) {
     <section class="detail-card">
       <div>
         ${pathline(detail, state)}
-        <h2 style="font-family:var(--serif)">${escapeHtml(detail.title || 'State')}</h2>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <h2 style="font-family:var(--serif);margin:0">${escapeHtml(detail.title || 'State')}</h2>
+          ${actionBtnSoft('Ask', 'open-ask-modal')}
+        </div>
       </div>
       ${summaryBanner(summaryText)}
       <div class="hero-meta">
@@ -618,6 +621,7 @@ function renderBurgDetail(detail, state) {
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <h2 style="font-family:var(--serif);margin:0">${escapeHtml(detail.title || 'Burg')}</h2>
           ${actionBtn('Generate Package', 'run-command', 'data-command="gen"')}
+          ${actionBtnSoft('Ask', 'open-ask-modal')}
         </div>
       </div>
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
@@ -670,6 +674,7 @@ function renderLocationDetail(detail, state) {
         ${pathline(detail, state)}
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <h2 style="font-family:var(--serif);margin:0">${escapeHtml(detail.title || 'Location')}</h2>
+          ${actionBtnSoft('Ask', 'open-ask-modal')}
           ${actionBtnSoft('Modify', 'run-command', 'data-command="mod"')}
           ${actionBtnSoft('Regen Fields', 'run-command', `data-command="gen ${escapeHtml(raw.type || 'location')} ${escapeHtml(raw.name || '')}"`.trim())}
           ${raw.id ? actionBtnDanger('Delete', 'delete-entity', `data-id="${escapeHtml(String(raw.id))}"`) : ''}
@@ -758,6 +763,7 @@ function renderNpcDetail(detail, state) {
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <h2 style="font-family:var(--serif);margin:0">${escapeHtml(detail.title || 'NPC')}</h2>
           ${actionBtn('Talk', 'open-chat-npc', `data-name="${escapeHtml(raw.name || '')}"`)  }
+          ${actionBtnSoft('Ask', 'open-ask-modal')}
           ${actionBtnSoft('Modify', 'run-command', 'data-command="mod"')}
           ${actionBtnSoft('Regen Fields', 'run-command', `data-command="gen ${escapeHtml(raw.type || 'npc')} ${escapeHtml(raw.name || '')}"`.trim())}
           ${raw.id ? actionBtnDanger('Delete', 'delete-entity', `data-id="${escapeHtml(String(raw.id))}"`) : ''}
@@ -836,6 +842,7 @@ function renderEventDetail(detail, state) {
         ${pathline(detail, state)}
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <h2 style="font-family:var(--serif);margin:0">${escapeHtml(detail.title || 'Event')}</h2>
+          ${actionBtnSoft('Ask', 'open-ask-modal')}
           ${raw.id ? actionBtnDanger('Delete', 'delete-entity', `data-id="${escapeHtml(String(raw.id))}"`) : ''}
         </div>
       </div>
@@ -881,6 +888,7 @@ function renderRumorDetail(detail, state) {
         ${pathline(detail, state)}
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <h2 style="font-family:var(--serif);margin:0">${escapeHtml(detail.title || 'Rumor')}</h2>
+          ${actionBtnSoft('Ask', 'open-ask-modal')}
           ${raw.id ? actionBtnDanger('Delete', 'delete-entity', `data-id="${escapeHtml(String(raw.id))}"`) : ''}
         </div>
       </div>
@@ -932,6 +940,7 @@ function renderHookDetail(detail, state) {
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <h2 style="font-family:var(--serif);margin:0">${escapeHtml(detail.title || 'Hook')}</h2>
           ${payload.urgency ? badge(payload.urgency, urgencyVariant) : ''}
+          ${actionBtnSoft('Ask', 'open-ask-modal')}
         </div>
       </div>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
@@ -1006,6 +1015,7 @@ function renderDeityDetail(detail, state) {
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <h2 style="font-family:var(--serif);margin:0">${escapeHtml(detail.title || 'Deity')}</h2>
           ${payload.rank ? badge(payload.rank, rankVariant) : ''}
+          ${actionBtnSoft('Ask', 'open-ask-modal')}
         </div>
       </div>
       ${domainsChips}
@@ -1079,6 +1089,7 @@ function renderFactionDetail(detail, state) {
         ${pathline(detail, state)}
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <h2 style="font-family:var(--serif);margin:0">${escapeHtml(detail.title || 'Faction')}</h2>
+          ${actionBtnSoft('Ask', 'open-ask-modal')}
           ${actionBtnSoft('Modify', 'run-command', 'data-command="mod"')}
           ${raw.id ? actionBtnDanger('Delete', 'delete-entity', `data-id="${escapeHtml(String(raw.id))}"`) : ''}
         </div>
@@ -1121,6 +1132,7 @@ function renderGenericDetail(detail, state) {
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <h2 style="font-family:var(--serif);margin:0">${escapeHtml(detail.title || 'Entity')}</h2>
           ${detail.kind ? badge(detail.kind) : ''}
+          ${actionBtnSoft('Ask', 'open-ask-modal')}
           ${raw.id ? actionBtnDanger('Delete', 'delete-entity', `data-id="${escapeHtml(String(raw.id))}"`) : ''}
         </div>
       </div>
