@@ -25,3 +25,7 @@ export async function apiDelete(path) {
 export async function apiPatch(path, body) {
   return api(path, { method: "PATCH", body: JSON.stringify(body) });
 }
+
+export async function askQuestion(question) {
+  return apiPost("/api/ask", { question });
+}

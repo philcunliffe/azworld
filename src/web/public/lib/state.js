@@ -23,6 +23,7 @@ const state = {
   genFormOpen: null,
   burgTab: "factions",
   mapViewActive: false,
+  askModal: null,
 };
 
 let renderFn = null;
