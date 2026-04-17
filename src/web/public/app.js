@@ -5,7 +5,7 @@
  * handles event delegation, and orchestrates the render loop.
  */
 
-import { api, apiPost, apiDelete, apiPatch } from './lib/api.js';
+import { api, apiPost, apiDelete, apiPatch, askQuestion } from './lib/api.js';
 import { state, setRenderCallback, syncSnapshot, pushNotice, navigate, parseHashRoute } from './lib/state.js';
 import { initKeyboard, registerShortcut } from './lib/keyboard.js';
 import { escapeHtml, parseJsonField } from './lib/util.js';
@@ -14,6 +14,7 @@ import { renderSidebar } from './components/sidebar.js';
 import { renderSideSheet } from './components/side-sheet.js';
 import { renderChatDrawer } from './components/chat-drawer.js';
 import { renderSettings } from './components/settings.js';
+import { renderAskModal } from './components/ask-modal.js';
 import { renderEntityDetail } from './views/entity-detail.js';
 import { loadRegionMap } from './components/region-map.js';
 import { renderWorldMap, loadWorldMap } from './views/world-map.js';
@@ -156,6 +157,7 @@ function render() {
       ${!isGeneralChat ? renderChatDrawer(state) : ''}
     </div>
     ${renderSettings(state)}
+    ${renderAskModal(state)}
     ${renderSearchOverlay()}
     ${renderCommandPalette()}
     ${renderNotices()}
@@ -169,6 +171,16 @@ function render() {
   if (state.commandPaletteOpen) {
     const input = document.getElementById('command-palette-input');
     if (input) input.focus();
+  }
+  // Focus ask-modal input (when form is visible)
+  if (state.askModal && (state.askModal.status === 'idle' || state.askModal.status === 'errored')) {
+    const input = document.getElementById('ask-modal-input');
+    if (input && document.activeElement !== input) {
+      input.focus();
+      // Move caret to end when pre-populated
+      const len = input.value.length;
+      input.setSelectionRange(len, len);
+    }
   }
   // Auto-scroll chat to bottom
   if (state.chatOpen) {
@@ -331,6 +343,34 @@ document.addEventListener('click', async (event) => {
       state.chatOpen = true;
       state.chatMode = 'npc';
       render();
+      return;
+    }
+
+    // Ask modal
+    if (action === 'open-ask-modal') {
+      const detail = state.snapshot?.browse?.detail;
+      const entityTitle = detail?.title || 'this entity';
+      state.askModal = { status: 'idle', entityTitle, lastQuestion: '' };
+      render();
+      return;
+    }
+    if (action === 'close-ask-modal') {
+      state.askModal = null;
+      render();
+      return;
+    }
+    if (action === 'close-ask-modal-backdrop') {
+      if (event.target === event.target.closest('.ask-modal-overlay')) {
+        state.askModal = null;
+        render();
+      }
+      return;
+    }
+    if (action === 'ask-modal-reset') {
+      if (state.askModal) {
+        state.askModal = { status: 'idle', entityTitle: state.askModal.entityTitle, lastQuestion: '' };
+        render();
+      }
       return;
     }
 
@@ -653,6 +693,40 @@ document.addEventListener('submit', async (event) => {
   event.preventDefault();
 
   try {
+    // Ask modal form
+    if (form.id === 'ask-modal-form') {
+      if (!state.askModal) return;
+      const question = String(new FormData(form).get('question') || '').trim();
+      if (!question) return;
+      const entityTitle = state.askModal.entityTitle;
+      state.askModal = { status: 'loading', entityTitle, lastQuestion: question };
+      render();
+      try {
+        const data = await askQuestion(question);
+        if (data.snapshot) syncSnapshot(data.snapshot);
+        if (state.askModal && state.askModal.status === 'loading') {
+          state.askModal = {
+            status: 'answered',
+            entityTitle: data.result?.entityTitle || entityTitle,
+            lastQuestion: question,
+            reply: data.result?.reply || '',
+          };
+          render();
+        }
+      } catch (e) {
+        if (state.askModal && state.askModal.status === 'loading') {
+          state.askModal = {
+            status: 'errored',
+            entityTitle,
+            lastQuestion: question,
+            error: e.message || String(e),
+          };
+          render();
+        }
+      }
+      return;
+    }
+
     // Inline generation form
     if (form.id === 'gen-inline-form') {
       const hints = String(new FormData(form).get('hints') || '').trim();
@@ -934,6 +1008,7 @@ registerShortcut('toggle-sidebar', () => {
 registerShortcut('escape', () => {
   if (state.commandPaletteOpen) { state.commandPaletteOpen = false; render(); return; }
   if (state.searchOpen) { state.searchOpen = false; state.searchQuery = ''; state.searchResults = []; render(); return; }
+  if (state.askModal) { state.askModal = null; render(); return; }
   if (state.settingsOpen) { state.settingsOpen = false; render(); return; }
   if (state.genFormOpen) { state.genFormOpen = null; render(); return; }
 });
