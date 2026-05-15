@@ -15,6 +15,7 @@ import { directScene, type SceneContext, type ChatBlock } from "../chat/director
 import { npcTurn, resolveNpcByName } from "../chat/npc";
 import { generalChat } from "../chat/general";
 import { parseSourceText } from "../canon/ingest";
+import { kickOffIdeaLabeling } from "../canon/idea-labeler";
 import { exportWiki } from "../wiki/wiki";
 import { formatPhasePlan, executePhasePlan, planCultureGeneration, planPantheonGeneration, planReligionGeneration, planStateGeneration, type PhasePlan, type WorldGenContext } from "../browse/world-init-gen";
 import type { CampaignSettings } from "../chat/schema";
@@ -262,6 +263,9 @@ class WebSession {
     const talkLlm = talkProvider
       ? createLLMClient({ provider: talkProvider, model: getEffectiveTalkModel(config, talkProvider) })
       : undefined;
+
+    // Drain any backlog of unlabeled ideas in the background.
+    kickOffIdeaLabeling(canon, generationLlm ?? llm);
 
     return new WebSession({
       worldPath,

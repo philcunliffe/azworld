@@ -19,6 +19,7 @@ import {
   getEffectiveTalkModel,
   type LLMConfig,
 } from "../llm/config";
+import { kickOffIdeaLabeling } from "../canon/idea-labeler";
 import { extractGlobals } from "../util/args";
 import { getCampaignSettings, runOnboarding, GenerationFlags, OnboardingResult } from "../chat/campaign-settings";
 import { CampaignSettings } from "../chat/schema";
@@ -277,6 +278,9 @@ async function main() {
     const talkModel = getEffectiveTalkModel(config, talkProvider);
     talkLlm = createLLMClient({ provider: talkProvider, model: talkModel });
   }
+
+  // Drain any backlog of unlabeled ideas in the background.
+  kickOffIdeaLabeling(canon, generationLlm ?? llm);
 
   // Load campaign settings if they exist
   let campaignSettings: CampaignSettings | undefined = getCampaignSettings(canon);

@@ -1,17 +1,31 @@
 import { AzgaarWorld } from "../world/azgaar";
 import { CanonStore, EntityType } from "../canon/canon";
 import { parseSourceText } from "../canon/ingest";
+import { addIdea, listIdeas, getIdea, markIdeaUsed, deleteIdea, setIdeaLabels } from "../canon/ideas";
+import { runPendingIdeaLabeling, suggestLabelsForIdea, kickOffIdeaLabeling } from "../canon/idea-labeler";
 import { exportWiki } from "../wiki/wiki";
 import { extractGlobals, readJsonArgAsync } from "../util/args";
 import { jsonDumps } from "../util/json";
 import { ok, err } from "../util/envelope";
-import { createLLMClient } from "../llm/providers";
-import { loadConfig, getEffectiveGenerationModel, getEffectiveGenerationProvider, getEffectiveModel, getEffectiveProvider } from "../llm/config";
+import { createLLMClient, type LLMClient } from "../llm/providers";
+import { loadConfig, getEffectiveGenerationModel, getEffectiveGenerationProvider, getEffectiveModel, getEffectiveProvider, type LLMConfig } from "../llm/config";
 
 function print(globals: { json?: boolean; pretty?: boolean }, value: any) {
   const pretty = !!globals.pretty;
   const text = jsonDumps(value, pretty);
   console.log(text);
+}
+
+function buildGenerationLLM(config: LLMConfig): LLMClient | undefined {
+  try {
+    const provider = getEffectiveGenerationProvider(config) || getEffectiveProvider(config);
+    const model = getEffectiveGenerationProvider(config)
+      ? getEffectiveGenerationModel(config, provider)
+      : getEffectiveModel(config, provider);
+    return createLLMClient({ provider, model });
+  } catch {
+    return undefined;
+  }
 }
 
 function usage(): string {
@@ -41,6 +55,13 @@ function usage(): string {
     "  canon link --from-id <id> --to-id <id> --rel <type> [--strength n] [--notes ...]",
     "  canon export --out <file.json>",
     "  canon import --input <file.json> [--mode upsert|insert]",
+    "  idea add <text> [--labels a,b] [--no-label]",
+    "  idea list [--status pending|used|all] [--label X] [--limit N]",
+    "  idea show <id>",
+    "  idea mark-used <id> [--by-entity <entityId>]",
+    "  idea remove <id>",
+    "  idea relabel <id>",
+    "  idea label-pending [--concurrency N]",
     "  export wiki --out <dir>",
   ].join("\n");
 }
@@ -358,6 +379,144 @@ async function main() {
       }
 
       throw new Error("Unknown canon action");
+    }
+
+    if (cmd === "idea") {
+      canon.initDb();
+      const action = sub;
+
+      const flags = args;
+      const getFlag = (name: string): string | undefined => {
+        const idx = flags.indexOf(name);
+        if (idx >= 0) return flags[idx + 1];
+        const pref = name + "=";
+        const hit = flags.find((x) => x?.startsWith(pref));
+        return hit ? hit.slice(pref.length) : undefined;
+      };
+      const hasFlag = (name: string) => flags.includes(name);
+
+      const formatIdea = (e: any) => {
+        const payload = e.payload || {};
+        const text = e.details_md || e.summary || e.name;
+        return {
+          id: e.id,
+          text,
+          summary: e.summary,
+          status: payload.status ?? "pending",
+          labels: Array.isArray(payload.labels) ? payload.labels : [],
+          labelsStatus: payload.labelsStatus ?? "pending",
+          usedByEntityId: payload.usedByEntityId ?? null,
+          usedAt: payload.usedAt ?? null,
+          createdAt: e.created_at,
+          updatedAt: e.updated_at,
+        };
+      };
+
+      if (action === "add") {
+        const text = (args[0] && !args[0].startsWith("--")) ? args[0] : undefined;
+        if (!text) throw new Error("idea text is required (azcli idea add \"<text>\")");
+
+        const rawLabels = getFlag("--labels");
+        const explicitLabels = rawLabels
+          ? rawLabels.split(",").map((s) => s.trim()).filter(Boolean)
+          : undefined;
+        const noLabel = hasFlag("--no-label");
+
+        let llm: LLMClient | undefined;
+        if (!explicitLabels && !noLabel) {
+          llm = buildGenerationLLM(config);
+        }
+
+        const ent = await addIdea(canon, {
+          text,
+          labels: noLabel ? [] : explicitLabels,
+          kickOffLabeling: !noLabel && !explicitLabels,
+          llm,
+        });
+        if (noLabel && !explicitLabels) {
+          // Mark as skipped instead of pending so auto-drains leave it alone.
+          const updated = canon.patchEntity(ent.id, { payload: { labelsStatus: "skipped" } });
+          print(globals, wrap(formatIdea(updated ?? ent)));
+          return;
+        }
+        print(globals, wrap(formatIdea(ent)));
+        return;
+      }
+
+      if (action === "list") {
+        const statusFlag = (getFlag("--status") ?? "pending") as any;
+        if (!["pending", "used", "all"].includes(statusFlag)) {
+          throw new Error("--status must be pending, used, or all");
+        }
+        const label = getFlag("--label");
+        const limit = getFlag("--limit") ? Number(getFlag("--limit")) : (globals.limit ?? 100);
+        const ideas = listIdeas(canon, { status: statusFlag, label, limit });
+        print(globals, wrap(ideas.map(formatIdea)));
+        return;
+      }
+
+      if (action === "show") {
+        const id = args[0];
+        if (!id) throw new Error("Missing idea id");
+        const idea = getIdea(canon, id);
+        if (!idea) throw new Error("Idea not found");
+        const usedById = idea.payload?.usedByEntityId as string | undefined;
+        const usedBy = usedById ? canon.getEntity(usedById) : undefined;
+        const formatted = formatIdea(idea);
+        print(globals, wrap({
+          ...formatted,
+          usedBy: usedBy ? { id: usedBy.id, type: usedBy.type, name: usedBy.name } : null,
+        }));
+        return;
+      }
+
+      if (action === "mark-used") {
+        const id = args[0];
+        if (!id) throw new Error("Missing idea id");
+        const byEntity = getFlag("--by-entity");
+        const updated = markIdeaUsed(canon, id, byEntity);
+        if (!updated) throw new Error("Idea not found");
+        print(globals, wrap(formatIdea(updated)));
+        return;
+      }
+
+      if (action === "remove") {
+        const id = args[0];
+        if (!id) throw new Error("Missing idea id");
+        const removed = deleteIdea(canon, id);
+        if (!removed) throw new Error("Idea not found");
+        print(globals, wrap({ removed: true, id }));
+        return;
+      }
+
+      if (action === "relabel") {
+        const id = args[0];
+        if (!id) throw new Error("Missing idea id");
+        const idea = getIdea(canon, id);
+        if (!idea) throw new Error("Idea not found");
+        const llm = buildGenerationLLM(config);
+        if (!llm) throw new Error("No LLM configured for labeling. Set LLM_PROVIDER and credentials.");
+        const text = idea.details_md || idea.summary || idea.name;
+        const labels = await suggestLabelsForIdea(text, llm);
+        const updated = setIdeaLabels(canon, id, labels);
+        print(globals, wrap({
+          idea: formatIdea(updated ?? idea),
+          producedLabels: labels.length,
+        }));
+        return;
+      }
+
+      if (action === "label-pending") {
+        const concurrencyArg = getFlag("--concurrency");
+        const concurrency = concurrencyArg ? Math.max(1, Number(concurrencyArg)) : 2;
+        const llm = buildGenerationLLM(config);
+        if (!llm) throw new Error("No LLM configured for labeling. Set LLM_PROVIDER and credentials.");
+        const result = await runPendingIdeaLabeling(canon, llm, { concurrency });
+        print(globals, wrap(result));
+        return;
+      }
+
+      throw new Error("Unknown idea action");
     }
 
     if (cmd === "export" && sub === "wiki") {

@@ -1,6 +1,20 @@
 import { z } from "zod";
 
-export const EntityTypeEnum = z.enum(["npc", "faction", "location", "event", "rumor", "hook", "meta", "culture", "religion", "deity", "era", "phenomena", "relation_type", "source_text", "marker"]);
+export const EntityTypeEnum = z.enum(["npc", "faction", "location", "event", "rumor", "hook", "meta", "culture", "religion", "deity", "era", "phenomena", "relation_type", "source_text", "marker", "idea"]);
+
+// Idea pool — short snippets generation agents can weave into outputs
+export const IdeaStatusEnum = z.enum(["pending", "used"]);
+export const IdeaLabelsStatusEnum = z.enum(["pending", "labeled", "skipped"]);
+
+export const IdeaPayloadSchema = z.object({
+  status: IdeaStatusEnum,
+  labels: z.array(z.string()),
+  labelsStatus: IdeaLabelsStatusEnum,
+  usedByEntityId: z.string().optional(),
+  usedAt: z.string().optional(),
+});
+
+export type IdeaPayload = z.infer<typeof IdeaPayloadSchema>;
 
 // Deity payload schemas
 export const DeityRankEnum = z.enum(["supreme", "greater", "lesser", "demigod", "spirit"]);

@@ -18,6 +18,7 @@ import {
   type LLMConfig,
 } from "../llm/config";
 import { exportWiki } from "../wiki/wiki";
+import { kickOffIdeaLabeling } from "../canon/idea-labeler";
 import { extractGlobals } from "../util/args";
 import { directScene, newChatState, SceneContext } from "./director";
 import { npcTurn, resolveNpcByName } from "./npc";
@@ -111,6 +112,10 @@ async function main() {
     const genModel = getEffectiveGenerationModel(config, genProvider);
     generationLlm = createLLMClient({ provider: genProvider, model: genModel });
   }
+
+  // Drain any backlog of unlabeled ideas in the background. Never await — UI
+  // should not wait for LLM calls at startup.
+  kickOffIdeaLabeling(canon, generationLlm ?? llm);
 
   // Initialize status bar
   const statusBar = initStatusBar(llm.provider, llm.model);

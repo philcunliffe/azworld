@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { mergePatch } from "../util/mergePatch";
 import { nowIso } from "../util/time";
 
-export type EntityType = "npc" | "faction" | "location" | "event" | "rumor" | "hook" | "meta" | "culture" | "religion" | "deity" | "era" | "phenomena" | "relation_type" | "source_text" | "marker";
+export type EntityType = "npc" | "faction" | "location" | "event" | "rumor" | "hook" | "meta" | "culture" | "religion" | "deity" | "era" | "phenomena" | "relation_type" | "source_text" | "marker" | "idea";
 
 export const BUILTIN_RELATION_TYPES = [
   "about",
@@ -85,7 +85,7 @@ PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS entities (
   id TEXT PRIMARY KEY,
-  type TEXT NOT NULL CHECK(type IN ('npc','faction','location','event','rumor','hook','meta','culture','religion','deity','era','phenomena','relation_type','source_text','marker')),
+  type TEXT NOT NULL CHECK(type IN ('npc','faction','location','event','rumor','hook','meta','culture','religion','deity','era','phenomena','relation_type','source_text','marker','idea')),
   name TEXT NOT NULL,
   summary TEXT,
   details_md TEXT,
@@ -767,14 +767,20 @@ export class CanonStore {
       .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'entities'")
       .get() as { sql?: string } | undefined;
     const sql = row?.sql || "";
-    if (sql.includes("'era'") && sql.includes("'phenomena'") && sql.includes("'relation_type'") && sql.includes("'source_text'")) return;
+    if (
+      sql.includes("'era'") &&
+      sql.includes("'phenomena'") &&
+      sql.includes("'relation_type'") &&
+      sql.includes("'source_text'") &&
+      sql.includes("'idea'")
+    ) return;
 
     this.db.exec("BEGIN");
     try {
       this.db.exec(`
         CREATE TABLE entities_new (
           id TEXT PRIMARY KEY,
-          type TEXT NOT NULL CHECK(type IN ('npc','faction','location','event','rumor','hook','meta','culture','religion','deity','era','phenomena','relation_type','source_text','marker')),
+          type TEXT NOT NULL CHECK(type IN ('npc','faction','location','event','rumor','hook','meta','culture','religion','deity','era','phenomena','relation_type','source_text','marker','idea')),
           name TEXT NOT NULL,
           summary TEXT,
           details_md TEXT,

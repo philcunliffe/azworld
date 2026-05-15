@@ -118,7 +118,7 @@ export function registerCanonTools(registry: ToolRegistry): void {
     },
     async (args: Record<string, any>, ctx: ToolContext) => {
       const type = args.type as EntityType;
-      if (!VALID_ENTITY_TYPES.includes(type)) {
+      if (!(VALID_ENTITY_TYPES as readonly string[]).includes(type)) {
         return { error: `Invalid entity type: ${args.type}` };
       }
 
