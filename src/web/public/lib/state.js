@@ -23,6 +23,13 @@ const state = {
   genFormOpen: null,
   burgTab: "factions",
   mapViewActive: false,
+  // Ideas pool overlay
+  ideasOpen: false,
+  ideasStatusFilter: "pending",
+  ideasLabelFilter: "",
+  ideasItems: [],
+  ideasLoading: false,
+  ideasError: null,
 };
 
 let renderFn = null;

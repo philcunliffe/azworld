@@ -15,7 +15,8 @@ import { directScene, type SceneContext, type ChatBlock } from "../chat/director
 import { npcTurn, resolveNpcByName } from "../chat/npc";
 import { generalChat } from "../chat/general";
 import { parseSourceText } from "../canon/ingest";
-import { kickOffIdeaLabeling } from "../canon/idea-labeler";
+import { addIdea, deleteIdea, getIdea, listIdeas, markIdeaUsed, setIdeaLabels } from "../canon/ideas";
+import { kickOffIdeaLabeling, suggestLabelsForIdea } from "../canon/idea-labeler";
 import { exportWiki } from "../wiki/wiki";
 import { formatPhasePlan, executePhasePlan, planCultureGeneration, planPantheonGeneration, planReligionGeneration, planStateGeneration, type PhasePlan, type WorldGenContext } from "../browse/world-init-gen";
 import type { CampaignSettings } from "../chat/schema";
@@ -1045,6 +1046,79 @@ class WebSession {
     return this.canon.listEntities({ type, limit: 300 });
   }
 
+  /**
+   * Format a canon idea entity for the web API. Resolves usedByEntityId to a
+   * human-readable name so the UI doesn't need a second roundtrip.
+   */
+  private serializeIdea(idea: CanonEntity): Record<string, unknown> {
+    const payload = idea.payload || {};
+    const usedById = payload.usedByEntityId as string | undefined;
+    const usedBy = usedById ? this.canon.getEntity(usedById) : undefined;
+    return {
+      id: idea.id,
+      text: idea.details_md || idea.summary || idea.name || "",
+      summary: idea.summary,
+      status: (payload.status as string) ?? "pending",
+      labels: Array.isArray(payload.labels) ? payload.labels : [],
+      labelsStatus: (payload.labelsStatus as string) ?? "pending",
+      usedByEntityId: usedById ?? null,
+      usedBy: usedBy ? { id: usedBy.id, type: usedBy.type, name: usedBy.name } : null,
+      usedAt: (payload.usedAt as string) ?? null,
+      createdAt: idea.created_at,
+      updatedAt: idea.updated_at,
+    };
+  }
+
+  listIdeasApi(opts: { status?: string; label?: string }): Record<string, unknown>[] {
+    const status = (opts.status as "pending" | "used" | "all" | undefined);
+    const filter: "pending" | "used" | "all" = status === "used" || status === "all" || status === "pending"
+      ? status
+      : "pending";
+    const ideas = listIdeas(this.canon, { status: filter, label: opts.label });
+    return ideas.map((i) => this.serializeIdea(i));
+  }
+
+  getIdeaApi(id: string): Record<string, unknown> | null {
+    const idea = getIdea(this.canon, id);
+    return idea ? this.serializeIdea(idea) : null;
+  }
+
+  async createIdeaApi(body: { text?: string; labels?: string[] | string }): Promise<Record<string, unknown>> {
+    const text = normalizeText(body.text);
+    if (!text) throw new Error("idea text is required");
+    const explicitLabels = body.labels !== undefined ? normalizeStringList(body.labels) : undefined;
+    const wantsLLM = !explicitLabels;
+    const llm = wantsLLM ? (this.generationLlm ?? this.llm) : undefined;
+    const idea = await addIdea(this.canon, {
+      text,
+      labels: explicitLabels,
+      kickOffLabeling: wantsLLM,
+      llm,
+    });
+    const refreshed = this.canon.getEntity(idea.id) ?? idea;
+    this.pushTimeline("system", "Idea Added", `${refreshed.id}: ${refreshed.summary || refreshed.name}`, "ok");
+    return this.serializeIdea(refreshed);
+  }
+
+  markIdeaUsedApi(id: string, byEntityId?: string): Record<string, unknown> | null {
+    const updated = markIdeaUsed(this.canon, id, byEntityId);
+    return updated ? this.serializeIdea(updated) : null;
+  }
+
+  async relabelIdeaApi(id: string): Promise<Record<string, unknown> | null> {
+    const idea = getIdea(this.canon, id);
+    if (!idea) return null;
+    const llm = this.generationLlm ?? this.llm;
+    const text = idea.details_md || idea.summary || idea.name;
+    const labels = await suggestLabelsForIdea(text, llm);
+    const updated = setIdeaLabels(this.canon, id, labels) ?? idea;
+    return this.serializeIdea(updated);
+  }
+
+  deleteIdeaApi(id: string): boolean {
+    return deleteIdea(this.canon, id);
+  }
+
   search(query: string): any[] {
     return performSearch(query, this.world, this.canon, 40);
   }
@@ -1487,6 +1561,51 @@ async function main(): Promise<void> {
           const ok = session.deleteRelation(relationId);
           if (!ok) return notFound("Relation not found.");
           return json({ ok, snapshot: session.snapshot() });
+        }
+
+        if (url.pathname === "/api/ideas" && request.method === "GET") {
+          const status = url.searchParams.get("status") ?? "pending";
+          const label = url.searchParams.get("label") ?? undefined;
+          const ideas = session.listIdeasApi({ status, label });
+          return json({ ideas });
+        }
+
+        if (url.pathname === "/api/ideas" && request.method === "POST") {
+          const body = await readJson<{ text?: string; labels?: string[] | string }>(request);
+          const idea = await session.createIdeaApi(body);
+          return json({ idea });
+        }
+
+        if (url.pathname.startsWith("/api/ideas/") && request.method === "GET") {
+          const trailing = url.pathname.slice("/api/ideas/".length);
+          if (trailing && !trailing.includes("/")) {
+            const id = decodeURIComponent(trailing);
+            const idea = session.getIdeaApi(id);
+            if (!idea) return notFound("Idea not found.");
+            return json({ idea });
+          }
+        }
+
+        if (url.pathname.endsWith("/mark-used") && url.pathname.startsWith("/api/ideas/") && request.method === "POST") {
+          const id = decodeURIComponent(url.pathname.slice("/api/ideas/".length, -"/mark-used".length));
+          const body = await readJson<{ byEntityId?: string }>(request).catch(() => ({} as { byEntityId?: string }));
+          const updated = session.markIdeaUsedApi(id, body.byEntityId);
+          if (!updated) return notFound("Idea not found.");
+          return json({ idea: updated });
+        }
+
+        if (url.pathname.endsWith("/relabel") && url.pathname.startsWith("/api/ideas/") && request.method === "POST") {
+          const id = decodeURIComponent(url.pathname.slice("/api/ideas/".length, -"/relabel".length));
+          const updated = await session.relabelIdeaApi(id);
+          if (!updated) return notFound("Idea not found.");
+          return json({ idea: updated });
+        }
+
+        if (url.pathname.startsWith("/api/ideas/") && request.method === "DELETE") {
+          const id = decodeURIComponent(url.pathname.slice("/api/ideas/".length));
+          const ok = session.deleteIdeaApi(id);
+          if (!ok) return notFound("Idea not found.");
+          return json({ ok: true });
         }
 
         if (url.pathname === "/api/canon/awareness" && request.method === "POST") {

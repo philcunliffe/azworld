@@ -84,6 +84,8 @@ export function handleKeypress(key: string, state: TuiState): KeypressResult {
       return handleEntityEditMode(key, state);
     case "talk":
       return handleTalkMode(key, state);
+    case "ideas":
+      return handleIdeasMode(key, state);
     default:
       return { actions: [] };
   }
@@ -118,6 +120,11 @@ function handleNormalMode(key: string, state: TuiState): KeypressResult {
   if (key === "?") {
     actions.push({ type: "OPEN_HELP" });
     return { actions };
+  }
+
+  // Open ideas panel
+  if (key === "i") {
+    return { actions: [], callback: "open_ideas_panel" };
   }
 
   // Navigation in tree
@@ -949,6 +956,111 @@ function handleEntityEditMode(key: string, state: TuiState): KeypressResult {
 }
 
 /**
+ * Handle keys in ideas mode (ideas pool panel)
+ */
+function handleIdeasMode(key: string, state: TuiState): KeypressResult {
+  const actions: TuiAction[] = [];
+
+  if (!state.ideas) {
+    actions.push({ type: "SET_MODE", mode: "normal" });
+    return { actions };
+  }
+
+  // Sub-mode: adding a new idea (text input)
+  if (state.ideas.subMode === "add") {
+    // Escape - cancel add and return to list
+    if (key === ESCAPE || key === CTRL_C) {
+      actions.push({ type: "IDEAS_CANCEL_ADD" });
+      return { actions };
+    }
+
+    // Enter - submit the idea text
+    if (key === ENTER) {
+      if (!state.ideas.inputBuffer.trim()) {
+        // Empty: cancel
+        actions.push({ type: "IDEAS_CANCEL_ADD" });
+        return { actions };
+      }
+      return { actions, callback: "submit_idea" };
+    }
+
+    if (key === BACKSPACE || key === DELETE) {
+      actions.push({ type: "BACKSPACE_IDEAS_INPUT" });
+      return { actions };
+    }
+    if (key === LEFT_ARROW) {
+      actions.push({ type: "MOVE_IDEAS_CURSOR", direction: "left" });
+      return { actions };
+    }
+    if (key === RIGHT_ARROW) {
+      actions.push({ type: "MOVE_IDEAS_CURSOR", direction: "right" });
+      return { actions };
+    }
+    if (key.length === 1 && key.charCodeAt(0) >= 32) {
+      actions.push({ type: "INSERT_IDEAS_CHAR", char: key });
+      return { actions };
+    }
+    return { actions };
+  }
+
+  // List sub-mode
+  if (key === ESCAPE || key === "q" || key === CTRL_C) {
+    actions.push({ type: "CLOSE_IDEAS" });
+    return { actions };
+  }
+
+  if (key === "j" || key === DOWN_ARROW) {
+    actions.push({ type: "IDEAS_MOVE", direction: "down" });
+    return { actions };
+  }
+  if (key === "k" || key === UP_ARROW) {
+    actions.push({ type: "IDEAS_MOVE", direction: "up" });
+    return { actions };
+  }
+
+  // Cycle status filter: pending → all → used → pending
+  if (key === TAB || key === "f") {
+    const next: "pending" | "used" | "all" =
+      state.ideas.statusFilter === "pending" ? "all"
+      : state.ideas.statusFilter === "all" ? "used"
+      : "pending";
+    actions.push({ type: "SET_IDEAS_FILTER", filter: next });
+    return { actions, callback: "load_ideas" };
+  }
+
+  // Enter add mode
+  if (key === "a" || key === "n") {
+    actions.push({ type: "IDEAS_START_ADD" });
+    return { actions };
+  }
+
+  // Mark selected idea as used
+  if (key === "m") {
+    if (state.ideas.items.length === 0) return { actions };
+    return { actions, callback: "mark_selected_idea_used" };
+  }
+
+  // Delete selected idea
+  if (key === "d" || key === "x") {
+    if (state.ideas.items.length === 0) return { actions };
+    return { actions, callback: "delete_selected_idea" };
+  }
+
+  // Relabel selected idea
+  if (key === "r") {
+    if (state.ideas.items.length === 0) return { actions };
+    return { actions, callback: "relabel_selected_idea" };
+  }
+
+  // Refresh
+  if (key === "R") {
+    return { actions, callback: "load_ideas" };
+  }
+
+  return { actions };
+}
+
+/**
  * Handle keys in talk mode (NPC conversation)
  */
 function handleTalkMode(key: string, state: TuiState): KeypressResult {
@@ -1010,7 +1122,7 @@ function handleTalkMode(key: string, state: TuiState): KeypressResult {
  * Check if we're in a mode that captures all input
  */
 export function isInputCaptured(state: TuiState): boolean {
-  return state.mode === "command" || state.mode === "modal" || state.mode === "search" || state.mode === "onboarding" || state.mode === "help" || state.mode === "fieldSelection" || state.mode === "entityEdit" || state.mode === "talk";
+  return state.mode === "command" || state.mode === "modal" || state.mode === "search" || state.mode === "onboarding" || state.mode === "help" || state.mode === "fieldSelection" || state.mode === "entityEdit" || state.mode === "talk" || state.mode === "ideas";
 }
 
 /**
@@ -1020,9 +1132,9 @@ export function getModeHelpText(mode: InputMode, focus: string): string {
   switch (mode) {
     case "normal":
       if (focus === "tree") {
-        return "j/k: move  t: talk  1-4: tabs  /: search  ?: help  :: command  q: quit";
+        return "j/k: move  t: talk  i: ideas  1-4: tabs  /: search  ?: help  :: command  q: quit";
       } else {
-        return "j/k: section  Space: toggle  h: ← tree  /: search  ?: help  :: command  q: quit";
+        return "j/k: section  Space: toggle  h: ← tree  i: ideas  /: search  ?: help  :: command  q: quit";
       }
     case "command":
       return "Enter: execute  Esc: cancel  ←/→: cursor  ↑/↓: history";
@@ -1040,6 +1152,8 @@ export function getModeHelpText(mode: InputMode, focus: string): string {
       return "Type to edit  Enter: save  Esc: cancel";
     case "talk":
       return "Type message  Enter: send  Esc: exit talk mode";
+    case "ideas":
+      return "j/k: move  a: add  m: mark used  d: delete  r: relabel  Tab: filter  q/Esc: close";
     default:
       return "";
   }

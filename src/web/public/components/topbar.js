@@ -37,6 +37,9 @@ export function renderTopbar(state) {
         <button class="topbar-icon-btn ${state.mapViewActive ? 'is-active' : ''}" data-action="toggle-map" title="World Map">
           <span>&#x1F5FA;</span>
         </button>
+        <button class="topbar-icon-btn ${state.ideasOpen ? 'is-active' : ''}" data-action="toggle-ideas" title="Ideas Pool">
+          <span>&#x1F4A1;</span>
+        </button>
         <button class="topbar-icon-btn" data-action="toggle-chat" title="Chat (Cmd+D)">
           <span>&#x1F4AC;</span>
         </button>

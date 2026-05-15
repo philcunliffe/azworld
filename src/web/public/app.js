@@ -14,6 +14,7 @@ import { renderSidebar } from './components/sidebar.js';
 import { renderSideSheet } from './components/side-sheet.js';
 import { renderChatDrawer } from './components/chat-drawer.js';
 import { renderSettings } from './components/settings.js';
+import { renderIdeasOverlay } from './components/ideas.js';
 import { renderEntityDetail } from './views/entity-detail.js';
 import { loadRegionMap } from './components/region-map.js';
 import { renderWorldMap, loadWorldMap } from './views/world-map.js';
@@ -156,6 +157,7 @@ function render() {
       ${!isGeneralChat ? renderChatDrawer(state) : ''}
     </div>
     ${renderSettings(state)}
+    ${renderIdeasOverlay(state)}
     ${renderSearchOverlay()}
     ${renderCommandPalette()}
     ${renderNotices()}
@@ -195,6 +197,22 @@ setRenderCallback(render);
 // ---------------------------------------------------------------------------
 // Command execution helper
 // ---------------------------------------------------------------------------
+
+async function loadIdeas() {
+  state.ideasLoading = true;
+  state.ideasError = null;
+  render();
+  try {
+    const data = await api(`/api/ideas?status=${encodeURIComponent(state.ideasStatusFilter || 'pending')}`);
+    state.ideasItems = data.ideas || [];
+  } catch (e) {
+    state.ideasError = e.message;
+    state.ideasItems = [];
+  } finally {
+    state.ideasLoading = false;
+    render();
+  }
+}
 
 async function runCommand(command) {
   try {
@@ -331,6 +349,63 @@ document.addEventListener('click', async (event) => {
       state.chatOpen = true;
       state.chatMode = 'npc';
       render();
+      return;
+    }
+
+    // Ideas pool overlay
+    if (action === 'toggle-ideas') {
+      state.ideasOpen = !state.ideasOpen;
+      if (state.ideasOpen) {
+        await loadIdeas();
+      }
+      render();
+      return;
+    }
+    if (action === 'close-ideas') {
+      state.ideasOpen = false;
+      render();
+      return;
+    }
+    if (action === 'set-ideas-status') {
+      state.ideasStatusFilter = target.dataset.status || 'pending';
+      await loadIdeas();
+      return;
+    }
+    if (action === 'mark-idea-used') {
+      const id = target.dataset.id;
+      if (!id) return;
+      try {
+        await apiPost(`/api/ideas/${encodeURIComponent(id)}/mark-used`, {});
+        await loadIdeas();
+        pushNotice('ok', `Marked ${id} used.`);
+      } catch (e) {
+        pushNotice('error', e.message);
+      }
+      return;
+    }
+    if (action === 'relabel-idea') {
+      const id = target.dataset.id;
+      if (!id) return;
+      try {
+        pushNotice('ok', `Re-labeling ${id}…`);
+        await apiPost(`/api/ideas/${encodeURIComponent(id)}/relabel`, {});
+        await loadIdeas();
+      } catch (e) {
+        pushNotice('error', e.message);
+      }
+      return;
+    }
+    if (action === 'delete-idea') {
+      const id = target.dataset.id;
+      if (!id) return;
+      if (!confirm('Delete this idea?')) return;
+      try {
+        await apiDelete(`/api/ideas/${encodeURIComponent(id)}`);
+        await loadIdeas();
+        pushNotice('ok', `Deleted ${id}.`);
+      } catch (e) {
+        pushNotice('error', e.message);
+      }
       return;
     }
 
@@ -653,6 +728,33 @@ document.addEventListener('submit', async (event) => {
   event.preventDefault();
 
   try {
+    // Idea-add form (ideas overlay)
+    if (form.id === 'idea-add-form') {
+      const fd = new FormData(form);
+      const text = String(fd.get('text') || '').trim();
+      if (!text) return;
+      const labelsRaw = String(fd.get('labels') || '').trim();
+      const labels = labelsRaw
+        ? labelsRaw.split(',').map((s) => s.trim()).filter(Boolean)
+        : undefined;
+      const body = labels ? { text, labels } : { text };
+      try {
+        const data = await apiPost('/api/ideas', body);
+        // Prepend immediately so the user sees the row without a full reload,
+        // then refresh in the background so labels (auto-labeled) appear shortly.
+        if (data?.idea) {
+          state.ideasItems = [data.idea, ...state.ideasItems];
+          render();
+        }
+        form.reset();
+        await loadIdeas();
+        pushNotice('ok', 'Idea added.');
+      } catch (e) {
+        pushNotice('error', e.message);
+      }
+      return;
+    }
+
     // Inline generation form
     if (form.id === 'gen-inline-form') {
       const hints = String(new FormData(form).get('hints') || '').trim();
@@ -875,6 +977,18 @@ document.addEventListener('input', (event) => {
   if (target.id === 'global-search-input') {
     handleSearchInput(target.value);
   }
+  if (target.id === 'idea-label-filter') {
+    state.ideasLabelFilter = target.value;
+    render();
+    // After re-render the input loses focus; restore it and cursor.
+    const el = document.getElementById('idea-label-filter');
+    if (el) {
+      el.focus();
+      // Place cursor at end to mirror the user's typing flow.
+      const v = el.value;
+      el.setSelectionRange(v.length, v.length);
+    }
+  }
 });
 
 document.addEventListener('keydown', (event) => {
@@ -935,6 +1049,7 @@ registerShortcut('escape', () => {
   if (state.commandPaletteOpen) { state.commandPaletteOpen = false; render(); return; }
   if (state.searchOpen) { state.searchOpen = false; state.searchQuery = ''; state.searchResults = []; render(); return; }
   if (state.settingsOpen) { state.settingsOpen = false; render(); return; }
+  if (state.ideasOpen) { state.ideasOpen = false; render(); return; }
   if (state.genFormOpen) { state.genFormOpen = null; render(); return; }
 });
 

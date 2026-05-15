@@ -6,6 +6,15 @@ import { AzgaarWorld } from "../world/azgaar";
 import { CanonStore, CanonEntity, EntityType } from "../canon/canon";
 import { parseSourceText } from "../canon/ingest";
 import {
+  addIdea,
+  listIdeas,
+  getIdea,
+  markIdeaUsed,
+  deleteIdea,
+  setIdeaLabels,
+} from "../canon/ideas";
+import { suggestLabelsForIdea } from "../canon/idea-labeler";
+import {
   LLMClient,
   completeJson,
   listModels,
@@ -214,6 +223,45 @@ export function parseCommand(line: string): { cmd: string; args: string[] } {
   return { cmd: parts[0] || "", args: parts.slice(1) };
 }
 
+/**
+ * Split an arg string on whitespace while honoring double-quoted segments.
+ * Used by :idea-add so quoted idea text survives parseCommand's split.
+ */
+function parseQuotedArgs(input: string): string[] {
+  const out: string[] = [];
+  let buf = "";
+  let inQuote = false;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (ch === '"') {
+      inQuote = !inQuote;
+      continue;
+    }
+    if (!inQuote && /\s/.test(ch)) {
+      if (buf) { out.push(buf); buf = ""; }
+      continue;
+    }
+    buf += ch;
+  }
+  if (buf) out.push(buf);
+  return out;
+}
+
+/**
+ * Strip a leading `/ideas/` (or `/ideas`) path prefix from an argument and
+ * return the remainder. Returns null if the prefix does not match.
+ *
+ * Accepts: `/ideas`, `/ideas/`, `/ideas/all`, `/ideas/used`, `ideas`,
+ * `ideas/`, `ideas/all`, `ideas/used`.
+ */
+function stripIdeasPrefix(arg: string): string | null {
+  const trimmed = arg.trim();
+  if (trimmed === "/ideas" || trimmed === "/ideas/" || trimmed === "ideas" || trimmed === "ideas/") return "";
+  if (trimmed.startsWith("/ideas/")) return trimmed.slice("/ideas/".length);
+  if (trimmed.startsWith("ideas/")) return trimmed.slice("ideas/".length);
+  return null;
+}
+
 // Execute a command
 export async function executeCommand(
   line: string,
@@ -360,9 +408,58 @@ export async function executeCommand(
 
   // Listing: ls [filter]
   if (cmd === "ls") {
+    // Special-case the /ideas/ path: `ls /ideas`, `ls /ideas/all`, `ls /ideas/used`
+    const ideasSuffix = argStr ? stripIdeasPrefix(argStr) : null;
+    if (ideasSuffix !== null) {
+      const sub = ideasSuffix.trim().toLowerCase();
+      const status: "pending" | "used" | "all" = sub === "all"
+        ? "all"
+        : sub === "used"
+          ? "used"
+          : "pending";
+      const ideas = listIdeas(ctx.canon, { status });
+      const context = `ideas (${status})`;
+      const output = formatIdeaList(ideas, context, ctx.useColors);
+      if (ctx.tuiMode) {
+        return { output, messageModal: { title: `Ideas (${status})`, content: output } };
+      }
+      return { output };
+    }
     const filter = argStr || undefined;
     const result = listContextual(ctx.state, ctx.world, ctx.canon, filter);
     return { output: `${result.context}:\n${formatListResult(result, ctx.useColors)}` };
+  }
+
+  // Cat: cat /ideas/<id>  (or just cat <id> — renders idea or generic entity)
+  if (cmd === "cat") {
+    if (!argStr) return { error: "Usage: cat /ideas/<id>  (or cat <id>)" };
+    // Strip /ideas/ prefix when present
+    const stripped = stripIdeasPrefix(argStr);
+    const id = (stripped ?? argStr).trim();
+    if (!id) return { error: "Usage: cat /ideas/<id>" };
+    const idea = getIdea(ctx.canon, id);
+    if (idea) {
+      const output = formatIdeaDetail(idea, ctx.canon, ctx.useColors);
+      if (ctx.tuiMode) {
+        return { output, messageModal: { title: `Idea ${idea.id}`, content: output } };
+      }
+      return { output };
+    }
+    // Fall back to a generic entity render so `cat <id>` still works for non-idea entities.
+    const entity = ctx.canon.getEntity(id);
+    if (entity) {
+      const output = formatEntityInfo(entity, ctx.useColors);
+      if (ctx.tuiMode) {
+        return { output, messageModal: { title: entity.name, content: output } };
+      }
+      return { output };
+    }
+    return { error: `Entity not found: ${id}` };
+  }
+
+  // Ideas REPL commands: :idea-add | :idea-rm | :idea-mark-used | :idea-list | :idea-relabel
+  if (cmd.startsWith(":idea-")) {
+    return executeIdeaCommand(cmd, line, ctx);
   }
 
   // Info: info [id]
@@ -788,6 +885,117 @@ async function navigateToAny(name: string, ctx: CommandContext): Promise<Command
   }
 
   return { error: `Not found: ${name}` };
+}
+
+/**
+ * Dispatcher for the :idea-* family of REPL commands.
+ *
+ * Argument parsing here uses the raw command line so that double-quoted idea
+ * text (e.g. `:idea-add "mistlands caused by melting ice"`) survives intact.
+ */
+async function executeIdeaCommand(
+  cmd: string,
+  line: string,
+  ctx: CommandContext
+): Promise<CommandResult> {
+  // Recover the raw argument string (everything after the command token).
+  const trimmed = line.trim();
+  const idx = trimmed.indexOf(" ");
+  const rest = idx >= 0 ? trimmed.slice(idx + 1).trim() : "";
+  const parts = parseQuotedArgs(rest);
+
+  const flagIndex = (name: string) => parts.findIndex((p) => p === name || p.startsWith(name + "="));
+  const consumeFlag = (name: string): string | undefined => {
+    const i = flagIndex(name);
+    if (i < 0) return undefined;
+    const raw = parts[i];
+    if (raw === name) {
+      const value = parts[i + 1];
+      parts.splice(i, 2);
+      return value;
+    }
+    const value = raw.slice(name.length + 1);
+    parts.splice(i, 1);
+    return value;
+  };
+  const consumeBool = (name: string): boolean => {
+    const i = flagIndex(name);
+    if (i < 0) return false;
+    parts.splice(i, 1);
+    return true;
+  };
+
+  if (cmd === ":idea-list") {
+    const all = consumeBool("--all");
+    const labelFlag = consumeFlag("--label");
+    const status: "pending" | "used" | "all" = all ? "all" : "pending";
+    const ideas = listIdeas(ctx.canon, { status, label: labelFlag });
+    const context = labelFlag ? `ideas (${status}, label=${labelFlag})` : `ideas (${status})`;
+    const output = formatIdeaList(ideas, context, ctx.useColors);
+    if (ctx.tuiMode) {
+      return { output, messageModal: { title: `Ideas (${status})`, content: output } };
+    }
+    return { output };
+  }
+
+  if (cmd === ":idea-add") {
+    const labelsFlag = consumeFlag("--labels");
+    const noLabel = consumeBool("--no-label");
+    // Whatever remains (joined by spaces) is the idea text.
+    const text = parts.join(" ").trim();
+    if (!text) return { error: 'Usage: :idea-add "<text>" [--labels a,b] [--no-label]' };
+
+    const explicitLabels = labelsFlag
+      ? labelsFlag.split(",").map((s) => s.trim()).filter(Boolean)
+      : undefined;
+    const wantsLLM = !explicitLabels && !noLabel;
+    const llm = wantsLLM ? (ctx.generationLlm ?? ctx.llm) : undefined;
+
+    const idea = await addIdea(ctx.canon, {
+      text,
+      labels: noLabel ? [] : explicitLabels,
+      kickOffLabeling: wantsLLM,
+      llm,
+    });
+    if (noLabel && !explicitLabels) {
+      ctx.canon.patchEntity(idea.id, { payload: { labelsStatus: "skipped" } });
+    }
+    const refreshed = ctx.canon.getEntity(idea.id) ?? idea;
+    return { output: `Added idea ${refreshed.id}.\n${formatIdeaListLine(refreshed, ctx.useColors)}` };
+  }
+
+  if (cmd === ":idea-rm") {
+    const id = parts[0]?.trim();
+    if (!id) return { error: "Usage: :idea-rm <id>" };
+    const idea = getIdea(ctx.canon, id);
+    if (!idea) return { error: `Idea not found: ${id}` };
+    deleteIdea(ctx.canon, id);
+    return { output: `Removed idea ${id}.` };
+  }
+
+  if (cmd === ":idea-mark-used") {
+    const id = parts[0]?.trim();
+    if (!id) return { error: "Usage: :idea-mark-used <id> [--by-entity <entityId>]" };
+    const byEntity = consumeFlag("--by-entity");
+    const updated = markIdeaUsed(ctx.canon, id, byEntity);
+    if (!updated) return { error: `Idea not found: ${id}` };
+    return { output: `Marked idea ${id} used.\n${formatIdeaListLine(updated, ctx.useColors)}` };
+  }
+
+  if (cmd === ":idea-relabel") {
+    const id = parts[0]?.trim();
+    if (!id) return { error: "Usage: :idea-relabel <id>" };
+    const idea = getIdea(ctx.canon, id);
+    if (!idea) return { error: `Idea not found: ${id}` };
+    const llm = ctx.generationLlm ?? ctx.llm;
+    if (!llm) return { error: "No LLM configured for labeling." };
+    const text = idea.details_md || idea.summary || idea.name;
+    const labels = await suggestLabelsForIdea(text, llm);
+    const updated = setIdeaLabels(ctx.canon, id, labels) ?? idea;
+    return { output: `Relabeled idea ${id} (${labels.length} labels).\n${formatIdeaListLine(updated, ctx.useColors)}` };
+  }
+
+  return { error: `Unknown idea command: ${cmd}. Try :idea-add, :idea-list, :idea-mark-used, :idea-rm, :idea-relabel.` };
 }
 
 // Search across world and canon
@@ -2293,6 +2501,83 @@ function formatNpcInfo(npc: CanonEntity | undefined, useColors?: boolean): strin
   ].filter(Boolean).join("\n");
 }
 
+/**
+ * One-line summary of an idea for list rendering.
+ */
+function formatIdeaListLine(idea: CanonEntity, useColors?: boolean): string {
+  const bold = useColors ? BOLD : "";
+  const dim = useColors ? DIM : "";
+  const cyan = useColors ? CYAN : "";
+  const yellow = useColors ? YELLOW : "";
+  const green = useColors ? GREEN : "";
+  const reset = useColors ? RESET : "";
+
+  const payload = idea.payload || {};
+  const status = (payload.status as string) || "pending";
+  const labelsStatus = (payload.labelsStatus as string) || "pending";
+  const labels: string[] = Array.isArray(payload.labels) ? payload.labels : [];
+  const statusColor = status === "used" ? dim : green;
+  const labelText = labels.length
+    ? labels.slice(0, 4).join(", ")
+    : (labelsStatus === "pending" ? "(labeling…)" : labelsStatus === "skipped" ? "(no labels)" : "");
+  const snippet = (idea.summary || idea.name || "").replace(/\s+/g, " ").trim().slice(0, 80);
+
+  const idCell = `${bold}${idea.id}${reset}`;
+  const statusCell = `${statusColor}[${status}]${reset}`;
+  const labelCell = labelText ? `${cyan}{${labelText}}${reset}` : "";
+  const snippetCell = `${yellow}${snippet}${reset}`;
+
+  return `  ${idCell} ${statusCell} ${snippetCell} ${labelCell}`.trimEnd();
+}
+
+/**
+ * Render a list of ideas with a context header.
+ */
+function formatIdeaList(ideas: CanonEntity[], context: string, useColors?: boolean): string {
+  if (ideas.length === 0) {
+    return `${context}:\n  (no ideas)`;
+  }
+  const lines = ideas.map((i) => formatIdeaListLine(i, useColors));
+  return `${context}:\n${lines.join("\n")}`;
+}
+
+/**
+ * Full detail rendering for a single idea, including labels, status, and
+ * the consuming entity (when used).
+ */
+function formatIdeaDetail(idea: CanonEntity, canon: CanonStore, useColors?: boolean): string {
+  const bold = useColors ? BOLD : "";
+  const dim = useColors ? DIM : "";
+  const reset = useColors ? RESET : "";
+
+  const payload = idea.payload || {};
+  const status = (payload.status as string) || "pending";
+  const labelsStatus = (payload.labelsStatus as string) || "pending";
+  const labels: string[] = Array.isArray(payload.labels) ? payload.labels : [];
+  const usedById = payload.usedByEntityId as string | undefined;
+  const usedAt = payload.usedAt as string | undefined;
+  const usedBy = usedById ? canon.getEntity(usedById) : undefined;
+  const text = idea.details_md || idea.summary || idea.name;
+
+  const lines = [
+    `${bold}Idea ${idea.id}${reset}`,
+    `  Status:        ${status}`,
+    `  Labels:        ${labels.length ? labels.join(", ") : `${dim}(none)${reset}`}`,
+    `  LabelsStatus:  ${labelsStatus}`,
+  ];
+  if (usedBy) {
+    lines.push(`  Used by:       ${usedBy.name} (${usedBy.type} ${usedBy.id})`);
+  } else if (usedById) {
+    lines.push(`  Used by id:    ${usedById}`);
+  }
+  if (usedAt) lines.push(`  Used at:       ${usedAt}`);
+  lines.push(`  Created:       ${idea.created_at}`);
+  lines.push(`  Updated:       ${idea.updated_at}`);
+  lines.push("");
+  lines.push(text);
+  return lines.join("\n");
+}
+
 function formatEntityInfo(entity: CanonEntity, useColors?: boolean): string {
   const bold = useColors ? BOLD : "";
   const reset = useColors ? RESET : "";
@@ -2584,6 +2869,8 @@ ${cyan}Listing${reset}
   ls events          Active events affecting context
   ls rumors          Rumors circulating in burg
   ls hooks           Adventure hooks available in burg
+  ls /ideas          Pending ideas (use /ideas/all or /ideas/used to filter)
+  cat /ideas/<id>    Full idea detail (text, labels, status, used-by)
 
 ${cyan}Information${reset}
   info               Show details of current entity
@@ -2619,6 +2906,13 @@ ${cyan}LLM/Chat${reset}
   scene <desc>       Run director for scene description
   /talk [npc]        Enter NPC roleplay mode
   /back              Exit roleplay mode
+
+${cyan}Ideas Pool${reset}
+  :idea-add "<text>" [--labels a,b] [--no-label]   Add an idea (auto-labels via LLM by default)
+  :idea-list [--all] [--label X]                   List ideas (pending only unless --all)
+  :idea-mark-used <id> [--by-entity <entityId>]    Mark idea as consumed
+  :idea-rm <id>                                    Delete an idea
+  :idea-relabel <id>                               Re-run LLM labeling for an idea
 
 ${cyan}Settings${reset}
   init               Configure campaign settings (vibe, quest, tone, rating)

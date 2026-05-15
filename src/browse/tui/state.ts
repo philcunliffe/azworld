@@ -52,6 +52,9 @@ export function createInitialTuiState(): TuiState {
     // Field selection modal
     fieldSelection: null,
 
+    // Ideas pool panel
+    ideas: null,
+
     // Terminal dimensions
     terminalRows: process.stdout.rows || 24,
     terminalCols: process.stdout.columns || 80,
@@ -166,6 +169,7 @@ export function getHelpContent(): string[] {
     "  /          Open search modal",
     "  ?          Open this help modal",
     "  t          Enter talk mode (when on NPC)",
+    "  i          Open Ideas pool",
     "  q          Quit",
     "",
     "COMMAND MODE",
@@ -212,6 +216,16 @@ export function getHelpContent(): string[] {
     "  Ctrl+J/K   Scroll plan details",
     "  PgUp/PgDn  Scroll by page",
     "  g / G      Jump to top/bottom",
+    "",
+    "IDEAS POOL (i to open)",
+    "  j / k      Move selection",
+    "  Tab / f    Cycle status filter (pending / all / used)",
+    "  a / n      Start adding a new idea",
+    "  m          Mark selected idea used",
+    "  d / x      Delete selected idea",
+    "  r          Re-run LLM labeling on selected idea",
+    "  R          Reload list",
+    "  q / Esc    Close",
   ];
 }
 
@@ -1531,6 +1545,128 @@ export function tuiReducer(state: TuiState, action: TuiAction): TuiState {
         modal: { ...state.modal, editCursorPos: newPos },
       };
     }
+
+    // Ideas pool panel
+    case "OPEN_IDEAS":
+      return {
+        ...state,
+        mode: "ideas",
+        ideas: {
+          visible: true,
+          statusFilter: "pending",
+          items: [],
+          selectedIndex: 0,
+          scrollOffset: 0,
+          subMode: "list",
+          inputBuffer: "",
+          inputCursorPos: 0,
+          status: null,
+        },
+      };
+
+    case "CLOSE_IDEAS":
+      return {
+        ...state,
+        mode: "normal",
+        ideas: null,
+      };
+
+    case "SET_IDEAS_ITEMS": {
+      if (!state.ideas) return state;
+      const clamped = Math.max(0, Math.min(state.ideas.selectedIndex, Math.max(0, action.items.length - 1)));
+      return {
+        ...state,
+        ideas: { ...state.ideas, items: action.items, selectedIndex: clamped, scrollOffset: 0 },
+      };
+    }
+
+    case "SET_IDEAS_FILTER":
+      if (!state.ideas) return state;
+      return {
+        ...state,
+        ideas: { ...state.ideas, statusFilter: action.filter, selectedIndex: 0, scrollOffset: 0, status: null },
+      };
+
+    case "IDEAS_MOVE": {
+      if (!state.ideas || state.ideas.items.length === 0) return state;
+      const total = state.ideas.items.length;
+      const newIndex =
+        action.direction === "down"
+          ? Math.min(total - 1, state.ideas.selectedIndex + 1)
+          : Math.max(0, state.ideas.selectedIndex - 1);
+      return {
+        ...state,
+        ideas: { ...state.ideas, selectedIndex: newIndex, status: null },
+      };
+    }
+
+    case "IDEAS_START_ADD":
+      if (!state.ideas) return state;
+      return {
+        ...state,
+        ideas: { ...state.ideas, subMode: "add", inputBuffer: "", inputCursorPos: 0, status: null },
+      };
+
+    case "IDEAS_CANCEL_ADD":
+      if (!state.ideas) return state;
+      return {
+        ...state,
+        ideas: { ...state.ideas, subMode: "list", inputBuffer: "", inputCursorPos: 0 },
+      };
+
+    case "INSERT_IDEAS_CHAR": {
+      if (!state.ideas) return state;
+      const before = state.ideas.inputBuffer.slice(0, state.ideas.inputCursorPos);
+      const after = state.ideas.inputBuffer.slice(state.ideas.inputCursorPos);
+      return {
+        ...state,
+        ideas: {
+          ...state.ideas,
+          inputBuffer: before + action.char + after,
+          inputCursorPos: state.ideas.inputCursorPos + 1,
+        },
+      };
+    }
+
+    case "BACKSPACE_IDEAS_INPUT": {
+      if (!state.ideas || state.ideas.inputCursorPos === 0) return state;
+      const before = state.ideas.inputBuffer.slice(0, state.ideas.inputCursorPos - 1);
+      const after = state.ideas.inputBuffer.slice(state.ideas.inputCursorPos);
+      return {
+        ...state,
+        ideas: {
+          ...state.ideas,
+          inputBuffer: before + after,
+          inputCursorPos: state.ideas.inputCursorPos - 1,
+        },
+      };
+    }
+
+    case "MOVE_IDEAS_CURSOR": {
+      if (!state.ideas) return state;
+      const newPos =
+        action.direction === "left"
+          ? Math.max(0, state.ideas.inputCursorPos - 1)
+          : Math.min(state.ideas.inputBuffer.length, state.ideas.inputCursorPos + 1);
+      return {
+        ...state,
+        ideas: { ...state.ideas, inputCursorPos: newPos },
+      };
+    }
+
+    case "CLEAR_IDEAS_INPUT":
+      if (!state.ideas) return state;
+      return {
+        ...state,
+        ideas: { ...state.ideas, inputBuffer: "", inputCursorPos: 0 },
+      };
+
+    case "SET_IDEAS_STATUS":
+      if (!state.ideas) return state;
+      return {
+        ...state,
+        ideas: { ...state.ideas, status: action.status },
+      };
 
     default:
       return state;

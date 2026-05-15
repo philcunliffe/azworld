@@ -1790,3 +1790,57 @@ fieldset legend {
   .form-grid.two { grid-template-columns: 1fr; }
   .entity-two-col { grid-template-columns: 1fr; }
 }
+
+/* Ideas pool overlay --------------------------------------------------- */
+.ideas-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.idea-row {
+  border: 1px solid var(--border, #ccc);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--surface, #fff);
+}
+.idea-row-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+.idea-id {
+  font-family: var(--mono, monospace);
+  color: var(--muted, #777);
+}
+.idea-status {
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.idea-status-pending { background: #e8f4ea; color: #2c6c34; }
+.idea-status-used    { background: #eee; color: #555; }
+.idea-text {
+  margin: 8px 0 6px 0;
+  white-space: pre-wrap;
+}
+.idea-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.idea-chip {
+  background: #eef3fb;
+  color: #2f4f7a;
+  border-radius: 12px;
+  padding: 2px 8px;
+  font-size: 11px;
+}
+.idea-labels-empty { font-size: 11px; }
+.idea-actions {
+  display: flex;
+  gap: 6px;
+}

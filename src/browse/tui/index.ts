@@ -4,7 +4,7 @@
  * Full-screen terminal user interface with tree navigation and detail panels.
  */
 
-import type { TuiState, TuiAction, TuiCallbacks, TreeNode, EntityKind, ApprovalChoice, FieldSelectionState } from "./types";
+import type { TuiState, TuiAction, TuiCallbacks, TreeNode, EntityKind, ApprovalChoice, FieldSelectionState, IdeaListItem } from "./types";
 import type { EntityRef, BrowseState } from "../state";
 import type { AzgaarWorld } from "../../world/azgaar";
 import type { CanonStore } from "../../canon/canon";
@@ -21,6 +21,7 @@ import { overlaySearchModal } from "./panels/search-modal";
 import { overlayOnboardingModal } from "./panels/onboarding-modal";
 import { overlayHelpModal } from "./panels/help-modal";
 import { overlayFieldSelectionModal } from "./panels/field-selection-modal";
+import { overlayIdeasModal } from "./panels/ideas-modal";
 import { performSearch } from "./search";
 import { handleKeypress, parseKeyBuffer, getModeHelpText } from "./keybindings";
 import {
@@ -56,6 +57,8 @@ import type { DescriptionPlan } from "../gen-agent";
 import { currentRef, navigateTo, setStack, stackToPath } from "../state";
 import { debugLog } from "../../chat/debug-log";
 import { saveCampaignSettings, type GenerationFlags } from "../../chat/campaign-settings";
+import { addIdea, listIdeas, getIdea, deleteIdea, markIdeaUsed, setIdeaLabels } from "../../canon/ideas";
+import { suggestLabelsForIdea } from "../../canon/idea-labeler";
 import {
   planReligionGeneration,
   planPantheonGeneration,
@@ -441,6 +444,31 @@ export class TuiController {
       const message = this.state.commandBuffer;
       this.dispatch({ type: "CLEAR_COMMAND" });
       await this.sendTalkMessage(message);
+    }
+
+    if (result.callback === "open_ideas_panel") {
+      this.dispatch({ type: "OPEN_IDEAS" });
+      this.loadIdeasIntoPanel();
+    }
+
+    if (result.callback === "load_ideas") {
+      this.loadIdeasIntoPanel();
+    }
+
+    if (result.callback === "submit_idea") {
+      await this.submitIdeaFromPanel();
+    }
+
+    if (result.callback === "delete_selected_idea") {
+      this.deleteSelectedIdeaFromPanel();
+    }
+
+    if (result.callback === "mark_selected_idea_used") {
+      this.markSelectedIdeaUsedFromPanel();
+    }
+
+    if (result.callback === "relabel_selected_idea") {
+      await this.relabelSelectedIdeaFromPanel();
     }
 
     // Trigger search with debounce when query changes
@@ -1674,6 +1702,112 @@ export class TuiController {
   }
 
   /**
+   * Convert a canon idea entity to a flattened list item for the TUI panel.
+   */
+  private ideaToListItem(idea: import("../../canon/canon").CanonEntity): IdeaListItem {
+    const payload = idea.payload || {};
+    const usedById = payload.usedByEntityId as string | undefined;
+    const usedBy = usedById ? this.options.canon.getEntity(usedById) : undefined;
+    return {
+      id: idea.id,
+      text: idea.details_md || idea.summary || idea.name || "",
+      status: (payload.status as string) || "pending",
+      labels: Array.isArray(payload.labels) ? (payload.labels as string[]) : [],
+      labelsStatus: (payload.labelsStatus as string) || "pending",
+      usedByName: usedBy ? usedBy.name : null,
+    };
+  }
+
+  /**
+   * Refresh the ideas panel from canon using the current status filter.
+   */
+  private loadIdeasIntoPanel(): void {
+    if (!this.state.ideas) return;
+    const filter = this.state.ideas.statusFilter;
+    const ideas = listIdeas(this.options.canon, { status: filter });
+    const items = ideas.map((i) => this.ideaToListItem(i));
+    this.dispatch({ type: "SET_IDEAS_ITEMS", items });
+  }
+
+  /**
+   * Submit the typed text in the add-idea sub-mode.
+   */
+  private async submitIdeaFromPanel(): Promise<void> {
+    if (!this.state.ideas) return;
+    const text = this.state.ideas.inputBuffer.trim();
+    if (!text) {
+      this.dispatch({ type: "IDEAS_CANCEL_ADD" });
+      return;
+    }
+    try {
+      const llm = this.options.commandContext.generationLlm ?? this.options.commandContext.llm;
+      const idea = await addIdea(this.options.canon, { text, kickOffLabeling: true, llm });
+      this.dispatch({ type: "IDEAS_CANCEL_ADD" });
+      this.dispatch({ type: "SET_IDEAS_STATUS", status: `Added idea ${idea.id}.` });
+      this.loadIdeasIntoPanel();
+    } catch (e: any) {
+      this.dispatch({ type: "SET_IDEAS_STATUS", status: `Error: ${e?.message || String(e)}` });
+    }
+  }
+
+  /**
+   * Delete the currently highlighted idea.
+   */
+  private deleteSelectedIdeaFromPanel(): void {
+    if (!this.state.ideas || this.state.ideas.items.length === 0) return;
+    const selected = this.state.ideas.items[this.state.ideas.selectedIndex];
+    if (!selected) return;
+    const ok = deleteIdea(this.options.canon, selected.id);
+    if (ok) {
+      this.dispatch({ type: "SET_IDEAS_STATUS", status: `Removed idea ${selected.id}.` });
+      this.loadIdeasIntoPanel();
+    } else {
+      this.dispatch({ type: "SET_IDEAS_STATUS", status: `Idea not found: ${selected.id}` });
+    }
+  }
+
+  /**
+   * Mark the currently highlighted idea as used.
+   */
+  private markSelectedIdeaUsedFromPanel(): void {
+    if (!this.state.ideas || this.state.ideas.items.length === 0) return;
+    const selected = this.state.ideas.items[this.state.ideas.selectedIndex];
+    if (!selected) return;
+    const updated = markIdeaUsed(this.options.canon, selected.id);
+    if (updated) {
+      this.dispatch({ type: "SET_IDEAS_STATUS", status: `Marked ${selected.id} used.` });
+      this.loadIdeasIntoPanel();
+    } else {
+      this.dispatch({ type: "SET_IDEAS_STATUS", status: `Idea not found: ${selected.id}` });
+    }
+  }
+
+  /**
+   * Re-run the LLM labeler synchronously for the currently highlighted idea.
+   */
+  private async relabelSelectedIdeaFromPanel(): Promise<void> {
+    if (!this.state.ideas || this.state.ideas.items.length === 0) return;
+    const selected = this.state.ideas.items[this.state.ideas.selectedIndex];
+    if (!selected) return;
+    const idea = getIdea(this.options.canon, selected.id);
+    if (!idea) {
+      this.dispatch({ type: "SET_IDEAS_STATUS", status: `Idea not found: ${selected.id}` });
+      return;
+    }
+    const llm = this.options.commandContext.generationLlm ?? this.options.commandContext.llm;
+    try {
+      this.dispatch({ type: "SET_IDEAS_STATUS", status: `Relabeling ${selected.id}…` });
+      this.render();
+      const labels = await suggestLabelsForIdea(idea.details_md || idea.summary || idea.name, llm);
+      setIdeaLabels(this.options.canon, selected.id, labels);
+      this.dispatch({ type: "SET_IDEAS_STATUS", status: `Relabeled ${selected.id} (${labels.length} labels).` });
+      this.loadIdeasIntoPanel();
+    } catch (e: any) {
+      this.dispatch({ type: "SET_IDEAS_STATUS", status: `Relabel failed: ${e?.message || String(e)}` });
+    }
+  }
+
+  /**
    * Render the full screen
    */
   private render(): void {
@@ -1795,6 +1929,11 @@ export class TuiController {
     // Apply field selection modal overlay if visible
     if (this.state.fieldSelection?.visible) {
       screenLines = overlayFieldSelectionModal(screenLines, this.state.fieldSelection, this.layout);
+    }
+
+    // Apply ideas modal overlay if visible
+    if (this.state.ideas?.visible) {
+      screenLines = overlayIdeasModal(screenLines, this.state.ideas, this.layout);
     }
 
     // Render to screen

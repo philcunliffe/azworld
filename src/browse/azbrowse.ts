@@ -76,6 +76,8 @@ function createCompleter(
           "gen", "ingest", "simplegen", "mod", "rm", "unlink",
           "ask", "scene", "help", "exit", "talk", "back", "pwd",
           "init", "tokens", "model", "genmodel", "talkmodel",
+          "cat",
+          ":idea-add", ":idea-list", ":idea-mark-used", ":idea-rm", ":idea-relabel",
         ];
         const matches = commands.filter(c => c.startsWith(cmd));
         return [matches, cmd];

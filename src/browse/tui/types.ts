@@ -17,6 +17,7 @@ export const InputModeEnum = z.enum([
   "fieldSelection",   // field selection for :gen on existing entity
   "entityEdit",       // editing entity field in approval modal
   "talk",             // NPC talk mode - typing messages to NPC
+  "ideas",            // ideas pool panel
 ]);
 
 export type InputMode = z.infer<typeof InputModeEnum>;
@@ -143,6 +144,33 @@ export const FieldSelectionStateSchema = z.object({
 });
 
 export type FieldSelectionState = z.infer<typeof FieldSelectionStateSchema>;
+
+// Ideas pool panel state
+export const IdeasStatusFilterEnum = z.enum(["pending", "used", "all"]);
+export type IdeasStatusFilter = z.infer<typeof IdeasStatusFilterEnum>;
+
+export const IdeaListItemSchema = z.object({
+  id: z.string(),
+  text: z.string(),
+  status: z.string(),
+  labels: z.array(z.string()),
+  labelsStatus: z.string(),
+  usedByName: z.string().nullable(),
+});
+export type IdeaListItem = z.infer<typeof IdeaListItemSchema>;
+
+export const IdeasStateSchema = z.object({
+  visible: z.boolean(),
+  statusFilter: IdeasStatusFilterEnum,
+  items: z.array(IdeaListItemSchema),
+  selectedIndex: z.number(),
+  scrollOffset: z.number(),
+  subMode: z.enum(["list", "add"]),
+  inputBuffer: z.string(),
+  inputCursorPos: z.number(),
+  status: z.string().nullable(),   // transient status line (success/error)
+});
+export type IdeasState = z.infer<typeof IdeasStateSchema>;
 
 // Entity edit field type
 export const EntityEditFieldEnum = z.enum(["name", "reason", "customPrompt"]);
@@ -309,6 +337,9 @@ export const TuiStateSchema = z.object({
   // Field selection modal
   fieldSelection: FieldSelectionStateSchema.nullable(),
 
+  // Ideas pool panel
+  ideas: IdeasStateSchema.nullable(),
+
   // Screen dimensions (updated on resize)
   terminalRows: z.number(),
   terminalCols: z.number(),
@@ -419,6 +450,20 @@ export type TuiAction =
   | { type: "BACKSPACE_FIELD_HINT" }
   | { type: "MOVE_FIELD_HINT_CURSOR"; direction: "left" | "right" }
 
+  // Ideas pool panel
+  | { type: "OPEN_IDEAS" }
+  | { type: "CLOSE_IDEAS" }
+  | { type: "SET_IDEAS_ITEMS"; items: IdeaListItem[] }
+  | { type: "SET_IDEAS_FILTER"; filter: IdeasStatusFilter }
+  | { type: "IDEAS_MOVE"; direction: "up" | "down" }
+  | { type: "IDEAS_START_ADD" }
+  | { type: "IDEAS_CANCEL_ADD" }
+  | { type: "INSERT_IDEAS_CHAR"; char: string }
+  | { type: "BACKSPACE_IDEAS_INPUT" }
+  | { type: "MOVE_IDEAS_CURSOR"; direction: "left" | "right" }
+  | { type: "CLEAR_IDEAS_INPUT" }
+  | { type: "SET_IDEAS_STATUS"; status: string | null }
+
   // Entity editing in approval modal
   | { type: "SELECT_ENTITY"; direction: "up" | "down" }
   | { type: "START_ENTITY_EDIT"; field: EntityEditField }
@@ -470,6 +515,6 @@ export type TuiCallbacks = {
 // Keypress result from keybinding handler
 export type KeypressResult = {
   actions: TuiAction[];
-  callback?: "execute_command" | "navigate_to_entity" | "sync_browse_state" | "quit" | "execute_approved_generation" | "execute_approved_modification" | "execute_approved_simulation" | "execute_approved_world_generation" | "execute_approved_description_generation" | "toggle_current_section" | "navigate_to_search_result" | "execute_onboarding" | "navigate_to_detail_link" | "detail_move_down" | "detail_move_up" | "rebuild_tree_for_tab" | "confirm_field_selection" | "execute_field_regeneration" | "open_plan_in_editor" | "enter_talk_mode" | "exit_talk_mode" | "send_talk_message" | null;
+  callback?: "execute_command" | "navigate_to_entity" | "sync_browse_state" | "quit" | "execute_approved_generation" | "execute_approved_modification" | "execute_approved_simulation" | "execute_approved_world_generation" | "execute_approved_description_generation" | "toggle_current_section" | "navigate_to_search_result" | "execute_onboarding" | "navigate_to_detail_link" | "detail_move_down" | "detail_move_up" | "rebuild_tree_for_tab" | "confirm_field_selection" | "execute_field_regeneration" | "open_plan_in_editor" | "enter_talk_mode" | "exit_talk_mode" | "send_talk_message" | "open_ideas_panel" | "load_ideas" | "submit_idea" | "delete_selected_idea" | "mark_selected_idea_used" | "relabel_selected_idea" | null;
   entityRef?: EntityRef;
 };
