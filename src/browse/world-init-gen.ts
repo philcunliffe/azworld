@@ -15,6 +15,11 @@ import { LLMClient, completeJsonWithUsage, TokenUsage } from "../llm/providers";
 import { CampaignSettings } from "../chat/schema";
 import { formatSettingsForGeneration, GenerationFlags } from "../chat/campaign-settings";
 import { debugLog } from "../chat/debug-log";
+import {
+  prepareIdeaInjection,
+  markIdeasUsedFromOutput,
+  logIdeaBreadcrumb,
+} from "../canon/idea-injection";
 
 // --- Helper functions to query generated content from canon DB ---
 
@@ -264,6 +269,16 @@ export async function generateStateContent(ctx: WorldGenContext): Promise<WorldG
     ctx.onEntityStart?.(state.name, i, states.length);
 
     try {
+      const ideaInjection = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "state",
+        additionalLabels: ["government", "ruler"],
+        anchor: {
+          stateId: state.id,
+          tags: [state.name, stateContext.formName, stateContext.culture?.name].filter((s): s is string => !!s),
+        },
+      });
+
       const systemPrompt = `You are a world-building assistant for a fantasy tabletop RPG.
 Generate a government faction and its ruler for a state based on the provided context.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
@@ -294,7 +309,7 @@ Output ONLY valid JSON:
       "secrets": ["personal secrets"]
     }
   }
-}`;
+}${ideaInjection.promptAddition}`;
 
       const userPrompt = JSON.stringify({
         state: {
@@ -374,6 +389,9 @@ Output ONLY valid JSON:
         strength: 1.0,
       });
 
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, data, govEntity.id, ideaInjection.candidateIds);
+      logIdeaBreadcrumb(`generateStateContent:${state.name}`, ideaInjection.candidateIds, usedIdeas);
+
       result.created += 2;
       const elapsedMs = Date.now() - startTime;
       ctx.onEntityComplete?.(state.name, i, states.length, usage?.totalTokens || 0, elapsedMs);
@@ -412,6 +430,16 @@ export async function generateReligionContent(ctx: WorldGenContext): Promise<Wor
     ctx.onEntityStart?.(religion.name, i, religions.length);
 
     try {
+      const ideaInjection = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "religion",
+        additionalLabels: ["theology", religionContext.form, religionContext.type].filter((s): s is string => !!s),
+        anchor: {
+          azgaarReligionId: religion.id,
+          tags: [religion.name, religionContext.originCulture?.name].filter((s): s is string => !!s),
+        },
+      });
+
       const systemPrompt = `You are a world-building assistant for a fantasy tabletop RPG.
 Generate detailed theological content for a religion - the FAITH ITSELF, not any organization.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
@@ -432,7 +460,7 @@ Output ONLY valid JSON:
     "symbols": ["holy symbols and icons"],
     "afterlife": "beliefs about death and what comes after"
   }
-}`;
+}${ideaInjection.promptAddition}`;
 
       const userPrompt = JSON.stringify({
         religion: {
@@ -458,7 +486,7 @@ Output ONLY valid JSON:
       }
 
       // Create religion entity (theological content)
-      ctx.canon.addEntity({
+      const religionEntity = ctx.canon.addEntity({
         type: "religion",
         name: data.name || religion.name,
         summary: data.summary,
@@ -479,6 +507,9 @@ Output ONLY valid JSON:
         },
       });
       result.created += 1;
+
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, data, religionEntity.id, ideaInjection.candidateIds);
+      logIdeaBreadcrumb(`generateReligionContent:${religion.name}`, ideaInjection.candidateIds, usedIdeas);
 
       const elapsedMs = Date.now() - startTime;
       ctx.onEntityComplete?.(religion.name, i, religions.length, usage?.totalTokens || 0, elapsedMs);
@@ -547,6 +578,16 @@ export async function generatePantheonContent(ctx: WorldGenContext): Promise<Wor
         relEntity.beliefs?.length ? `Core beliefs: ${relEntity.beliefs.join("; ")}` : "",
       ].filter(Boolean).join("\n");
 
+      const ideaInjection = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "deity",
+        additionalLabels: ["pantheon", "religion", form].filter((s): s is string => !!s),
+        anchor: {
+          azgaarReligionId,
+          tags: [relEntity.name, religionContext.originCulture?.name].filter((s): s is string => !!s),
+        },
+      });
+
       const systemPrompt = `You are a fantasy worldbuilding assistant creating a pantheon for a religion.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
 ${formConfig.guidance}
@@ -563,7 +604,7 @@ Generate between ${formConfig.min} and ${formConfig.max} deities. Each deity nee
 Also generate relations between deities (parent_of, sibling_of, consort_of, rival_of, aspect_of) using their keys.
 
 The deities should feel like they belong to the SAME religion and form a coherent mythology.
-Output ONLY valid JSON with "deities" array and optional "relations" array.`;
+Output ONLY valid JSON with "deities" array and optional "relations" array. If you wove in any of the optional design hints, list their IDs in a top-level "usedIdeaIds" string array.${ideaInjection.promptAddition}`;
 
       const { data, usage } = await completeJsonWithUsage(ctx.llm, {
         system: systemPrompt,
@@ -625,6 +666,10 @@ Output ONLY valid JSON with "deities" array and optional "relations" array.`;
         }
       }
 
+      const firstDeityId = keyToId.size > 0 ? keyToId.values().next().value : undefined;
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, data, firstDeityId, ideaInjection.candidateIds);
+      logIdeaBreadcrumb(`generatePantheonContent:${relEntity.name}`, ideaInjection.candidateIds, usedIdeas);
+
       const elapsedMs = Date.now() - startTime;
       ctx.onEntityComplete?.(relEntity.name, i, religionEntities.length, usage?.totalTokens || 0, elapsedMs);
     } catch (e: any) {
@@ -656,6 +701,16 @@ export async function generateCultureContent(ctx: WorldGenContext): Promise<Worl
     ctx.onEntityStart?.(culture.name, i, cultures.length);
 
     try {
+      const ideaInjection = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "culture",
+        anchor: {
+          cultureId: culture.id,
+          tags: [culture.name, cultureContext.type, ...(cultureContext.dominantBiomes || [])]
+            .filter((s): s is string => !!s),
+        },
+      });
+
       const systemPrompt = `You are a world-building assistant for a fantasy tabletop RPG.
 Generate a detailed culture description based on the provided context.
 Consider how the biomes, geography, and associated religions would shape the culture.
@@ -678,7 +733,7 @@ Output ONLY valid JSON:
       "relations": "How they typically relate to outsiders"
     }
   }
-}`;
+}${ideaInjection.promptAddition}`;
 
       const userPrompt = JSON.stringify({
         culture: {
@@ -705,7 +760,7 @@ Output ONLY valid JSON:
       }
 
       // Create culture entity
-      ctx.canon.addEntity({
+      const cultureEntity = ctx.canon.addEntity({
         type: "culture",
         name: data.culture?.name || culture.name,
         summary: data.culture?.summary,
@@ -725,6 +780,9 @@ Output ONLY valid JSON:
         },
       });
       result.created += 1;
+
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, data.culture || data, cultureEntity.id, ideaInjection.candidateIds);
+      logIdeaBreadcrumb(`generateCultureContent:${culture.name}`, ideaInjection.candidateIds, usedIdeas);
 
       const elapsedMs = Date.now() - startTime;
       ctx.onEntityComplete?.(culture.name, i, cultures.length, usage?.totalTokens || 0, elapsedMs);
@@ -1025,6 +1083,7 @@ type GeneratedEntity = {
   usage?: TokenUsage;
   elapsedMs: number;
   error?: string;
+  candidateIdeaIds?: string[];
 };
 
 /**
@@ -1064,6 +1123,17 @@ export async function executeWorldGeneration(
   ): Promise<GeneratedEntity> => {
     const startTime = Date.now();
     ctx.onEntityStart?.(subEntity.name, index, allEntities.length);
+
+    const anchorBase: any = { tags: [entityPlan.sourceName, subEntity.role].filter(Boolean) };
+    if (entityPlan.category === "state") anchorBase.stateId = entityPlan.sourceId;
+    else if (entityPlan.category === "religion") anchorBase.azgaarReligionId = entityPlan.sourceId;
+    else if (entityPlan.category === "culture") anchorBase.cultureId = entityPlan.sourceId;
+    const ideaInjection = prepareIdeaInjection({
+      canon: ctx.canon,
+      entityType: subEntity.type,
+      additionalLabels: [entityPlan.category, subEntity.role].filter(Boolean) as string[],
+      anchor: anchorBase,
+    });
 
     try {
       let systemPrompt = "";
@@ -1236,8 +1306,9 @@ Output ONLY valid JSON with name, summary, details_md, tags, and payload fields.
         });
       }
 
+      const fullSystemPrompt = systemPrompt + ideaInjection.promptAddition;
       const { data, usage } = await completeJsonWithUsage(ctx.llm, {
-        system: systemPrompt,
+        system: fullSystemPrompt,
         messages: [{ role: "user", content: userPrompt }],
         maxTokens: 2000,
         temperature: 0.7,
@@ -1254,6 +1325,7 @@ Output ONLY valid JSON with name, summary, details_md, tags, and payload fields.
         result: data,
         usage,
         elapsedMs,
+        candidateIdeaIds: ideaInjection.candidateIds,
       };
     } catch (e: any) {
       const elapsedMs = Date.now() - startTime;
@@ -1263,6 +1335,7 @@ Output ONLY valid JSON with name, summary, details_md, tags, and payload fields.
         result: null,
         elapsedMs,
         error: e?.message || String(e),
+        candidateIdeaIds: ideaInjection.candidateIds,
       };
     }
   };
@@ -1324,6 +1397,9 @@ Output ONLY valid JSON with name, summary, details_md, tags, and payload fields.
       // Track for relationship creation
       const key = `${entityPlan.category}:${entityPlan.sourceId}:${subEntity.role}`;
       entityIdMap.set(key, entity.id);
+
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, data, entity.id, gen.candidateIdeaIds || []);
+      logIdeaBreadcrumb(`executeWorldGeneration:${entityPlan.category}/${subEntity.role}`, gen.candidateIdeaIds || [], usedIdeas);
 
       result.created += 1;
       ctx.onEntityComplete?.(subEntity.name, i, generatedEntities.length, usage?.totalTokens || 0, elapsedMs);
@@ -1436,6 +1512,17 @@ export async function generateCultureContentWithReligions(ctx: WorldGenContext):
     ctx.onEntityStart?.(culture.name, i, cultures.length);
 
     try {
+      const ideaInjectionPhased = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "culture",
+        additionalLabels: ["culture"],
+        anchor: {
+          cultureId: culture.id,
+          tags: [culture.name, cultureContext.type, ...(cultureContext.dominantBiomes || [])]
+            .filter((s): s is string => !!s),
+        },
+      });
+
       const systemPrompt = `You are a world-building assistant for a fantasy tabletop RPG.
 Generate a detailed culture description based on the provided context.
 Consider how the biomes, geography, AND the established religions would shape this culture.
@@ -1460,7 +1547,7 @@ Output ONLY valid JSON:
       "dominantReligion": "Primary religion if applicable"
     }
   }
-}`;
+}${ideaInjectionPhased.promptAddition}`;
 
       const userPrompt = JSON.stringify({
         culture: {
@@ -1488,7 +1575,7 @@ Output ONLY valid JSON:
       }
 
       // Create culture entity
-      ctx.canon.addEntity({
+      const phasedCultureEntity = ctx.canon.addEntity({
         type: "culture",
         name: data.culture?.name || culture.name,
         summary: data.culture?.summary,
@@ -1509,6 +1596,9 @@ Output ONLY valid JSON:
         },
       });
       result.created += 1;
+
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, data.culture || data, phasedCultureEntity.id, ideaInjectionPhased.candidateIds);
+      logIdeaBreadcrumb(`generateCultureContentWithReligions:${culture.name}`, ideaInjectionPhased.candidateIds, usedIdeas);
 
       const elapsedMs = Date.now() - startTime;
       ctx.onEntityComplete?.(culture.name, i, cultures.length, usage?.totalTokens || 0, elapsedMs);
@@ -1548,6 +1638,16 @@ export async function generateStateContentWithContext(ctx: WorldGenContext): Pro
     ctx.onEntityStart?.(state.name, i, states.length);
 
     try {
+      const ideaInjectionStateCtx = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "state",
+        additionalLabels: ["government", "ruler"],
+        anchor: {
+          stateId: state.id,
+          tags: [state.name, stateContext.formName, stateContext.culture?.name].filter((s): s is string => !!s),
+        },
+      });
+
       const systemPrompt = `You are a world-building assistant for a fantasy tabletop RPG.
 Generate a government faction and its ruler for a state based on the provided context.
 ${religionContext ? `\nThe religions in this world are:\n${religionContext}\n` : ""}
@@ -1585,7 +1685,7 @@ Output ONLY valid JSON:
       "culturalBackground": "Their cultural identity"
     }
   }
-}`;
+}${ideaInjectionStateCtx.promptAddition}`;
 
       const userPrompt = JSON.stringify({
         state: {
@@ -1668,6 +1768,9 @@ Output ONLY valid JSON:
         rel_type: "leads",
         strength: 1.0,
       });
+
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, data, govEntity.id, ideaInjectionStateCtx.candidateIds);
+      logIdeaBreadcrumb(`generateStateContentWithContext:${state.name}`, ideaInjectionStateCtx.candidateIds, usedIdeas);
 
       result.created += 2;
       const elapsedMs = Date.now() - startTime;
@@ -2347,6 +2450,17 @@ export async function executePhasePlan(
       const startTime = Date.now();
       ctx.onEntityStart?.(subEntity.name, index, allEntities.length);
 
+      const anchorBase: any = { tags: [entityPlan.sourceName, subEntity.role].filter(Boolean) };
+      if (entityPlan.category === "state") anchorBase.stateId = entityPlan.sourceId;
+      else if (entityPlan.category === "religion") anchorBase.azgaarReligionId = entityPlan.sourceId;
+      else if (entityPlan.category === "culture") anchorBase.cultureId = entityPlan.sourceId;
+      const ideaInjection = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: subEntity.type,
+        additionalLabels: [entityPlan.category, subEntity.role, plan.phase].filter(Boolean) as string[],
+        anchor: anchorBase,
+      });
+
       try {
         const { systemPrompt, userPrompt } = buildEntityPrompts(
           entityPlan,
@@ -2356,7 +2470,7 @@ export async function executePhasePlan(
         );
 
         const { data, usage } = await completeJsonWithUsage(ctx.llm, {
-          system: systemPrompt,
+          system: systemPrompt + ideaInjection.promptAddition,
           messages: [{ role: "user", content: userPrompt }],
           maxTokens: 2000,
           temperature: 0.7,
@@ -2372,6 +2486,7 @@ export async function executePhasePlan(
           data,
           usage,
           elapsedMs: Date.now() - startTime,
+          candidateIdeaIds: ideaInjection.candidateIds,
         };
       } catch (e: any) {
         return {
@@ -2380,6 +2495,7 @@ export async function executePhasePlan(
           data: null,
           error: e?.message || String(e),
           elapsedMs: Date.now() - startTime,
+          candidateIdeaIds: ideaInjection.candidateIds,
         };
       }
     })
@@ -2421,6 +2537,9 @@ export async function executePhasePlan(
 
       const key = `${entityPlan.category}:${entityPlan.sourceId}:${subEntity.role}`;
       entityIdMap.set(key, entity.id);
+
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, data, entity.id, (gen as any).candidateIdeaIds || []);
+      logIdeaBreadcrumb(`executePhasePlan:${plan.phase}:${subEntity.role}`, (gen as any).candidateIdeaIds || [], usedIdeas);
 
       result.created += 1;
       ctx.onEntityComplete?.(subEntity.name, i, generatedEntities.length, usage?.totalTokens || 0, elapsedMs);

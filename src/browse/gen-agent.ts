@@ -15,6 +15,11 @@ import { debugLLMCall, debugLog, isDebugEnabled } from "../chat/debug-log";
 import { CampaignSettings } from "../chat/schema";
 import { formatSettingsForGeneration } from "../chat/campaign-settings";
 import {
+  prepareIdeaInjection,
+  markIdeasUsedFromOutput,
+  logIdeaBreadcrumb,
+} from "../canon/idea-injection";
+import {
   BrowseState,
   EntityRef,
   currentRef,
@@ -601,6 +606,19 @@ export async function executeGeneration(
     const startTime = Date.now();
     ctx.onEntityStart?.(entityPlan.name, index, total);
 
+    const ideaInjection = prepareIdeaInjection({
+      canon: ctx.canon,
+      entityType: entityPlan.type,
+      anchor: {
+        burgId: plan.context.burgId,
+        tags: [
+          plan.context.burgName,
+          plan.context.stateName,
+          entityPlan.kind,
+        ].filter((s): s is string => !!s),
+      },
+    });
+
     const systemPrompt = `You are a tabletop GM assistant. Generate a detailed ${entityPlan.type} entity for a fantasy world.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
 Output ONLY valid JSON with these fields:
@@ -628,7 +646,7 @@ For locations, payload should include: kind, briefDescription (3-5 sentences for
 For factions, payload should include: kind, goals, goalProgress (optional long-term progress objects), methods, influence
 For rumors, payload should include: truthLevel (false/distorted/mostly-true/true), spreadLevel (whisper/local/regional/widespread), sourceType (gossip/observation/leak/planted/unknown), secrecy (secret/restricted/rumored/public), ageDays, actualTruth (GM-only information)
 For hooks, payload should include: hookType (investigation/rescue/exploration/negotiation/combat/heist/escort/delivery/mystery/social), urgency (background/whenever/soon/urgent/critical), difficulty (trivial/easy/moderate/hard/deadly), rewardType (gold/information/favor/item/reputation/mixed), rewardDetails, complications (array), failureConsequences
-For events, payload should include: scope (neighborhood/burg/state/region/world), severity (minor/moderate/major/catastrophic), scale (covert/incident/operation/crisis/historic), secrecy (secret/restricted/rumored/public), audience (who knows), daysAgo (how many days ago it happened, 0 for ongoing)`;
+For events, payload should include: scope (neighborhood/burg/state/region/world), severity (minor/moderate/major/catastrophic), scale (covert/incident/operation/crisis/historic), secrecy (secret/restricted/rumored/public), audience (who knows), daysAgo (how many days ago it happened, 0 for ongoing)${ideaInjection.promptAddition}`;
 
     const userPrompt = JSON.stringify({
       type: entityPlan.type,
@@ -661,7 +679,7 @@ For events, payload should include: scope (neighborhood/burg/state/region/world)
         ctx.onTokens(usage);
       }
 
-      return { entityPlan, result, usage, elapsedMs, tokens, index, success: true as const };
+      return { entityPlan, result, usage, elapsedMs, tokens, index, ideaInjection, success: true as const };
     } catch (e: any) {
       const elapsedMs = Date.now() - startTime;
       const errorMsg = e?.message || String(e);
@@ -669,7 +687,8 @@ For events, payload should include: scope (neighborhood/burg/state/region/world)
       if (isDebugEnabled()) {
         debugLLMCall(`Generation FAILED: ${entityPlan.name}`, { type: entityPlan.type, error: errorMsg });
       }
-      return { entityPlan, error: errorMsg, elapsedMs, tokens: 0, index, success: false as const };
+      logIdeaBreadcrumb(`executeGeneration:${entityPlan.type}`, ideaInjection.candidateIds, []);
+      return { entityPlan, error: errorMsg, elapsedMs, tokens: 0, index, ideaInjection, success: false as const };
     }
   };
 
@@ -697,7 +716,7 @@ For events, payload should include: scope (neighborhood/burg/state/region/world)
       );
       continue;
     }
-    const { entityPlan, result, elapsedMs, tokens, index } = res;
+    const { entityPlan, result, elapsedMs, tokens, index, ideaInjection } = res;
 
     const entity = ctx.canon.addEntity({
       type: entityPlan.type,
@@ -716,6 +735,9 @@ For events, payload should include: scope (neighborhood/burg/state/region/world)
         approved_at: nowIso(),
       },
     });
+
+    const usedIdeas = markIdeasUsedFromOutput(ctx.canon, result, entity.id, ideaInjection.candidateIds);
+    logIdeaBreadcrumb(`executeGeneration:${entityPlan.type}`, ideaInjection.candidateIds, usedIdeas);
 
     createdIds.push(entity.id);
     keyToId[entityPlan.name] = entity.id;
@@ -1307,6 +1329,16 @@ export async function executeFieldRegeneration(
   const coreFields = plan.selectedFields.filter(f => fieldConfig.core.includes(f));
   const payloadFields = plan.selectedFields.filter(f => fieldConfig.payload.includes(f));
 
+  const ideaInjection = prepareIdeaInjection({
+    canon: ctx.canon,
+    entityType: entity.type,
+    anchor: {
+      burgId: entity.anchors?.burgId as number | undefined,
+      stateId: entity.anchors?.stateId as number | undefined,
+      tags: [plan.context.burgName, ...(entity.tags || [])].filter((s): s is string => !!s),
+    },
+  });
+
   // Build the system prompt based on entity type
   const systemPrompt = `You are a tabletop GM assistant. You are regenerating specific fields for an existing ${entity.type} entity.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
@@ -1317,7 +1349,7 @@ IMPORTANT:
 
 Output ONLY valid JSON with the regenerated field values.
 For core fields (name, summary, details_md, tags), include them at the top level.
-For payload fields, include them inside a "payload" object.`;
+For payload fields, include them inside a "payload" object.${ideaInjection.promptAddition}`;
 
   const userPrompt = JSON.stringify({
     existingEntity: plan.context.existingEntity,
@@ -1376,6 +1408,9 @@ For payload fields, include them inside a "payload" object.`;
     if (Object.keys(patch).length > 0) {
       ctx.canon.patchEntity(plan.entityId, patch);
     }
+
+    const usedIdeas = markIdeasUsedFromOutput(ctx.canon, result, entity.id, ideaInjection.candidateIds);
+    logIdeaBreadcrumb(`executeFieldRegeneration:${entity.type}`, ideaInjection.candidateIds, usedIdeas);
 
     ctx.onEntityComplete?.(
       { id: entity.id, name: entity.name, type: entity.type },
@@ -1683,6 +1718,20 @@ export async function executeDescriptionGeneration(
   const isState = plan.targetType === "state";
   const nowIso = () => new Date().toISOString();
 
+  const anchorTags: string[] = [];
+  if (plan.context.culture?.name) anchorTags.push(plan.context.culture.name);
+  if (plan.context.religion?.name) anchorTags.push(plan.context.religion.name);
+  const ideaInjection = prepareIdeaInjection({
+    canon: ctx.canon,
+    entityType: isState ? "state-description" : "burg-description",
+    additionalLabels: isState ? ["state", "description"] : ["burg", "description"],
+    anchor: {
+      burgId: "burgId" in plan.target ? (plan.target as any).burgId : undefined,
+      stateId: "stateId" in plan.target ? (plan.target as any).stateId : undefined,
+      tags: anchorTags,
+    },
+  });
+
   // Build the prompt based on target type
   let systemPrompt: string;
   let userPrompt: string;
@@ -1708,7 +1757,7 @@ IMPORTANT:
 - Focus on evocative, sensory details a GM can use
 - Consider how the culture and religion shape daily life
 - Include hooks for adventure or intrigue
-- Keep the summary punchy and memorable`;
+- Keep the summary punchy and memorable${ideaInjection.promptAddition}`;
 
     userPrompt = JSON.stringify({
       state: plan.context.stateInfo,
@@ -1737,7 +1786,7 @@ IMPORTANT:
 - Focus on evocative, sensory details a GM can use
 - Consider the geographic context, culture, and religion
 - Include hooks for adventure or intrigue
-- Keep the summary punchy and memorable`;
+- Keep the summary punchy and memorable${ideaInjection.promptAddition}`;
 
     userPrompt = JSON.stringify({
       burg: plan.context.burgInfo,
@@ -1792,6 +1841,9 @@ IMPORTANT:
         approved_at: nowIso(),
       },
     });
+
+    const usedIdeas = markIdeasUsedFromOutput(ctx.canon, result, entity.id, ideaInjection.candidateIds);
+    logIdeaBreadcrumb(`executeDescriptionGeneration:${plan.targetType}`, ideaInjection.candidateIds, usedIdeas);
 
     ctx.onEntityComplete?.(
       { id: entity.id, name: entity.name, type: entity.type },
@@ -2000,6 +2052,17 @@ export async function executeRumorGeneration(
   const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
   const nowIso = () => new Date().toISOString();
 
+  const ideaInjection = prepareIdeaInjection({
+    canon: ctx.canon,
+    entityType: "rumor",
+    additionalLabels: [plan.sourceType, plan.spreadLevel].filter((s) => typeof s === "string" && !!s) as string[],
+    anchor: {
+      burgId: plan.burgId,
+      tags: [plan.burgName, plan.topic, plan.linkedEventName, plan.linkedNpcName]
+        .filter((s): s is string => !!s),
+    },
+  });
+
   const systemPrompt = `You are a tabletop GM assistant. Generate a rumor for a fantasy city.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
 A rumor is something people are saying - it may be true, distorted, or completely false.
@@ -2012,7 +2075,7 @@ Output ONLY valid JSON with:
   "details_md": "Fuller version with variations and where you might hear it",
   "tags": ["relevant", "tags"],
   "actualTruth": "GM-only: what's really true behind this rumor"
-}`;
+}${ideaInjection.promptAddition}`;
 
   const userPrompt = JSON.stringify({
     topic: plan.topic,
@@ -2084,6 +2147,9 @@ Output ONLY valid JSON with:
         rel_type: "spread_by",
       });
     }
+
+    const usedIdeas = markIdeasUsedFromOutput(ctx.canon, result, rumorEntity.id, ideaInjection.candidateIds);
+    logIdeaBreadcrumb("executeRumorGeneration", ideaInjection.candidateIds, usedIdeas);
 
     const tokens = (usage?.promptTokens || 0) + (usage?.completionTokens || 0);
     ctx.onEntityComplete?.(
@@ -2243,6 +2309,23 @@ export async function executeHookGeneration(
   const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
   const nowIso = () => new Date().toISOString();
 
+  const ideaInjection = prepareIdeaInjection({
+    canon: ctx.canon,
+    entityType: "hook",
+    additionalLabels: [plan.hookType, plan.urgency, plan.difficulty, plan.rewardType]
+      .filter((s) => typeof s === "string" && !!s) as string[],
+    anchor: {
+      burgId: plan.burgId,
+      tags: [
+        plan.burgName,
+        plan.concept,
+        plan.linkedEventName,
+        plan.linkedNpcName,
+        plan.linkedFactionName,
+      ].filter((s): s is string => !!s),
+    },
+  });
+
   const systemPrompt = `You are a tabletop GM assistant. Generate an adventure hook for a fantasy TTRPG.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
 A hook is a potential quest, job, or adventure that players might pursue.
@@ -2256,7 +2339,7 @@ Output ONLY valid JSON with:
   "rewardDetails": "Specific reward details if applicable",
   "complications": ["2-3 potential twists or complications"],
   "failureConsequences": "What happens if players ignore or fail this hook"
-}`;
+}${ideaInjection.promptAddition}`;
 
   const userPrompt = JSON.stringify({
     concept: plan.concept,
@@ -2341,6 +2424,9 @@ Output ONLY valid JSON with:
         rel_type: "involves",
       });
     }
+
+    const usedIdeas = markIdeasUsedFromOutput(ctx.canon, result, hookEntity.id, ideaInjection.candidateIds);
+    logIdeaBreadcrumb("executeHookGeneration", ideaInjection.candidateIds, usedIdeas);
 
     const tokens = (usage?.promptTokens || 0) + (usage?.completionTokens || 0);
     ctx.onEntityComplete?.(

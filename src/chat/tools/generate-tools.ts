@@ -16,6 +16,13 @@ import {
   SecrecyLevelEnum,
 } from "../schema";
 import { formatSettingsForGeneration } from "../campaign-settings";
+import {
+  prepareIdeaInjection,
+  markIdeasUsedFromOutput,
+  logIdeaBreadcrumb,
+} from "../../canon/idea-injection";
+import { listIdeas } from "../../canon/ideas";
+import { levenshtein } from "../../util/fuzzy";
 
 // Schemas for generated content
 const GeneratedEntitySchema = z.object({
@@ -228,6 +235,7 @@ export function registerGenerateTools(registry: ToolRegistry): void {
           existingEntities: { type: "string", description: "JSON array of existing entity names to avoid duplicating" },
           reason: { type: "string", description: "Reason/prompt for why this entity is being generated (for provenance)" },
           source: { type: "string", description: "Source application generating this entity (e.g., 'azbrowse', 'azchat')" },
+          forceUseIdeaId: { type: "string", description: "Optional: ID of a specific pending idea from the pool to weave into this generation. Use ideas_lookup or ideas_list first to find IDs." },
         },
         required: ["kind", "burgId"],
       },
@@ -281,6 +289,17 @@ export function registerGenerateTools(registry: ToolRegistry): void {
       })));
       const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
 
+      const ideaInjection = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "location",
+        forceUseIdeaId: args.forceUseIdeaId ? String(args.forceUseIdeaId) : undefined,
+        additionalLabels: [kind, "burg"],
+        anchor: {
+          burgId,
+          tags: [burg.name, state?.name, kind].filter((s): s is string => !!s),
+        },
+      });
+
       const systemPrompt = `You are a tabletop GM assistant. Generate a ${kind} location for a fantasy city.
 Output ONLY valid JSON matching the schema.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Constraints:
@@ -289,7 +308,7 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Constraints:
 - Include a brief description (3-5 sentences for quick reference) AND a detailed physical description (rich sensory details - sights, sounds, smells, layout, lighting, notable features)
 - Generate 3-6 NPCs present at the location
 - Entity keys should be stable identifiers like "location_main", "npc_barkeep"
-- NPCs should have varied roles appropriate to the location`;
+- NPCs should have varied roles appropriate to the location${ideaInjection.promptAddition}`;
 
       const userPrompt = {
         request: { kind, hints: args.hints || null },
@@ -423,6 +442,9 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Constraints:
         ctx.state.currentLocationId = locationEntity.id;
         ctx.state.currentBurgId = burgId;
 
+        const usedIdeas = markIdeasUsedFromOutput(ctx.canon, data, locationEntity.id, ideaInjection.candidateIds);
+        logIdeaBreadcrumb("generate_location", ideaInjection.candidateIds, usedIdeas);
+
         console.log(`[generate_location] Persisted: 1 location, ${npcSummaries.length} NPCs`);
 
         // Return compact summary (not full entities)
@@ -433,6 +455,7 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Constraints:
           locationSummary: locationEntity.summary,
           npcs: npcSummaries,
           narration: data.narration,
+          usedIdeaIds: usedIdeas.length > 0 ? usedIdeas : undefined,
         };
       } catch (err: any) {
         const elapsed = Date.now() - startTime;
@@ -458,6 +481,7 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Constraints:
           factionIds: { type: "string", description: "JSON array of faction IDs to potentially link NPCs to" },
           reason: { type: "string", description: "Reason/prompt for why these NPCs are being generated (for provenance)" },
           source: { type: "string", description: "Source application generating these NPCs (e.g., 'azbrowse', 'azchat')" },
+          forceUseIdeaId: { type: "string", description: "Optional: ID of a specific pending idea to weave into one of these NPCs." },
         },
         required: ["burgId"],
       },
@@ -528,6 +552,18 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Constraints:
       const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
       const genLlm = getGenLlm(ctx);
 
+      const npcsIdeaInjection = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "npc",
+        forceUseIdeaId: args.forceUseIdeaId ? String(args.forceUseIdeaId) : undefined,
+        additionalLabels: args.roles ? String(args.roles).split(/[,\s]+/).filter(Boolean) : undefined,
+        anchor: {
+          burgId,
+          locationId,
+          tags: [burg.name].filter((s): s is string => !!s),
+        },
+      });
+
       const systemPrompt = `You are a tabletop GM assistant. Generate ${count} detailed NPCs for a fantasy city.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
 Each NPC should have rich character details. Output ONLY valid JSON:
@@ -556,7 +592,7 @@ Each NPC should have rich character details. Output ONLY valid JSON:
   }]
 }
 
-If linking to factions, use "factionId" in payload and add a "factionRole" (member/senior/leader) and "factionSecret" (true/false).`;
+If linking to factions, use "factionId" in payload and add a "factionRole" (member/senior/leader) and "factionSecret" (true/false).${npcsIdeaInjection.promptAddition}`;
 
       const userPrompt = {
         count,
@@ -641,10 +677,15 @@ If linking to factions, use "factionId" in payload and add a "factionRole" (memb
         });
       }
 
+      const firstNpcId = npcSummaries[0]?.id;
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, parsed.data, firstNpcId, npcsIdeaInjection.candidateIds);
+      logIdeaBreadcrumb("generate_npcs", npcsIdeaInjection.candidateIds, usedIdeas);
+
       return {
         success: true,
         count: npcSummaries.length,
         npcs: npcSummaries,
+        usedIdeaIds: usedIdeas.length > 0 ? usedIdeas : undefined,
       };
     }
   );
@@ -666,6 +707,7 @@ If linking to factions, use "factionId" in payload and add a "factionRole" (memb
           hints: { type: "string", description: "Additional hints about the faction" },
           reason: { type: "string", description: "Reason/prompt for why this faction is being generated (for provenance)" },
           source: { type: "string", description: "Source application generating this faction (e.g., 'azbrowse', 'azchat')" },
+          forceUseIdeaId: { type: "string", description: "Optional: ID of a pending idea to weave into this faction." },
         },
         required: ["kind", "burgId"],
       },
@@ -705,9 +747,17 @@ If linking to factions, use "factionId" in payload and add a "factionRole" (memb
       const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
       const genLlm = getGenLlm(ctx);
 
+      const factionIdeaInjection = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "faction",
+        forceUseIdeaId: args.forceUseIdeaId ? String(args.forceUseIdeaId) : undefined,
+        additionalLabels: [kind],
+        anchor: { burgId, tags: [burg.name, kind].filter((s): s is string => !!s) },
+      });
+
       const systemPrompt = `You are a tabletop GM assistant. Generate a ${kind} faction.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY valid JSON with a "faction" object.
-Faction payload should include goals and may include goalProgress objects for long-term schemes.`;
+Faction payload should include goals and may include goalProgress objects for long-term schemes.${factionIdeaInjection.promptAddition}`;
 
       const userPrompt = {
         kind,
@@ -746,11 +796,15 @@ Faction payload should include goals and may include goalProgress objects for lo
         },
       });
 
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, parsed.data, factionEntity.id, factionIdeaInjection.candidateIds);
+      logIdeaBreadcrumb("generate_faction", factionIdeaInjection.candidateIds, usedIdeas);
+
       return {
         success: true,
         factionId: factionEntity.id,
         factionName: factionEntity.name,
         factionSummary: factionEntity.summary,
+        usedIdeaIds: usedIdeas.length > 0 ? usedIdeas : undefined,
       };
     }
   );
@@ -794,6 +848,7 @@ Faction payload should include goals and may include goalProgress objects for lo
           hints: { type: "string", description: "Additional creative hints" },
           reason: { type: "string", description: "Reason/prompt for why this event is being generated (for provenance)" },
           source: { type: "string", description: "Source application generating this event (e.g., 'azbrowse', 'azchat')" },
+          forceUseIdeaId: { type: "string", description: "Optional: ID of a pending idea to weave into this event." },
         },
         required: ["kind", "scope", "severity"],
       },
@@ -824,9 +879,20 @@ Faction payload should include goals and may include goalProgress objects for lo
 
       const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
       const genLlm = getGenLlm(ctx);
+      const eventIdeaInjection = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "event",
+        forceUseIdeaId: args.forceUseIdeaId ? String(args.forceUseIdeaId) : undefined,
+        additionalLabels: [kind, scope, severity],
+        anchor: {
+          burgId,
+          stateId,
+          tags: [kind, scope].filter(Boolean) as string[],
+        },
+      });
       const systemPrompt = `You are a tabletop GM assistant. Generate a ${kind} event.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output ONLY valid JSON with an "event" object, optional "payload" object, and "consequences" array.
-Use payload.scale for operational size, payload.secrecy for who knows, and payload.audience for initially informed actors.`;
+Use payload.scale for operational size, payload.secrecy for who knows, and payload.audience for initially informed actors.${eventIdeaInjection.promptAddition}`;
 
       const userPrompt = {
         kind,
@@ -888,6 +954,9 @@ Use payload.scale for operational size, payload.secrecy for who knows, and paylo
         },
       });
 
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, parsed.data, eventEntity.id, eventIdeaInjection.candidateIds);
+      logIdeaBreadcrumb("generate_event", eventIdeaInjection.candidateIds, usedIdeas);
+
       return {
         success: true,
         eventId: eventEntity.id,
@@ -897,6 +966,7 @@ Use payload.scale for operational size, payload.secrecy for who knows, and paylo
         severity,
         daysAgo: historical ? null : daysAgo,
         historical,
+        usedIdeaIds: usedIdeas.length > 0 ? usedIdeas : undefined,
       };
     }
   );
@@ -936,6 +1006,7 @@ Use payload.scale for operational size, payload.secrecy for who knows, and paylo
           hints: { type: "string", description: "Additional creative hints" },
           reason: { type: "string", description: "Reason/prompt for generation (for provenance)" },
           source: { type: "string", description: "Source application (e.g., 'azbrowse', 'azchat')" },
+          forceUseIdeaId: { type: "string", description: "Optional: ID of a pending idea to weave into this rumor." },
         },
         required: ["topic", "burgId"],
       },
@@ -976,6 +1047,14 @@ Use payload.scale for operational size, payload.secrecy for who knows, and paylo
       const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
       const genLlm = getGenLlm(ctx);
 
+      const rumorIdeaInjection = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "rumor",
+        forceUseIdeaId: args.forceUseIdeaId ? String(args.forceUseIdeaId) : undefined,
+        additionalLabels: [String(truthLevel), String(spreadLevel), String(sourceType)],
+        anchor: { burgId, tags: [burg.name, topic].filter((s): s is string => !!s) },
+      });
+
       const systemPrompt = `You are a tabletop GM assistant. Generate a rumor for a fantasy city.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
 A rumor is something people are saying - it may be true, distorted, or completely false.
@@ -983,7 +1062,7 @@ The "actualTruth" field is GM-only information about what's really going on.
 
 Output ONLY valid JSON with:
 - rumor: { key, type: "rumor", name (the rumor as people say it), summary (1-2 sentences of what people claim), details_md (fuller version with variations), tags }
-- payload: { truthLevel, spreadLevel, sourceType, secrecy, ageDays, actualTruth (GM-only: what's really true) }`;
+- payload: { truthLevel, spreadLevel, sourceType, secrecy, ageDays, actualTruth (GM-only: what's really true) }${rumorIdeaInjection.promptAddition}`;
 
       const userPrompt = {
         topic,
@@ -1054,6 +1133,9 @@ Output ONLY valid JSON with:
         });
       }
 
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, parsed.data, rumorEntity.id, rumorIdeaInjection.candidateIds);
+      logIdeaBreadcrumb("generate_rumor", rumorIdeaInjection.candidateIds, usedIdeas);
+
       return {
         success: true,
         rumorId: rumorEntity.id,
@@ -1062,6 +1144,7 @@ Output ONLY valid JSON with:
         truthLevel,
         spreadLevel,
         sourceType,
+        usedIdeaIds: usedIdeas.length > 0 ? usedIdeas : undefined,
       };
     }
   );
@@ -1103,6 +1186,7 @@ Output ONLY valid JSON with:
           hints: { type: "string", description: "Additional creative hints" },
           reason: { type: "string", description: "Reason/prompt for generation (for provenance)" },
           source: { type: "string", description: "Source application (e.g., 'azbrowse', 'azchat')" },
+          forceUseIdeaId: { type: "string", description: "Optional: ID of a pending idea to weave into this hook." },
         },
         required: ["hookType", "burgId"],
       },
@@ -1147,13 +1231,21 @@ Output ONLY valid JSON with:
       const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
       const genLlm = getGenLlm(ctx);
 
+      const hookIdeaInjection = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "hook",
+        forceUseIdeaId: args.forceUseIdeaId ? String(args.forceUseIdeaId) : undefined,
+        additionalLabels: [hookType, String(urgency), String(difficulty), String(rewardType)],
+        anchor: { burgId, tags: [burg.name].filter((s): s is string => !!s) },
+      });
+
       const systemPrompt = `You are a tabletop GM assistant. Generate an adventure hook for a fantasy TTRPG.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
 A hook is a potential quest, job, or adventure that players might pursue.
 
 Output ONLY valid JSON with:
 - hook: { key, type: "hook", name (catchy title), summary (1-2 sentence pitch to players), details_md (full setup, what's really going on), tags }
-- payload: { hookType, urgency, difficulty, rewardType, rewardDetails, complications (2-3 potential twists), failureConsequences }`;
+- payload: { hookType, urgency, difficulty, rewardType, rewardDetails, complications (2-3 potential twists), failureConsequences }${hookIdeaInjection.promptAddition}`;
 
       const userPrompt = {
         hookType,
@@ -1236,6 +1328,9 @@ Output ONLY valid JSON with:
         });
       }
 
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, parsed.data, hookEntity.id, hookIdeaInjection.candidateIds);
+      logIdeaBreadcrumb("generate_hook", hookIdeaInjection.candidateIds, usedIdeas);
+
       return {
         success: true,
         hookId: hookEntity.id,
@@ -1245,6 +1340,7 @@ Output ONLY valid JSON with:
         urgency,
         difficulty,
         rewardType,
+        usedIdeaIds: usedIdeas.length > 0 ? usedIdeas : undefined,
       };
     }
   );
@@ -1266,6 +1362,7 @@ Output ONLY valid JSON with:
           context: { type: "string", description: "Context (burg name, state, culture)" },
           reason: { type: "string", description: "Reason/prompt for why this lore is being generated (for provenance)" },
           source: { type: "string", description: "Source application generating this lore (e.g., 'azbrowse', 'azchat')" },
+          forceUseIdeaId: { type: "string", description: "Optional: ID of a pending idea to weave into this lore." },
         },
         required: ["subject", "aspect"],
       },
@@ -1276,8 +1373,15 @@ Output ONLY valid JSON with:
 
       const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
       const genLlm = getGenLlm(ctx);
+      const loreIdeaInjection = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "lore",
+        forceUseIdeaId: args.forceUseIdeaId ? String(args.forceUseIdeaId) : undefined,
+        additionalLabels: ["meta", "lore", aspect],
+        anchor: { tags: [subject, aspect, args.context].filter((s) => typeof s === "string" && !!s) as string[] },
+      });
       const systemPrompt = `You are a tabletop GM assistant. Generate ${aspect} lore about ${subject}.
-${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output JSON with: subject, aspect, content (markdown), relatedTopics (array of strings).`;
+${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output JSON with: subject, aspect, content (markdown), relatedTopics (array of strings).${loreIdeaInjection.promptAddition}`;
 
       const userPrompt = {
         subject,
@@ -1315,12 +1419,16 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output JSON with
         },
       });
 
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, parsed.data, loreEntity.id, loreIdeaInjection.candidateIds);
+      logIdeaBreadcrumb("generate_lore", loreIdeaInjection.candidateIds, usedIdeas);
+
       return {
         success: true,
         loreId: loreEntity.id,
         subject,
         aspect,
         contentPreview: parsed.data.content.slice(0, 150) + "...",
+        usedIdeaIds: usedIdeas.length > 0 ? usedIdeas : undefined,
       };
     }
   );
@@ -1347,6 +1455,7 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output JSON with
             description: "How much the actor knows: rumor, confirmed, intimate",
             enum: ["rumor", "confirmed", "intimate"],
           },
+          forceUseIdeaId: { type: "string", description: "Optional: ID of a pending idea to weave into the reaction." },
         },
         required: ["actorType", "actorId", "eventId", "awarenessLevel"],
       },
@@ -1356,6 +1465,7 @@ ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output JSON with
       const actorId = String(args.actorId);
       const eventId = String(args.eventId);
       const awarenessLevel = String(args.awarenessLevel);
+      const forceUseIdeaIdReaction = args.forceUseIdeaId ? String(args.forceUseIdeaId) : undefined;
 
       // Get event details
       const event = ctx.canon.getEntity(eventId);
@@ -1405,6 +1515,13 @@ Days ago: ${eventPayload.daysAgo ?? 0}
 Ongoing: ${eventPayload.ongoing ? "yes" : "no"}`;
 
       const campaignContext = formatSettingsForGeneration(ctx.campaignSettings);
+      const reactionIdeaInjection = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "reaction",
+        forceUseIdeaId: forceUseIdeaIdReaction,
+        additionalLabels: [actorType, awarenessLevel],
+        anchor: { tags: [actorName, event.name].filter((s): s is string => !!s) },
+      });
       const systemPrompt = `You are a tabletop GM assistant generating NPC/faction reactions to world events.
 Generate 3-5 diverse, plausible reactions the actor might have to the event.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}Output JSON with: actorName, eventName, candidates (array of reaction objects).
@@ -1414,7 +1531,7 @@ Each candidate should have:
 - category: "political", "economic", "social", or "factional"
 - intensity: "subtle", "moderate", or "dramatic"
 - publiclyVisible: boolean
-- creates: array of outcomes (optional) - each with type ("relation", "rumor", "event"), description, and optional targetType/targetId/relationType`;
+- creates: array of outcomes (optional) - each with type ("relation", "rumor", "event"), description, and optional targetType/targetId/relationType${reactionIdeaInjection.promptAddition}`;
 
       const userPrompt = {
         actorContext,
@@ -1440,6 +1557,9 @@ Each candidate should have:
         return { error: "Failed to parse generation result" };
       }
 
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, parsed.data, undefined, reactionIdeaInjection.candidateIds);
+      logIdeaBreadcrumb("generate_reaction", reactionIdeaInjection.candidateIds, usedIdeas);
+
       // Return compact summary - just names/descriptions, not full creates arrays
       return {
         success: true,
@@ -1451,6 +1571,7 @@ Each candidate should have:
           intensity: c.intensity,
           publiclyVisible: c.publiclyVisible,
         })),
+        usedIdeaIds: usedIdeas.length > 0 ? usedIdeas : undefined,
       };
     }
   );
@@ -1521,6 +1642,7 @@ Each candidate should have:
             type: "string",
             description: "Source application (e.g., 'azbrowse', 'azchat')",
           },
+          forceUseIdeaId: { type: "string", description: "Optional: ID of a pending idea to weave into one of the deities." },
         },
         required: ["azgaarReligionId"],
       },
@@ -1576,6 +1698,17 @@ Each candidate should have:
         if (practices?.length) religionInfo.push(`Practices: ${practices.join("; ")}`);
       }
 
+      const pantheonIdeaInjection = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "deity",
+        forceUseIdeaId: args.forceUseIdeaId ? String(args.forceUseIdeaId) : undefined,
+        additionalLabels: ["pantheon", "religion", form].filter(Boolean) as string[],
+        anchor: {
+          azgaarReligionId,
+          tags: [religionCtx.name, religionCtx.originCulture?.name].filter((s): s is string => !!s),
+        },
+      });
+
       const systemPrompt = `You are a fantasy worldbuilding assistant creating a pantheon for a religion.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
 ${formConfig.guidance}
@@ -1592,7 +1725,7 @@ Generate between ${formConfig.min} and ${formConfig.max} deities. Each deity nee
 Also generate relations between deities (parent_of, sibling_of, consort_of, rival_of, aspect_of) using their keys.
 
 The deities should feel like they belong to the SAME religion and form a coherent mythology.
-Output ONLY valid JSON matching the schema.`;
+Output ONLY valid JSON matching the schema. If you wove in any of the optional design hints, list their IDs in a top-level "usedIdeaIds" string array.${pantheonIdeaInjection.promptAddition}`;
 
       const userPrompt = {
         religion: religionInfo.join("\n"),
@@ -1661,6 +1794,10 @@ Output ONLY valid JSON matching the schema.`;
         }
       }
 
+      const firstDeityId = createdDeities[0]?.id;
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, parsed.data, firstDeityId, pantheonIdeaInjection.candidateIds);
+      logIdeaBreadcrumb("generate_pantheon", pantheonIdeaInjection.candidateIds, usedIdeas);
+
       return {
         success: true,
         religionName: religionCtx.name,
@@ -1668,6 +1805,7 @@ Output ONLY valid JSON matching the schema.`;
         deitiesCreated: createdDeities.length,
         relationsCreated,
         deities: createdDeities,
+        usedIdeaIds: usedIdeas.length > 0 ? usedIdeas : undefined,
       };
     }
   );
@@ -1701,6 +1839,7 @@ Output ONLY valid JSON matching the schema.`;
           hints: { type: "string", description: "Creative hints (e.g., 'abandoned dwarven', 'cursed', 'hidden by illusion')" },
           reason: { type: "string", description: "Reason for generation (provenance)" },
           source: { type: "string", description: "Source application" },
+          forceUseIdeaId: { type: "string", description: "Optional: ID of a pending idea to weave into this marker." },
         },
         required: ["kind"],
       },
@@ -1772,6 +1911,19 @@ Output ONLY valid JSON matching the schema.`;
         }
       }
 
+      const markerIdeaInjection = prepareIdeaInjection({
+        canon: ctx.canon,
+        entityType: "marker",
+        forceUseIdeaId: args.forceUseIdeaId ? String(args.forceUseIdeaId) : undefined,
+        additionalLabels: [kind, "wilderness"],
+        anchor: {
+          burgId: nearBurgId,
+          stateId,
+          cellId,
+          tags: [nearBurg?.name, nearState?.name, kind].filter((s) => typeof s === "string" && !!s) as string[],
+        },
+      });
+
       const systemPrompt = `You are a tabletop GM assistant. Generate a ${kind} wilderness marker - a point of interest in the wilderness, far from any city.
 ${campaignContext ? `Campaign style: ${campaignContext}\n` : ""}
 This should feel like a discovery - something adventurers might stumble upon while traveling.
@@ -1783,7 +1935,7 @@ Output ONLY valid JSON with a "marker" object containing:
 - tags: relevant tags
 - payload: object with kind, condition (intact/ruined/hidden/overgrown/active), dangerLevel (safe/cautious/dangerous/deadly), discoverable (boolean), physicalDescription, atmosphere, features (array), inhabitants (who/what is here), history (brief lore)
 
-Also include a "narration" field with a brief atmospheric description.`;
+Also include a "narration" field with a brief atmospheric description.${markerIdeaInjection.promptAddition}`;
 
       const userPrompt: any = {
         kind,
@@ -1836,6 +1988,9 @@ Also include a "narration" field with a brief atmospheric description.`;
         },
       });
 
+      const usedIdeas = markIdeasUsedFromOutput(ctx.canon, parsed.data, markerEntity.id, markerIdeaInjection.candidateIds);
+      logIdeaBreadcrumb("generate_marker", markerIdeaInjection.candidateIds, usedIdeas);
+
       return {
         success: true,
         markerId: markerEntity.id,
@@ -1844,6 +1999,98 @@ Also include a "narration" field with a brief atmospheric description.`;
         kind,
         coordinates: cellX !== undefined ? { x: cellX, y: cellY, cellId } : null,
         narration: parsed.data.narration,
+        usedIdeaIds: usedIdeas.length > 0 ? usedIdeas : undefined,
+      };
+    }
+  );
+
+  // ideas_lookup - Fuzzy search ideas in the pool by query
+  registry.register(
+    "ideas_lookup",
+    {
+      name: "ideas_lookup",
+      description:
+        "Fuzzy-search pending and used ideas in the world's ideas pool by free-text query. Returns top 5 matches with id, text, labels, and status. Use this to resolve user references like 'use the mistlands idea' before calling a generate_* tool with forceUseIdeaId.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Free-text search query (matches idea text and labels)" },
+          status: { type: "string", description: "Filter status: pending (default), used, all", enum: ["pending", "used", "all"] },
+          limit: { type: "number", description: "Max matches to return (default 5)" },
+        },
+        required: ["query"],
+      },
+    },
+    async (args: Record<string, any>, ctx: ToolContext) => {
+      const query = String(args.query || "").trim();
+      if (!query) return { error: "query is required" };
+      const limit = Math.max(1, Math.min(20, Number(args.limit) || 5));
+      const status = (args.status === "used" || args.status === "all") ? args.status : "pending";
+
+      const ideas = listIdeas(ctx.canon, { status, limit: 500 });
+      if (ideas.length === 0) return { matches: [], message: "No ideas in pool" };
+
+      const q = query.toLowerCase();
+      const scored = ideas.map((idea) => {
+        const text = (idea.details_md || idea.summary || idea.name || "").toLowerCase();
+        const labels: string[] = Array.isArray(idea.payload?.labels) ? idea.payload.labels : [];
+        const labelText = labels.join(" ").toLowerCase();
+        const hay = `${text} ${labelText}`;
+        const maxLen = Math.max(q.length, hay.length, 1);
+        const dist = levenshtein(q, hay.slice(0, Math.min(hay.length, q.length * 4)));
+        const sub = hay.includes(q) ? 0.9 : 0;
+        const fuzz = 1 - dist / maxLen;
+        const score = Math.max(sub, fuzz);
+        return { idea, score };
+      });
+
+      scored.sort((a, b) => b.score - a.score);
+      const top = scored.slice(0, limit).filter((s) => s.score > 0.15);
+
+      return {
+        matches: top.map((s) => ({
+          id: s.idea.id,
+          text: s.idea.details_md || s.idea.summary || s.idea.name,
+          labels: Array.isArray(s.idea.payload?.labels) ? s.idea.payload.labels : [],
+          status: s.idea.payload?.status || "pending",
+          score: Number(s.score.toFixed(3)),
+        })),
+      };
+    }
+  );
+
+  // ideas_list - List ideas with optional filters
+  registry.register(
+    "ideas_list",
+    {
+      name: "ideas_list",
+      description:
+        "List ideas in the world's ideas pool with optional status/label filters. Use for browsing or quick reference; use ideas_lookup for free-text resolution.",
+      parameters: {
+        type: "object",
+        properties: {
+          status: { type: "string", description: "pending (default), used, or all", enum: ["pending", "used", "all"] },
+          label: { type: "string", description: "Restrict to ideas tagged with this label (case-insensitive)" },
+          limit: { type: "number", description: "Max ideas to return (default 20)" },
+        },
+        required: [],
+      },
+    },
+    async (args: Record<string, any>, ctx: ToolContext) => {
+      const status = (args.status === "used" || args.status === "all") ? args.status : "pending";
+      const label = args.label ? String(args.label).trim().toLowerCase() : undefined;
+      const limit = Math.max(1, Math.min(200, Number(args.limit) || 20));
+
+      const ideas = listIdeas(ctx.canon, { status, label, limit });
+      return {
+        count: ideas.length,
+        ideas: ideas.map((idea) => ({
+          id: idea.id,
+          text: idea.details_md || idea.summary || idea.name,
+          labels: Array.isArray(idea.payload?.labels) ? idea.payload.labels : [],
+          status: idea.payload?.status || "pending",
+          usedByEntityId: idea.payload?.usedByEntityId,
+        })),
       };
     }
   );
