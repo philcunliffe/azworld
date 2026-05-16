@@ -36,6 +36,8 @@ import {
   debugTokens,
 } from "./debug-log";
 import { TuiController } from "./tui";
+import { CampaignStore } from "../campaign/store";
+import { runCampaignMode } from "./campaign-mode";
 
 function helpText(skills: SkillMetadata[] = []): string {
   const lines = [
@@ -45,6 +47,7 @@ function helpText(skills: SkillMetadata[] = []): string {
     "  /where                      Show current city/location",
     "  /talk <npc name>            Talk as an NPC in the current scene",
     "  /back                       Return to Director mode",
+    "  /campaign [name]            Enter campaign-builder mode (resumes by name if exists)",
     "  /nav                        Enter TUI navigation mode (Ctrl+N also works)",
     "  /wiki <outDir>              Export wiki Markdown to a directory",
     "  /model                      Show current LLM provider/model (chat + generation)",
@@ -557,6 +560,27 @@ async function main() {
           console.log(`Generation model: ${generationLlm.provider}/${generationLlm.model}`);
         } catch (e: any) {
           console.log(`Failed to switch: ${e?.message ?? String(e)}`);
+        }
+        continue;
+      }
+
+      if (cmd === "campaign") {
+        const campaignName = argStr || undefined;
+        const campaignStore = new CampaignStore(canon.db);
+        try {
+          await runCampaignMode({
+            store: campaignStore,
+            canon,
+            llm,
+            generationLlm,
+            campaignName,
+            io: {
+              ask,
+              println: (line: string) => console.log(line),
+            },
+          });
+        } catch (e: any) {
+          console.log(`(Campaign error: ${e?.message ?? String(e)})`);
         }
         continue;
       }

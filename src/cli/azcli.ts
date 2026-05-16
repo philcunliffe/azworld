@@ -3,6 +3,7 @@ import { CanonStore, EntityType } from "../canon/canon";
 import { parseSourceText } from "../canon/ingest";
 import { addIdea, listIdeas, getIdea, markIdeaUsed, deleteIdea, setIdeaLabels } from "../canon/ideas";
 import { runPendingIdeaLabeling, suggestLabelsForIdea, kickOffIdeaLabeling } from "../canon/idea-labeler";
+import { CampaignStore } from "../campaign/store";
 import { exportWiki } from "../wiki/wiki";
 import { extractGlobals, readJsonArgAsync } from "../util/args";
 import { jsonDumps } from "../util/json";
@@ -50,7 +51,7 @@ function usage(): string {
     "  canon add <npc|faction|location|event|rumor|hook|meta|culture|religion|era|phenomena|relation_type|source_text> --name <name> [--summary ...] [--details-md ...] [--tags a,b] [--payload-json <jsonOr@file>] [--burg <id>] [--state <id>]",
     "  canon ingest --file <notes.md> [--name <title>] [--apply] [--scope <scope>] [--burg <id>] [--state <id>] [--era-id <id>]",
     "  canon show <id>",
-    "  canon list [--type ...] [--burg <id>] [--tag <tag>] [--text <substr>] [--limit N]",
+    "  canon list [--type ...] [--burg <id>] [--tag <tag>] [--text <substr>] [--campaign <name>] [--limit N]",
     "  canon patch <id> --patch-json <jsonOr@file>",
     "  canon link --from-id <id> --to-id <id> --rel <type> [--strength n] [--notes ...]",
     "  canon export --out <file.json>",
@@ -246,12 +247,26 @@ async function main() {
         const limit = get("--limit") ? Number(get("--limit")) : (globals.limit ?? 50);
         const burgId = get("--burg") ? Number(get("--burg")) : undefined;
         const stateId = get("--state") ? Number(get("--state")) : undefined;
+        const campaignName = get("--campaign") ?? undefined;
 
         const anchors: any = {};
         if (typeof burgId === "number" && !Number.isNaN(burgId)) anchors.burgId = burgId;
         if (typeof stateId === "number" && !Number.isNaN(stateId)) anchors.stateId = stateId;
 
-        const ents = canon.listEntities({ type, tag, text, limit, anchors: Object.keys(anchors).length ? anchors : undefined });
+        let ents = canon.listEntities({ type, tag, text, limit, anchors: Object.keys(anchors).length ? anchors : undefined });
+
+        if (campaignName) {
+          const campaignStore = new CampaignStore(canon.db);
+          campaignStore.initDb();
+          const camp =
+            campaignStore.listCampaigns({ status: "open" }).find((c) => c.name === campaignName) ??
+            campaignStore.listCampaigns({ status: "archived" }).find((c) => c.name === campaignName);
+          if (!camp) {
+            throw new Error(`No campaign named '${campaignName}'`);
+          }
+          ents = ents.filter((e) => (e.provenance as any)?.campaign_id === camp.id);
+        }
+
         print(globals, wrap(ents));
         return;
       }
