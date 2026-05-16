@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { mergePatch } from "../util/mergePatch";
 import { nowIso } from "../util/time";
 
-export type EntityType = "npc" | "faction" | "location" | "event" | "rumor" | "hook" | "meta" | "culture" | "religion" | "deity" | "era" | "phenomena" | "relation_type" | "source_text" | "marker" | "idea";
+export type EntityType = "npc" | "faction" | "location" | "event" | "rumor" | "hook" | "meta" | "culture" | "religion" | "deity" | "era" | "phenomena" | "relation_type" | "source_text" | "marker" | "idea" | "region" | "lore";
 
 export const BUILTIN_RELATION_TYPES = [
   "about",
@@ -85,7 +85,7 @@ PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS entities (
   id TEXT PRIMARY KEY,
-  type TEXT NOT NULL CHECK(type IN ('npc','faction','location','event','rumor','hook','meta','culture','religion','deity','era','phenomena','relation_type','source_text','marker','idea')),
+  type TEXT NOT NULL CHECK(type IN ('npc','faction','location','event','rumor','hook','meta','culture','religion','deity','era','phenomena','relation_type','source_text','marker','idea','region','lore')),
   name TEXT NOT NULL,
   summary TEXT,
   details_md TEXT,
@@ -772,7 +772,9 @@ export class CanonStore {
       sql.includes("'phenomena'") &&
       sql.includes("'relation_type'") &&
       sql.includes("'source_text'") &&
-      sql.includes("'idea'")
+      sql.includes("'idea'") &&
+      sql.includes("'region'") &&
+      sql.includes("'lore'")
     ) return;
 
     this.db.exec("BEGIN");
@@ -780,7 +782,7 @@ export class CanonStore {
       this.db.exec(`
         CREATE TABLE entities_new (
           id TEXT PRIMARY KEY,
-          type TEXT NOT NULL CHECK(type IN ('npc','faction','location','event','rumor','hook','meta','culture','religion','deity','era','phenomena','relation_type','source_text','marker','idea')),
+          type TEXT NOT NULL CHECK(type IN ('npc','faction','location','event','rumor','hook','meta','culture','religion','deity','era','phenomena','relation_type','source_text','marker','idea','region','lore')),
           name TEXT NOT NULL,
           summary TEXT,
           details_md TEXT,

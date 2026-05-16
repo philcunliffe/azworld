@@ -20,6 +20,7 @@ import { kickOffIdeaLabeling, suggestLabelsForIdea } from "../canon/idea-labeler
 import { exportWiki } from "../wiki/wiki";
 import { formatPhasePlan, executePhasePlan, planCultureGeneration, planPantheonGeneration, planReligionGeneration, planStateGeneration, type PhasePlan, type WorldGenContext } from "../browse/world-init-gen";
 import type { CampaignSettings } from "../chat/schema";
+import { registerCampaignRoutes } from "./campaign/routes";
 
 type TokenTotals = {
   promptTokens: number;
@@ -1319,6 +1320,11 @@ async function main(): Promise<void> {
   const canonPath = globals.canon || "./data/canon.db";
 
   const session = await WebSession.create(worldPath, canonPath);
+  const campaignRoutes = registerCampaignRoutes({
+    canon: session.canon,
+    llm: session.llm,
+    generationLlm: session.generationLlm,
+  });
 
   // --- Livereload: watch public dir and notify connected SSE clients ---
   const livereloadClients = new Set<ReadableStreamDefaultController>();
@@ -1340,6 +1346,9 @@ async function main(): Promise<void> {
       const url = new URL(request.url);
 
       try {
+        const campResp = await campaignRoutes(url, request);
+        if (campResp) return campResp;
+
         // Livereload SSE endpoint
         if (url.pathname === "/api/livereload" && request.method === "GET") {
           const stream = new ReadableStream({
