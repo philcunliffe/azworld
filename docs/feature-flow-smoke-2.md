@@ -8,3 +8,5 @@ end-to-end with no manual nudges.
 
 - Bead 1 (this file) — created by polecat-N for bead az-XXX.
 - Bead 2 (next) — will append a confirmation line below.
+
+Confirmed: bead 2 ran after bead 1 closed. Auto-routing is wired post-fix.
